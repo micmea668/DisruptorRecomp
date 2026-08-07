@@ -6,8 +6,8 @@ built on [PSXRecomp](https://github.com/mstan/psxrecomp).
 The original PlayStation MIPS code is translated ahead of time to C locally and
 compiled into a native x64 executable. PSX hardware services are supplied by a
 purpose-built compatibility runtime, with the redistributable PCSX-Redux
-OpenBIOS backend. It is therefore a native static recompilation—not an emulator
-wrapper—and it is not a source-code decompilation or conventional source port.
+OpenBIOS backend. It is therefore a native static recompilation, not an emulator
+wrapper, and it is not a source-code decompilation or conventional source port.
 It is not yet a public release.
 
 No proprietary PlayStation BIOS is bundled or required.
