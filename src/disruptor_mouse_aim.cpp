@@ -1,0 +1,443 @@
+/*
+ * Native mouse aiming and modern keyboard/mouse controls for Disruptor
+ * (SLUS-00224).
+ *
+ * Dynamic correlation plus static instruction tracing identified 0x80077624
+ * as the game's 8-bit wrapping player/camera yaw.  The original turn routine
+ * adds a signed controller-derived step to this byte; renderer, collision and
+ * camera code then consume it through the game's own sine/cosine tables.
+ *
+ * This opt-in mod applies relative host mouse motion to the same yaw byte after
+ * each guest input/update frame.  A second opt-in path merges a conventional
+ * WASD/mouse layout into the emulated port-1 digital pad after the runtime's
+ * low-latency input sample.  Normal play has no hook or overhead unless either
+ * PSX_DISRUPTOR_MOUSE_AIM=1 or PSX_DISRUPTOR_MODERN_CONTROLS=1 is present.
+ */
+
+#include "psx_sdl.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
+
+extern "C" void mod_register_frame_hook(void (*hook)(void));
+extern "C" uint8_t psx_read_byte(uint32_t address);
+extern "C" void psx_write_byte(uint32_t address, uint8_t value);
+extern "C" uint16_t sio_get_pad_buttons_slot(int slot);
+extern "C" void sio_set_pad_state_slot(int slot, uint16_t buttons);
+extern "C" int32_t psx_mod_widescreen_x_margin(void);
+extern "C" int gpu_ws_present_native_43(void);
+extern "C" int ws_native_wide_active(void);
+extern "C" int ws_nw_extra(void);
+extern "C" void gpu_geometry_camera_yaw_residual_set(double yaw_units);
+extern "C" void gpu_geometry_correction_stats(uint64_t *world_triangles,
+                                                uint64_t *precise_triangles);
+extern "C" SDL_Window *sdl_window;
+
+namespace {
+
+constexpr uint32_t kPlayerYawAddress = 0x80077624u;
+constexpr double kDefaultHorizontalSensitivity = 0.080;
+constexpr double kMinimumSensitivity = 0.005;
+constexpr double kMaximumSensitivity = 2.000;
+constexpr double kMaximumMotionPerFrame = 1024.0;
+
+/* PS1 digital-pad bits are active-low: clearing a bit presses it. */
+constexpr uint16_t kPadSelect   = 1u << 0;
+constexpr uint16_t kPadStart    = 1u << 3;
+constexpr uint16_t kPadUp       = 1u << 4;
+constexpr uint16_t kPadRight    = 1u << 5;
+constexpr uint16_t kPadDown     = 1u << 6;
+constexpr uint16_t kPadLeft     = 1u << 7;
+constexpr uint16_t kPadL2       = 1u << 8;
+constexpr uint16_t kPadR2       = 1u << 9;
+constexpr uint16_t kPadL1       = 1u << 10;
+constexpr uint16_t kPadR1       = 1u << 11;
+constexpr uint16_t kPadTriangle = 1u << 12;
+constexpr uint16_t kPadCircle   = 1u << 13;
+constexpr uint16_t kPadCross    = 1u << 14;
+constexpr uint16_t kPadSquare   = 1u << 15;
+
+struct MouseAimState {
+    bool enabled = false;
+    bool mouse_aim_enabled = false;
+    bool modern_controls_enabled = false;
+    bool high_precision_camera = false;
+    bool configured = false;
+    bool captured = false;
+    bool middle_was_down = false;
+    bool escape_was_down = false;
+    bool invert_horizontal = false;
+    double horizontal_sensitivity = kDefaultHorizontalSensitivity;
+    double fractional_yaw = 0.0;
+    uint64_t frame = 0;
+    uint64_t motion_samples = 0;
+    double interval_mouse_x = 0.0;
+    int64_t interval_yaw_steps = 0;
+    uint16_t interval_modern_press_mask = 0;
+    std::FILE *log = nullptr;
+};
+
+MouseAimState g_mouse;
+
+std::string trim_copy(const std::string& value) {
+    size_t first = 0;
+    while (first < value.size() &&
+           (value[first] == ' ' || value[first] == '\t' ||
+            value[first] == '\r' || value[first] == '\n')) {
+        ++first;
+    }
+    size_t last = value.size();
+    while (last > first &&
+           (value[last - 1] == ' ' || value[last - 1] == '\t' ||
+            value[last - 1] == '\r' || value[last - 1] == '\n')) {
+        --last;
+    }
+    return value.substr(first, last - first);
+}
+
+bool parse_bool(const std::string& value, bool fallback) {
+    std::string lowered = trim_copy(value);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+                   });
+    if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on")
+        return true;
+    if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off")
+        return false;
+    return fallback;
+}
+
+double parse_sensitivity(const std::string& value, double fallback) {
+    const std::string trimmed = trim_copy(value);
+    if (trimmed.empty()) return fallback;
+    char *tail = nullptr;
+    const double parsed = std::strtod(trimmed.c_str(), &tail);
+    if (tail == trimmed.c_str() || !std::isfinite(parsed)) return fallback;
+    while (*tail == ' ' || *tail == '\t' || *tail == '\r' || *tail == '\n') ++tail;
+    if (*tail != '\0') return fallback;
+    return std::clamp(parsed, kMinimumSensitivity, kMaximumSensitivity);
+}
+
+bool env_enabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value && value[0] != '\0' && !(
+        std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "FALSE") == 0 || std::strcmp(value, "off") == 0 ||
+        std::strcmp(value, "OFF") == 0);
+}
+
+void load_configuration() {
+    if (g_mouse.configured) return;
+    g_mouse.configured = true;
+
+    std::ifstream input("mouse-aim.ini");
+    std::string line;
+    while (std::getline(input, line)) {
+        const size_t comment = line.find_first_of("#;");
+        if (comment != std::string::npos) line.erase(comment);
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos) continue;
+        const std::string key = trim_copy(line.substr(0, equals));
+        const std::string value = trim_copy(line.substr(equals + 1));
+        if (key == "horizontal_sensitivity") {
+            g_mouse.horizontal_sensitivity =
+                parse_sensitivity(value, g_mouse.horizontal_sensitivity);
+        } else if (key == "invert_horizontal") {
+            g_mouse.invert_horizontal = parse_bool(value, g_mouse.invert_horizontal);
+        }
+    }
+
+    if (const char *value = std::getenv("PSX_DISRUPTOR_MOUSE_SENSITIVITY")) {
+        g_mouse.horizontal_sensitivity =
+            parse_sensitivity(value, g_mouse.horizontal_sensitivity);
+    }
+    if (const char *value = std::getenv("PSX_DISRUPTOR_MOUSE_INVERT_X")) {
+        g_mouse.invert_horizontal = parse_bool(value, g_mouse.invert_horizontal);
+    }
+}
+
+void set_title(const char *message) {
+    if (!sdl_window) return;
+    const char *mode = g_mouse.modern_controls_enabled
+        ? "Modern Controls" : "Mouse Aim";
+    const std::string title = std::string("Disruptor Recompiled - ") +
+                              mode + ": " + message;
+    SDL_SetWindowTitle(sdl_window, title.c_str());
+}
+
+void open_log() {
+    if (g_mouse.log) return;
+    g_mouse.log = std::fopen("disruptor-mouse-aim.log", "wb");
+    if (!g_mouse.log) return;
+    std::fprintf(g_mouse.log,
+                 "DISRUPTOR MODERN CONTROLS AND HORIZONTAL MOUSE AIM v2\n"
+                 "yaw_address=0x%08X\n"
+                 "mouse_aim=%s\n"
+                 "modern_controls=%s\n"
+                 "high_precision_camera=%s\n"
+                 "horizontal_sensitivity=%.6f\n"
+                 "invert_horizontal=%s\n"
+                 "capture=middle-click release=middle-click-or-escape\n"
+                 "keyboard=W/S:forward/back A/D:strafe Space:jump E:use "
+                 "F:psionic Q:weapon R:psionic-select Tab:map P:pause\n"
+                 "mouse=left:fire right:psionic X1:weapon X2:psionic-select\n",
+                 kPlayerYawAddress,
+                 g_mouse.mouse_aim_enabled ? "true" : "false",
+                 g_mouse.modern_controls_enabled ? "true" : "false",
+                 g_mouse.high_precision_camera ? "true" : "false",
+                 g_mouse.horizontal_sensitivity,
+                 g_mouse.invert_horizontal ? "true" : "false");
+    std::fflush(g_mouse.log);
+}
+
+void log_event(const char *event) {
+    if (!g_mouse.log) return;
+    std::fprintf(g_mouse.log, "event=%s frame=%llu yaw=0x%02X\n", event,
+                 static_cast<unsigned long long>(g_mouse.frame),
+                 static_cast<unsigned>(psx_read_byte(kPlayerYawAddress)));
+    std::fflush(g_mouse.log);
+}
+
+bool set_relative_mouse_mode(bool enabled) {
+    if (!sdl_window) return false;
+#if defined(PSX_SDL3)
+    return SDL_SetWindowRelativeMouseMode(sdl_window, enabled);
+#else
+    return SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE) == 0;
+#endif
+}
+
+uint32_t get_mouse_buttons() {
+#if defined(PSX_SDL3)
+    float x = 0.0f;
+    float y = 0.0f;
+    return static_cast<uint32_t>(SDL_GetMouseState(&x, &y));
+#else
+    int x = 0;
+    int y = 0;
+    return static_cast<uint32_t>(SDL_GetMouseState(&x, &y));
+#endif
+}
+
+void discard_relative_motion() {
+#if defined(PSX_SDL3)
+    float x = 0.0f;
+    float y = 0.0f;
+    (void)SDL_GetRelativeMouseState(&x, &y);
+#else
+    int x = 0;
+    int y = 0;
+    (void)SDL_GetRelativeMouseState(&x, &y);
+#endif
+}
+
+double take_relative_x() {
+#if defined(PSX_SDL3)
+    float x = 0.0f;
+    float y = 0.0f;
+    (void)SDL_GetRelativeMouseState(&x, &y);
+    return static_cast<double>(x);
+#else
+    int x = 0;
+    int y = 0;
+    (void)SDL_GetRelativeMouseState(&x, &y);
+    return static_cast<double>(x);
+#endif
+}
+
+void set_capture(bool captured, const char *reason) {
+    if (captured == g_mouse.captured) return;
+    if (!set_relative_mouse_mode(captured)) {
+        set_title("ERROR enabling relative mode; see log");
+        if (g_mouse.log) {
+            std::fprintf(g_mouse.log, "event=relative-mode-error requested=%s error=%s\n",
+                         captured ? "capture" : "release", SDL_GetError());
+            std::fflush(g_mouse.log);
+        }
+        return;
+    }
+
+    g_mouse.captured = captured;
+    g_mouse.fractional_yaw = 0.0;
+    gpu_geometry_camera_yaw_residual_set(0.0);
+    discard_relative_motion();
+    log_event(reason);
+    if (captured) {
+        set_title(g_mouse.modern_controls_enabled
+            ? "CAPTURED - LMB fire, RMB psionic; middle-click or Esc releases"
+            : "CAPTURED - move to turn; middle-click or Esc releases");
+    } else {
+        set_title("released - middle-click in live gameplay to capture");
+    }
+}
+
+bool key_down(const Uint8 *keys, int scancode) {
+    return keys && scancode >= 0 && keys[scancode] != 0;
+}
+
+/* Merge host controls into the already sampled port-1 pad word.  This runs
+ * after the runtime's final low-latency sample, so releases are naturally
+ * refreshed on the next frame and no synthetic button can stick.  Keyboard
+ * controls remain live while uncaptured; mouse actions require capture so a
+ * desktop click cannot fire into gameplay accidentally. */
+void apply_modern_controls(const Uint8 *keys, uint32_t mouse_buttons) {
+    if (!g_mouse.modern_controls_enabled) return;
+
+    uint16_t press = 0;
+    if (key_down(keys, SDL_SCANCODE_W) || key_down(keys, SDL_SCANCODE_UP))
+        press |= kPadUp;
+    if (key_down(keys, SDL_SCANCODE_S) || key_down(keys, SDL_SCANCODE_DOWN))
+        press |= kPadDown;
+    if (key_down(keys, SDL_SCANCODE_LEFT))  press |= kPadLeft;
+    if (key_down(keys, SDL_SCANCODE_RIGHT)) press |= kPadRight;
+    if (key_down(keys, SDL_SCANCODE_A))     press |= kPadL2;
+    if (key_down(keys, SDL_SCANCODE_D))     press |= kPadR2;
+    if (key_down(keys, SDL_SCANCODE_SPACE)) press |= kPadCircle;
+    if (key_down(keys, SDL_SCANCODE_E))     press |= kPadTriangle;
+    if (key_down(keys, SDL_SCANCODE_F))     press |= kPadSquare;
+    if (key_down(keys, SDL_SCANCODE_Q))     press |= kPadL1;
+    if (key_down(keys, SDL_SCANCODE_R))     press |= kPadR1;
+    if (key_down(keys, SDL_SCANCODE_TAB))   press |= kPadSelect;
+    if (key_down(keys, SDL_SCANCODE_P))     press |= kPadStart;
+    if (key_down(keys, SDL_SCANCODE_RETURN)) press |= kPadCross;
+
+    if (g_mouse.captured) {
+        if ((mouse_buttons & SDL_BUTTON_LMASK) != 0)  press |= kPadCross;
+        if ((mouse_buttons & SDL_BUTTON_RMASK) != 0)  press |= kPadSquare;
+        if ((mouse_buttons & SDL_BUTTON_X1MASK) != 0) press |= kPadL1;
+        if ((mouse_buttons & SDL_BUTTON_X2MASK) != 0) press |= kPadR1;
+    }
+
+    if (press != 0) {
+        const uint16_t sampled = sio_get_pad_buttons_slot(0);
+        sio_set_pad_state_slot(0, static_cast<uint16_t>(sampled & ~press));
+        g_mouse.interval_modern_press_mask |= press;
+    }
+}
+
+void apply_mouse_x(double raw_x) {
+    if (raw_x == 0.0) return;
+    raw_x = std::clamp(raw_x, -kMaximumMotionPerFrame, kMaximumMotionPerFrame);
+    const double direction = g_mouse.invert_horizontal ? 1.0 : -1.0;
+    g_mouse.fractional_yaw +=
+        raw_x * g_mouse.horizontal_sensitivity * direction;
+
+    const double whole = std::trunc(g_mouse.fractional_yaw);
+    if (whole == 0.0) return;
+    int yaw_steps = static_cast<int>(whole);
+    yaw_steps = std::clamp(yaw_steps, -64, 64);
+    g_mouse.fractional_yaw -= static_cast<double>(yaw_steps);
+    if (std::abs(whole) > 64.0) g_mouse.fractional_yaw = 0.0;
+
+    const uint8_t old_yaw = psx_read_byte(kPlayerYawAddress);
+    const uint8_t new_yaw = static_cast<uint8_t>(
+        static_cast<int>(old_yaw) + yaw_steps);
+    psx_write_byte(kPlayerYawAddress, new_yaw);
+    ++g_mouse.motion_samples;
+    g_mouse.interval_mouse_x += raw_x;
+    g_mouse.interval_yaw_steps += yaw_steps;
+}
+
+void mouse_aim_frame() {
+    if (!g_mouse.enabled || !sdl_window) return;
+    ++g_mouse.frame;
+    load_configuration();
+    open_log();
+
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        set_title("middle-click in live gameplay to capture");
+        log_event("ready");
+    }
+
+    const Uint8 *keys = SDL_GetKeyboardState(nullptr);
+    const bool escape_down = keys && keys[SDL_SCANCODE_ESCAPE] != 0;
+    const uint32_t buttons = get_mouse_buttons();
+    const bool middle_down = (buttons & SDL_BUTTON_MMASK) != 0;
+
+    if (g_mouse.captured &&
+        (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_INPUT_FOCUS) == 0) {
+        set_capture(false, "focus-lost-release");
+    } else if (middle_down && !g_mouse.middle_was_down) {
+        set_capture(!g_mouse.captured,
+                    g_mouse.captured ? "middle-release" : "middle-capture");
+    } else if (g_mouse.captured && escape_down && !g_mouse.escape_was_down) {
+        set_capture(false, "escape-release");
+    }
+
+    g_mouse.middle_was_down = middle_down;
+    g_mouse.escape_was_down = escape_down;
+
+    apply_modern_controls(keys, buttons);
+    if (g_mouse.captured && g_mouse.mouse_aim_enabled)
+        apply_mouse_x(take_relative_x());
+    else if (g_mouse.captured)
+        discard_relative_motion();
+
+    /* The retail yaw byte remains authoritative for gameplay.  The sub-byte
+     * remainder is presentation metadata only, consumed by the independent
+     * geometry-correction surface; releasing capture immediately restores the
+     * exact retail camera. */
+    gpu_geometry_camera_yaw_residual_set(
+        g_mouse.high_precision_camera && g_mouse.captured &&
+                g_mouse.mouse_aim_enabled
+            ? g_mouse.fractional_yaw
+            : 0.0);
+
+    if (g_mouse.log && g_mouse.frame % 60u == 0u) {
+        uint64_t geometry_world = 0;
+        uint64_t geometry_precise = 0;
+        gpu_geometry_correction_stats(&geometry_world, &geometry_precise);
+        std::fprintf(g_mouse.log,
+                     "sample frame=%llu captured=%s mouse_x=%.3f yaw_steps=%lld "
+                     "yaw=0x%02X yaw_residual=%.6f motion_samples=%llu "
+                     "modern_press_mask=0x%04X geometry_world=%llu "
+                     "geometry_precise=%llu "
+                     "ws_margin=%d ws_native_active=%d ws_pinned_43=%d "
+                     "ws_extra=%d\n",
+                     static_cast<unsigned long long>(g_mouse.frame),
+                     g_mouse.captured ? "true" : "false",
+                     g_mouse.interval_mouse_x,
+                     static_cast<long long>(g_mouse.interval_yaw_steps),
+                     static_cast<unsigned>(psx_read_byte(kPlayerYawAddress)),
+                     g_mouse.fractional_yaw,
+                     static_cast<unsigned long long>(g_mouse.motion_samples),
+                     static_cast<unsigned>(g_mouse.interval_modern_press_mask),
+                     static_cast<unsigned long long>(geometry_world),
+                     static_cast<unsigned long long>(geometry_precise),
+                     static_cast<int>(psx_mod_widescreen_x_margin()),
+                     ws_native_wide_active(), gpu_ws_present_native_43(),
+                     ws_nw_extra());
+        std::fflush(g_mouse.log);
+        g_mouse.interval_mouse_x = 0.0;
+        g_mouse.interval_yaw_steps = 0;
+        g_mouse.interval_modern_press_mask = 0;
+    }
+}
+
+struct MouseAimRegistration {
+    MouseAimRegistration() {
+        g_mouse.mouse_aim_enabled =
+            env_enabled("PSX_DISRUPTOR_MOUSE_AIM");
+        g_mouse.modern_controls_enabled =
+            env_enabled("PSX_DISRUPTOR_MODERN_CONTROLS");
+        g_mouse.high_precision_camera =
+            env_enabled("PSX_DISRUPTOR_HIGH_PRECISION_CAMERA");
+        g_mouse.enabled = g_mouse.mouse_aim_enabled ||
+                          g_mouse.modern_controls_enabled ||
+                          g_mouse.high_precision_camera;
+        if (g_mouse.enabled) mod_register_frame_hook(mouse_aim_frame);
+    }
+};
+
+MouseAimRegistration g_registration;
+
+}  // namespace

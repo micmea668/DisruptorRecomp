@@ -1,0 +1,50 @@
+[game]
+name = "Disruptor"
+id = "SLUS-00224"
+exe = "input/SLUS_002.24.code"
+disc = "input/Disruptor (USA).cue"
+load_address = "0x80011200"
+entry_pc = "0x80048CE4"
+text_size = "0x00045738"
+stack_base = "0x801FFFF0"
+
+[recompiler]
+seeds = "seeds/functions.txt"
+bios_config = "psxrecomp/bios/OpenBIOS.toml"
+out_dir = "generated"
+out_stem = "SLUS_002.24.code"
+strict = true
+discovery = "whole-image"
+
+[runtime]
+debug_port = 4624
+window_title = "Disruptor Recompiled"
+memcard_dir = "saves"
+disc_speed = "1x"
+bios_hle = false
+overlay_cache = true
+overlay_backend = "auto"
+overlay_capture_history = true
+overlay_capture_persist_dir = "private-overlay-work/history"
+
+[video]
+aspect_ratio = "4:3"
+renderer = "software"
+supersampling = 1
+antialiasing = false
+texture_filtering = "nearest"
+
+[controller]
+default_mode = "digital"
+allow_hybrid = false
+lock_mode = true
+
+[audit]
+[[audit.regions]]
+name = "Main executable"
+rom_start = "0x800"
+rom_end = "0x45F38"
+vaddr_base = "0x80011200"
+
+[audit.normalize]
+kseg_mask = "0x1FFFFFFF"

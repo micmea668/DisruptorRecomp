@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+# Native Windows scripts are stored canonically as text and checked out with
+# the line endings expected by cmd.exe and Windows PowerShell.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Keep portable scripts and source deterministic on every host.
+*.sh text eol=lf
+*.py text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf

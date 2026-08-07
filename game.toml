@@ -1,0 +1,104 @@
+[game]
+name = "Disruptor"
+id = "SLUS-00224"
+exe = "input/SLUS_002.24.code"
+disc = "input/Disruptor (USA).cue"
+load_address = "0x80011200"
+entry_pc = "0x80048CE4"
+text_size = "0x00045738"
+stack_base = "0x801FFFF0"
+
+[recompiler]
+seeds = "seeds/functions.txt"
+bios_config = "psxrecomp/bios/OpenBIOS.toml"
+out_dir = "generated"
+out_stem = "SLUS_002.24.code"
+strict = true
+discovery = "whole-image"
+
+[runtime]
+debug_port = 4624
+window_title = "Disruptor Recompiled"
+memcard_dir = "saves"
+disc_speed = "1x"
+bios_hle = false
+overlay_cache = true
+overlay_backend = "auto"
+
+[video]
+aspect_ratio = "4:3"
+renderer = "opengl"
+supersampling = 4
+antialiasing = true
+texture_filtering = "nearest"
+
+[controller]
+default_mode = "digital"
+allow_hybrid = false
+lock_mode = true
+
+# The shipped default remains authentic 4:3.  The same generated executable
+# can select 16:9 at launch: every cull helper below is an identity at 4:3.
+[widescreen]
+gte_game_mode = true
+native_wide = false
+hud_sprt_squash = true
+nw_hud_corners = false
+offer = true
+offer_ultrawide = false
+adaptive_view = false
+
+# Disruptor seeds portal traversal with two eight-bit yaw rays at +/-32 units
+# (a 45-degree 4:3 half-FOV). Widen only those signed offsets for the live
+# aspect; keep every downstream unsigned 0..320 portal span intact.
+[[widescreen.cull.yaw_cone]]
+address = "0x80040FE8"
+expected = "0x24710020"
+full_turn = 256
+
+[[widescreen.cull.yaw_cone]]
+address = "0x80040FF0"
+expected = "0x2472FFE0"
+full_turn = 256
+
+# Two world-object funnels repeat the 45-degree horizontal side-plane test
+# after traversal. Their adjacent vertical tests deliberately remain vanilla.
+[[widescreen.cull.horizontal_slt]]
+address = "0x8003B8EC"
+expected = "0x0067102A"
+
+[[widescreen.cull.horizontal_slt]]
+address = "0x8003B8F8"
+expected = "0x0062102A"
+
+[[widescreen.cull.horizontal_slt]]
+address = "0x8003BD00"
+expected = "0x0067102A"
+
+[[widescreen.cull.horizontal_slt]]
+address = "0x8003BD0C"
+expected = "0x0062102A"
+
+# Disruptor's static-world portal renderer assumes every clip span remains in
+# its original unsigned 0..320 range.  Native-wide negative spans caused the
+# yaw-dependent world disappearance seen in Modernisation Tests 4-6.  Classic
+# projection-and-stretch keeps those invariants intact: the GTE handles normal
+# 3D, while these exact final-X sites apply the same 3/4 projection squash to
+# the game's CPU-projected portals, billboards, and point effects.  At 4:3 the
+# helper is an exact identity.
+[widescreen.backdrop]
+x_sites = [
+    "0x8003A578", "0x8003A650", "0x8003B244", "0x8003B2A0",
+    "0x8003B988", "0x8003BD9C", "0x8003C4AC", "0x8003D074",
+    "0x8003F6B4",
+]
+
+[audit]
+[[audit.regions]]
+name = "Main executable"
+rom_start = "0x800"
+rom_end = "0x45F38"
+vaddr_base = "0x80011200"
+
+[audit.normalize]
+kseg_mask = "0x1FFFFFFF"

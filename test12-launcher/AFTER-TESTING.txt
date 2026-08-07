@@ -1,0 +1,18 @@
+AFTER TESTING
+=============
+
+Recorded result (2026-08-07): fractures and stretched facets were gone, but
+neither corrected mode showed a noticeable wobble improvement over Test 9.
+The checklist below is retained for reproducibility.
+
+1. Compare the same scene in Exact Geometry Only, Exact Geometry + Fractional
+   Camera, and the Test 9 Baseline.
+2. Check slow rotation, tiny mouse turns, movement without rotation, doorways,
+   the green-lit steps, wall/floor seams and both widescreen edges.
+3. Confirm that Test 11's fractures and stretched facets are completely absent.
+4. Run "Collect Modernisation Results.cmd".
+5. Upload the resulting Disruptor-Modernisation-Test-12-Results ZIP privately
+   and describe which mode looked and felt best.
+
+Do not publish the executable, result ZIP, disc image or capture-history files.
+They may contain code derived from your retail disc.

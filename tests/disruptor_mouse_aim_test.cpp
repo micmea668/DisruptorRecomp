@@ -1,0 +1,433 @@
+#include "psx_sdl.h"
+
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <string>
+
+namespace {
+
+SDL_Window g_window;
+std::array<std::uint8_t, 2 * 1024 * 1024> g_ram{};
+std::array<Uint8, 512> g_keys{};
+void (*g_registered_hook)(void) = nullptr;
+std::uint32_t g_buttons = 0;
+std::uint16_t g_pad_buttons = 0xFFFFu;
+float g_relative_x = 0.0f;
+float g_relative_y = 0.0f;
+SDL_WindowFlags g_window_flags = SDL_WINDOW_INPUT_FOCUS;
+bool g_relative_mode = false;
+bool g_relative_mode_succeeds = true;
+std::string g_title;
+int g_failures = 0;
+int g_ws_margin = 0;
+int g_ws_pinned_43 = 1;
+int g_ws_native_active = 0;
+int g_ws_extra = 0;
+double g_camera_yaw_residual = 0.0;
+int g_camera_yaw_residual_calls = 0;
+
+constexpr std::uint32_t kTestYawAddress = 0x80077624u;
+
+}  // namespace
+
+extern "C" {
+
+SDL_Window *sdl_window = &g_window;
+
+void mod_register_frame_hook(void (*hook)(void)) {
+    g_registered_hook = hook;
+}
+
+std::uint8_t psx_read_byte(std::uint32_t address) {
+    return g_ram[address & 0x001fffffu];
+}
+
+void psx_write_byte(std::uint32_t address, std::uint8_t value) {
+    g_ram[address & 0x001fffffu] = value;
+}
+
+std::uint16_t sio_get_pad_buttons_slot(int slot) {
+    return slot == 0 ? g_pad_buttons : 0xFFFFu;
+}
+
+void sio_set_pad_state_slot(int slot, std::uint16_t buttons) {
+    if (slot == 0) g_pad_buttons = buttons;
+}
+
+std::int32_t psx_mod_widescreen_x_margin() {
+    return g_ws_margin;
+}
+
+int gpu_ws_present_native_43() {
+    return g_ws_pinned_43;
+}
+
+int ws_native_wide_active() {
+    return g_ws_native_active;
+}
+
+int ws_nw_extra() {
+    return g_ws_extra;
+}
+
+void gpu_geometry_camera_yaw_residual_set(double yaw_units) {
+    g_camera_yaw_residual = yaw_units;
+    ++g_camera_yaw_residual_calls;
+}
+
+void gpu_geometry_correction_stats(std::uint64_t *world_triangles,
+                                   std::uint64_t *precise_triangles) {
+    if (world_triangles) *world_triangles = 0;
+    if (precise_triangles) *precise_triangles = 0;
+}
+
+}  // extern "C"
+
+bool SDL_SetWindowRelativeMouseMode(SDL_Window *, bool enabled) {
+    if (!g_relative_mode_succeeds) return false;
+    g_relative_mode = enabled;
+    return true;
+}
+
+std::uint32_t SDL_GetMouseState(float *x, float *y) {
+    if (x) *x = 0.0f;
+    if (y) *y = 0.0f;
+    return g_buttons;
+}
+
+std::uint32_t SDL_GetRelativeMouseState(float *x, float *y) {
+    if (x) *x = g_relative_x;
+    if (y) *y = g_relative_y;
+    g_relative_x = 0.0f;
+    g_relative_y = 0.0f;
+    return g_buttons;
+}
+
+const Uint8 *SDL_GetKeyboardState(int *count) {
+    if (count) *count = static_cast<int>(g_keys.size());
+    return g_keys.data();
+}
+
+SDL_WindowFlags SDL_GetWindowFlags(SDL_Window *) {
+    return g_window_flags;
+}
+
+bool SDL_SetWindowTitle(SDL_Window *, const char *title) {
+    g_title = title ? title : "";
+    return true;
+}
+
+const char *SDL_GetError() {
+    return "mock relative-mode failure";
+}
+
+// Include the implementation so its internal pure helpers and state can be
+// exercised against the mocks above without exposing a test-only production ABI.
+#include "../src/disruptor_mouse_aim.cpp"
+
+namespace {
+
+void expect(bool condition, const char *message) {
+    if (condition) return;
+    ++g_failures;
+    std::cerr << "FAIL: " << message << '\n';
+}
+
+void expect_close(double actual, double expected, const char *message) {
+    expect(std::abs(actual - expected) < 0.000001, message);
+}
+
+void reset_state() {
+    if (g_mouse.log) std::fclose(g_mouse.log);
+    g_mouse = MouseAimState{};
+    g_ram.fill(0);
+    g_keys.fill(0);
+    g_buttons = 0;
+    g_pad_buttons = 0xFFFFu;
+    g_relative_x = 0.0f;
+    g_relative_y = 0.0f;
+    g_window_flags = SDL_WINDOW_INPUT_FOCUS;
+    g_relative_mode = false;
+    g_relative_mode_succeeds = true;
+    g_title.clear();
+    g_ws_margin = 0;
+    g_ws_pinned_43 = 1;
+    g_ws_native_active = 0;
+    g_ws_extra = 0;
+    g_camera_yaw_residual = 0.0;
+    g_camera_yaw_residual_calls = 0;
+    sdl_window = &g_window;
+}
+
+void test_parsing() {
+    expect(parse_bool(" YES ", false), "boolean true parsing");
+    expect(!parse_bool("off", true), "boolean false parsing");
+    expect(parse_bool("invalid", true), "invalid boolean fallback");
+    expect_close(parse_sensitivity("0.125", 0.08), 0.125,
+                 "decimal sensitivity parsing");
+    expect_close(parse_sensitivity("0", 0.08), 0.005,
+                 "minimum sensitivity clamp");
+    expect_close(parse_sensitivity("99", 0.08), 2.0,
+                 "maximum sensitivity clamp");
+    expect_close(parse_sensitivity("bad", 0.08), 0.08,
+                 "invalid sensitivity fallback");
+}
+
+void test_ini_configuration() {
+    reset_state();
+    {
+        std::ofstream output("mouse-aim.ini", std::ios::trunc);
+        output << "# test configuration\n"
+                  "horizontal_sensitivity = 0.375\n"
+                  "invert_horizontal = yes\n";
+    }
+    load_configuration();
+    expect_close(g_mouse.horizontal_sensitivity, 0.375,
+                 "INI sensitivity load");
+    expect(g_mouse.invert_horizontal, "INI inversion load");
+    std::remove("mouse-aim.ini");
+}
+
+void test_direction_fraction_and_wrap() {
+    reset_state();
+    g_mouse.horizontal_sensitivity = 0.08;
+
+    psx_write_byte(kTestYawAddress, 100);
+    apply_mouse_x(25.0);
+    expect(psx_read_byte(kTestYawAddress) == 98,
+           "rightward motion decreases Disruptor yaw");
+    apply_mouse_x(-25.0);
+    expect(psx_read_byte(kTestYawAddress) == 100,
+           "leftward motion increases Disruptor yaw");
+
+    psx_write_byte(kTestYawAddress, 100);
+    g_mouse.fractional_yaw = 0.0;
+    apply_mouse_x(6.0);
+    expect(psx_read_byte(kTestYawAddress) == 100,
+           "sub-step motion is retained without premature yaw change");
+    apply_mouse_x(7.0);
+    expect(psx_read_byte(kTestYawAddress) == 99,
+           "fractional motion accumulates into one yaw step");
+    expect_close(g_mouse.fractional_yaw, -0.04,
+                 "fractional remainder is preserved");
+
+    g_mouse.horizontal_sensitivity = 1.0;
+    g_mouse.fractional_yaw = 0.0;
+    psx_write_byte(kTestYawAddress, 1);
+    apply_mouse_x(4.0);
+    expect(psx_read_byte(kTestYawAddress) == 253,
+           "negative yaw wraps through zero");
+    psx_write_byte(kTestYawAddress, 254);
+    apply_mouse_x(-4.0);
+    expect(psx_read_byte(kTestYawAddress) == 2,
+           "positive yaw wraps through 255");
+
+    g_mouse.invert_horizontal = true;
+    psx_write_byte(kTestYawAddress, 10);
+    apply_mouse_x(3.0);
+    expect(psx_read_byte(kTestYawAddress) == 13,
+           "horizontal inversion reverses direction");
+}
+
+void test_motion_safety_clamp() {
+    reset_state();
+    g_mouse.horizontal_sensitivity = 2.0;
+    psx_write_byte(kTestYawAddress, 10);
+    apply_mouse_x(5000.0);
+    expect(psx_read_byte(kTestYawAddress) == 202,
+           "single-frame yaw delta is clamped to 64 steps");
+    expect_close(g_mouse.fractional_yaw, 0.0,
+                 "pathological motion does not leave a large backlog");
+}
+
+void test_capture_release_and_frame_motion() {
+    reset_state();
+    g_mouse.enabled = true;
+    g_mouse.mouse_aim_enabled = true;
+    g_mouse.configured = true;
+    g_mouse.horizontal_sensitivity = 0.08;
+    g_mouse.log = std::tmpfile();
+    psx_write_byte(kTestYawAddress, 100);
+
+    g_buttons = SDL_BUTTON_MMASK;
+    mouse_aim_frame();
+    expect(g_mouse.captured && g_relative_mode,
+           "middle-click captures the relative mouse");
+
+    g_buttons = 0;
+    g_relative_x = 25.0f;
+    mouse_aim_frame();
+    expect(psx_read_byte(kTestYawAddress) == 98,
+           "captured frame applies relative mouse motion");
+
+    g_buttons = SDL_BUTTON_MMASK;
+    mouse_aim_frame();
+    expect(!g_mouse.captured && !g_relative_mode,
+           "second middle-click releases the mouse");
+
+    g_buttons = 0;
+    mouse_aim_frame();
+    g_buttons = SDL_BUTTON_MMASK;
+    mouse_aim_frame();
+    g_buttons = 0;
+    mouse_aim_frame();
+    g_keys[SDL_SCANCODE_ESCAPE] = 1;
+    mouse_aim_frame();
+    expect(!g_mouse.captured && !g_relative_mode,
+           "Escape releases a captured mouse");
+
+    g_keys[SDL_SCANCODE_ESCAPE] = 0;
+    g_buttons = SDL_BUTTON_MMASK;
+    mouse_aim_frame();
+    g_buttons = 0;
+    mouse_aim_frame();
+    g_window_flags = 0;
+    mouse_aim_frame();
+    expect(!g_mouse.captured && !g_relative_mode,
+           "focus loss releases a captured mouse");
+}
+
+void test_high_precision_camera_residual() {
+    reset_state();
+    g_mouse.enabled = true;
+    g_mouse.mouse_aim_enabled = true;
+    g_mouse.high_precision_camera = true;
+    g_mouse.configured = true;
+    g_mouse.horizontal_sensitivity = 0.08;
+    g_mouse.log = std::tmpfile();
+    psx_write_byte(kTestYawAddress, 100);
+
+    g_buttons = SDL_BUTTON_MMASK;
+    mouse_aim_frame();
+    expect_close(g_camera_yaw_residual, 0.0,
+                 "capture starts with zero presentation residual");
+
+    g_buttons = 0;
+    g_relative_x = 6.0f;
+    mouse_aim_frame();
+    expect(psx_read_byte(kTestYawAddress) == 100,
+           "sub-step high-precision motion leaves retail yaw unchanged");
+    expect_close(g_camera_yaw_residual, -0.48,
+                 "sub-step remainder reaches the presentation camera");
+
+    g_relative_x = 7.0f;
+    mouse_aim_frame();
+    expect(psx_read_byte(kTestYawAddress) == 99,
+           "crossing the byte boundary still advances retail yaw");
+    expect_close(g_camera_yaw_residual, -0.04,
+                 "presentation residual is continuous across byte boundary");
+
+    g_buttons = SDL_BUTTON_MMASK;
+    mouse_aim_frame();
+    expect(!g_mouse.captured, "high-precision test releases capture");
+    expect_close(g_camera_yaw_residual, 0.0,
+                 "release restores the exact retail presentation camera");
+}
+
+void expect_pressed(std::uint16_t mask, const char *message) {
+    expect((g_pad_buttons & mask) == 0, message);
+}
+
+void expect_released(std::uint16_t mask, const char *message) {
+    expect((g_pad_buttons & mask) == mask, message);
+}
+
+void test_modern_keyboard_mapping_and_merge() {
+    reset_state();
+    g_mouse.modern_controls_enabled = true;
+
+    /* Preserve an action already supplied by the normal keyboard/controller
+     * sampler while adding all of the modern keyboard actions. */
+    g_pad_buttons = static_cast<std::uint16_t>(0xFFFFu & ~kPadSelect);
+    g_keys[SDL_SCANCODE_W] = 1;
+    g_keys[SDL_SCANCODE_S] = 1;
+    g_keys[SDL_SCANCODE_A] = 1;
+    g_keys[SDL_SCANCODE_D] = 1;
+    g_keys[SDL_SCANCODE_SPACE] = 1;
+    g_keys[SDL_SCANCODE_E] = 1;
+    g_keys[SDL_SCANCODE_F] = 1;
+    g_keys[SDL_SCANCODE_Q] = 1;
+    g_keys[SDL_SCANCODE_R] = 1;
+    g_keys[SDL_SCANCODE_P] = 1;
+    g_keys[SDL_SCANCODE_RETURN] = 1;
+    apply_modern_controls(g_keys.data(), 0);
+
+    expect_pressed(kPadSelect, "existing sampled controller action is preserved");
+    expect_pressed(kPadUp, "W maps to walk forward");
+    expect_pressed(kPadDown, "S maps to walk backward");
+    expect_pressed(kPadL2, "A maps to strafe left");
+    expect_pressed(kPadR2, "D maps to strafe right");
+    expect_pressed(kPadCircle, "Space maps to jump");
+    expect_pressed(kPadTriangle, "E maps to use");
+    expect_pressed(kPadSquare, "F maps to psionic attack");
+    expect_pressed(kPadL1, "Q maps to weapon selection");
+    expect_pressed(kPadR1, "R maps to psionic selection");
+    expect_pressed(kPadStart, "P maps to pause");
+    expect_pressed(kPadCross, "Return maps to confirm/fire");
+
+    reset_state();
+    g_mouse.modern_controls_enabled = true;
+    g_keys[SDL_SCANCODE_UP] = 1;
+    g_keys[SDL_SCANCODE_DOWN] = 1;
+    g_keys[SDL_SCANCODE_LEFT] = 1;
+    g_keys[SDL_SCANCODE_RIGHT] = 1;
+    g_keys[SDL_SCANCODE_TAB] = 1;
+    apply_modern_controls(g_keys.data(), 0);
+    expect_pressed(kPadUp, "Up arrow remains a menu/gameplay fallback");
+    expect_pressed(kPadDown, "Down arrow remains a menu/gameplay fallback");
+    expect_pressed(kPadLeft, "Left arrow retains original turn/menu behavior");
+    expect_pressed(kPadRight, "Right arrow retains original turn/menu behavior");
+    expect_pressed(kPadSelect, "Tab maps to the automap");
+}
+
+void test_modern_mouse_buttons_require_capture() {
+    reset_state();
+    g_mouse.modern_controls_enabled = true;
+    const std::uint32_t actions = SDL_BUTTON_LMASK | SDL_BUTTON_RMASK |
+                                  SDL_BUTTON_X1MASK | SDL_BUTTON_X2MASK;
+
+    apply_modern_controls(g_keys.data(), actions);
+    expect_released(kPadCross | kPadSquare | kPadL1 | kPadR1,
+                    "desktop mouse clicks do not reach the game while released");
+
+    g_mouse.captured = true;
+    apply_modern_controls(g_keys.data(), actions);
+    expect_pressed(kPadCross, "left mouse maps to fire");
+    expect_pressed(kPadSquare, "right mouse maps to psionic attack");
+    expect_pressed(kPadL1, "mouse X1 maps to weapon selection");
+    expect_pressed(kPadR1, "mouse X2 maps to psionic selection");
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--registration") == 0) {
+        expect(g_registered_hook != nullptr,
+               "environment opt-in registers the frame hook");
+    } else {
+        expect(g_registered_hook == nullptr,
+               "normal launch leaves mouse hook unregistered");
+        test_parsing();
+        test_ini_configuration();
+        test_direction_fraction_and_wrap();
+        test_motion_safety_clamp();
+        test_capture_release_and_frame_motion();
+        test_high_precision_camera_residual();
+        test_modern_keyboard_mapping_and_merge();
+        test_modern_mouse_buttons_require_capture();
+    }
+
+    if (g_mouse.log) {
+        std::fclose(g_mouse.log);
+        g_mouse.log = nullptr;
+    }
+    if (g_failures != 0) return 1;
+    std::cout << "Disruptor mouse-aim tests passed\n";
+    return 0;
+}

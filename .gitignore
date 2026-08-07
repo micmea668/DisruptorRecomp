@@ -1,0 +1,57 @@
+# Framework checkout and build outputs
+/psxrecomp/
+/build/
+/build-*/
+/generated/
+/private-overlay-work/
+/saves/
+/cache/
+/capture_history/
+
+# User-owned game data
+/input/*
+!/input/README.md
+*.bin
+*.cue
+*.iso
+*.img
+*.chd
+*.mcd
+*.mcr
+
+# Runtime/debug output
+overlay_captures.json
+overlay_captures.addendum.jsonl
+overlay_captures.json.d/
+psx_crash.txt
+psx_last_run_report.json
+psx_screenshot.bmp
+psx_freeze_heartbeat.json
+psx_freeze_dump*.json
+psx_cps_exit_trace.json
+starvation_dump.jsonl
+frustum-capture.json
+frustum-capture-status.txt
+*.log
+*.png
+*.zip
+*.7z
+*.exe
+*.dll
+
+# Explicit private/generated Disruptor artifacts
+SLUS_002.24
+SLUS_002.24.code
+Disruptor-main-code-private.bin
+Disruptor-Modernisation-*-Results-*
+
+# Local editor and Python files
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+CMakeUserPresets.json
+*.user
+__pycache__/
+*.pyc
