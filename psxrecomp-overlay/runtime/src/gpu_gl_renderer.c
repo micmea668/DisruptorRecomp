@@ -344,15 +344,22 @@ static void interp_draw_quad(float alpha, int lx, int ly, int lw, int lh);
 static int           s_raster_ok = 0;      /* full GPU pipeline available */
 
 /* Presentation-only geometry correction state. Precise vertices are queued by
- * gpu.c immediately before a polygon draw. The canonical pass floors them back
- * to the exact GP0 integer coordinates; only the independent display mirror
- * consumes their fractional component and the fractional camera yaw. */
+ * gpu.c immediately before a polygon draw. Every GL vertex carries the exact
+ * integer GP0 position separately from its optional precise position; the
+ * canonical pass always consumes the former, while only the independent
+ * display mirror may consume the latter and the fractional camera yaw. */
 static int           s_geometry_correction = 0;
 static int           s_next_world = 0;
 static int           s_next_precise = 0;
 static int32_t       s_next_x16[3], s_next_y16[3];
+static int           s_next_perspective = 0;
+static float         s_next_q[3] = { 0.0f, 0.0f, 0.0f };
 static float         s_yaw_sin = 0.0f, s_yaw_cos = 1.0f;
-static float         s_yaw_center = 160.0f, s_yaw_focal = 160.0f;
+static float         s_yaw_center_x = 160.0f;
+static float         s_yaw_center_y_relative = 120.0f;
+static float         s_yaw_focal_x = 160.0f;
+static int           s_geometry_full_yaw = 0;
+static int           s_geometry_coverage_tint = 0;
 
 /* Authoritative VRAM: hr color texture + stencil (mask bit) FBO. */
 static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
@@ -366,9 +373,10 @@ static GLuint        s_scratch_tex = 0, s_scratch_fbo = 0;
 /* Programs. */
 static GLuint s_geo_prog = 0, s_geo_vao = 0, s_geo_vbo = 0;
 static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
-/* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)
- * — per-prim texture state in flat attributes so prims batch (see flush_tex_batch). */
-#define TEXV 20
+/* Vertex formats retain both canonical GP0 and presentation-only positions.
+ * Per-primitive texture state stays in flat attributes so prims can batch. */
+#define GEOV 9
+#define TEXV 23
 static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
 static GLuint s_pack_prog = 0, s_stencil_prog = 0, s_empty_vao = 0;
 
@@ -392,11 +400,11 @@ static GLint s_tex_uXoff = -1, s_tex_uXhalf = -1;
 static GLint s_geo_uXscale = -1, s_geo_uXcenter = -1;
 static GLint s_tex_uXscale = -1, s_tex_uXcenter = -1;
 /* Presentation-mirror-only subpixel/yaw uniforms. The canonical pass keeps
- * u_visual=0, which floors any retained 16.16 coordinate to the guest GP0
- * integer. World classification is carried per vertex so sprites and HUD
- * rectangles remain fixed. */
-static GLint s_geo_uVisual = -1, s_geo_uCamera = -1;
-static GLint s_tex_uVisual = -1, s_tex_uCamera = -1;
+ * u_visual=0 and reads the explicit GP0-position attribute. World/exact
+ * classification is carried per vertex so sprites and HUD rectangles remain
+ * fixed and the optional exact-coverage tint cannot affect canonical output. */
+static GLint s_geo_uVisual = -1, s_geo_uCamera = -1, s_geo_uVisualOptions = -1;
+static GLint s_tex_uVisual = -1, s_tex_uCamera = -1, s_tex_uVisualOptions = -1;
 /* Runtime controls (ws_backdrop_stretch debug command). */
 int g_ws_bd_stretch_on   = 1;   /* feature on (gated by native-wide + per-prim gate) */
 int g_ws_bd_stretch_pct  = 0;   /* 0 = auto (g_wide_w/native_w); else pct/100 */
@@ -514,32 +522,42 @@ static int    s_wide_suppress = 0;
  * surface: local_x = vram_x - base_x + OFFSET. Same as SW wide_dx(). */
 static inline int wide_dx(void) { return g_wide_off - g_wide_cur_base; }
 
-static void geometry_visual_uniforms(GLint visual, GLint camera, int enabled) {
+static void geometry_visual_uniforms(GLint visual, GLint camera, GLint options,
+                                     int enabled) {
     const float on = enabled && s_geometry_correction ? 1.0f : 0.0f;
     p_glUniform1f(visual, on);
     p_glUniform4f(camera, s_yaw_sin, s_yaw_cos,
-                  (float)g_wide_cur_base + s_yaw_center, s_yaw_focal);
+                  (float)g_wide_cur_base + s_yaw_center_x,
+                  (float)s_off_y + s_yaw_center_y_relative);
+    p_glUniform4f(options, s_yaw_focal_x,
+                  s_geometry_full_yaw ? 1.0f : 0.0f,
+                  on && s_geometry_coverage_tint ? 0.55f : 0.0f, 0.0f);
 }
 
 /* Capture the one-shot metadata queued by gpu.c for the next polygon. `xs/ys`
  * remain the exact GP0 coordinates used for canonical dirty tracking and
  * guest-visible rasterization. The returned floats are consumed only by the
- * presentation mirror when the shader's u_visual switch is set. */
+ * presentation mirror when the shader's u_visual switch is set. The returned
+ * flags are bit 0 = world and bit 1 = exact precise provenance. */
 static int take_visual_triangle(const int *xs, const int *ys,
-                                float px[3], float py[3]) {
+                                 float px[3], float py[3], float pq[3]) {
     const int world = s_geometry_correction && s_next_world;
+    const int exact = world && s_next_precise;
+    const int perspective = exact && s_next_perspective;
     for (int i = 0; i < 3; ++i) {
-        if (world && s_next_precise) {
+        if (exact) {
             px[i] = (float)((double)s_next_x16[i] / 65536.0);
             py[i] = (float)((double)s_next_y16[i] / 65536.0);
         } else {
             px[i] = (float)xs[i];
             py[i] = (float)ys[i];
         }
+        if (pq) pq[i] = perspective ? s_next_q[i] : 0.0f;
     }
     s_next_world = 0;
     s_next_precise = 0;
-    return world;
+    s_next_perspective = 0;
+    return (world ? 1 : 0) | (exact ? 2 : 0);
 }
 
 /* ---- dirty-rect helpers ------------------------------------------------- */
@@ -821,34 +839,41 @@ static const char *GEO_VS =
     "#version 330\n"
     "layout(location=0) in vec2 a_pos;\n"
     "layout(location=1) in vec4 a_col;\n"
-    "layout(location=2) in float a_world;\n"
+    "layout(location=2) in float a_visual_flags;\n"
+    "layout(location=3) in vec2 a_visual_pos;\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
     "uniform float u_visual; /* 1 only for the independent display mirror */\n"
-    "uniform vec4 u_camera;  /* sin(yaw), cos(yaw), centre-x, focal-x */\n"
-    "noperspective out vec4 v_col;\n"
+    "uniform vec4 u_camera;  /* sin(yaw), cos(yaw), centre-x, centre-y */\n"
+    "uniform vec4 u_visual_options; /* focal-x, full-yaw, tint-strength, unused */\n"
+    "noperspective out vec4 v_col; noperspective out float v_tint;\n"
     "void main(){ v_col = a_col;\n"
-    "  bool corrected = u_visual > 0.5 && a_world > 0.5;\n"
-    "  vec2 p = corrected ? a_pos : floor(a_pos);\n"
-    "  float xb = p.x;\n"
-    "  if (corrected && abs(u_camera.x) > 0.0000001 && u_camera.w > 0.0) {\n"
-    "    float ux = (xb-u_camera.z)/u_camera.w;\n"
+    "  bool corrected = u_visual > 0.5 && a_visual_flags > 0.5;\n"
+    "  vec2 p = corrected ? a_visual_pos : a_pos;\n"
+    "  float xb = p.x, yb = p.y;\n"
+    "  v_tint = (u_visual > 0.5 && a_visual_flags > 1.5) ? u_visual_options.z : 0.0;\n"
+    "  if (corrected && abs(u_camera.x) > 0.0000001 && u_visual_options.x > 0.0) {\n"
+    "    float ux = (xb-u_camera.z)/u_visual_options.x;\n"
     "    float den = u_camera.y-ux*u_camera.x;\n"
-    "    if (abs(den) > 0.01) xb = u_camera.z + u_camera.w*((ux*u_camera.y+u_camera.x)/den);\n"
+    "    if (abs(den) > 0.01) {\n"
+    "      xb = u_camera.z + u_visual_options.x*((ux*u_camera.y+u_camera.x)/den);\n"
+    "      if (u_visual_options.y > 0.5) yb = u_camera.w + (yb-u_camera.w)/den;\n"
+    "    }\n"
     "  }\n"
     "  if (u_xscale < 0.0) {\n"
     "    float s = -u_xscale; float h = u_xhalf / s;\n"
     "    float l = u_xcenter - h, r = u_xcenter + h;\n"
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
     "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
-    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (p.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (yb+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *GEO_FS =
     "#version 330\n"
-    "noperspective in vec4 v_col; out vec4 frag;\n"
-    "void main(){ frag = v_col; }\n";
+    "noperspective in vec4 v_col; noperspective in float v_tint; out vec4 frag;\n"
+    "void main(){ frag = v_col;\n"
+    "  if (v_tint > 0.0) frag.rgb = mix(frag.rgb, vec3(1.0,0.15,0.85),v_tint); }\n";
 
 /* Textured prims: sample raw 1555 VRAM (integer), CLUT decode per depth,
  * texture window, optional bilinear, texel-0 discard, STP-split discard,
@@ -872,15 +897,20 @@ static const char *TEX_VS =
     "layout(location=6) in float a_raw;\n"
     "layout(location=7) in vec4 a_limits;\n"
     "layout(location=8) in float a_semi;\n"
-    "layout(location=9) in float a_world;\n"
+    "layout(location=9) in float a_visual_flags;\n"
+    "layout(location=10) in vec2 a_visual_pos;\n"
+    "layout(location=11) in float a_q;\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
     "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
     "uniform float u_visual; /* 1 only for the independent display mirror */\n"
-    "uniform vec4 u_camera;  /* sin(yaw), cos(yaw), centre-x, focal-x */\n"
-    "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
+    "uniform vec4 u_camera;  /* sin(yaw), cos(yaw), centre-x, centre-y */\n"
+    "uniform vec4 u_visual_options; /* focal-x, full-yaw, tint-strength, unused */\n"
+    "noperspective out vec2 v_uv; noperspective out vec3 v_uvq;\n"
+    "noperspective out vec4 v_col; flat out int v_perspective;\n"
+    "noperspective out float v_tint;\n"
     "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
     "flat out int v_raw; flat out ivec4 v_limits; flat out int v_semi;\n"
     "void main(){ v_uv = a_uv; v_col = a_col;\n"
@@ -890,23 +920,35 @@ static const char *TEX_VS =
     "  v_limits = ivec4(floor(a_limits + 0.5));\n"
     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
     "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
-    "  bool corrected = u_visual > 0.5 && a_world > 0.5;\n"
-    "  vec2 p = corrected ? a_pos : floor(a_pos);\n"
-    "  float xb = p.x;\n"
-    "  if (corrected && abs(u_camera.x) > 0.0000001 && u_camera.w > 0.0) {\n"
-    "    float ux = (xb-u_camera.z)/u_camera.w;\n"
+    "  bool corrected = u_visual > 0.5 && a_visual_flags > 0.5;\n"
+    "  vec2 p = corrected ? a_visual_pos : a_pos;\n"
+    "  float xb = p.x, yb = p.y;\n"
+    "  v_tint = (u_visual > 0.5 && a_visual_flags > 1.5) ? u_visual_options.z : 0.0;\n"
+    "  if (corrected && abs(u_camera.x) > 0.0000001 && u_visual_options.x > 0.0) {\n"
+    "    float ux = (xb-u_camera.z)/u_visual_options.x;\n"
     "    float den = u_camera.y-ux*u_camera.x;\n"
-    "    if (abs(den) > 0.01) xb = u_camera.z + u_camera.w*((ux*u_camera.y+u_camera.x)/den);\n"
+    "    if (abs(den) > 0.01) {\n"
+    "      xb = u_camera.z + u_visual_options.x*((ux*u_camera.y+u_camera.x)/den);\n"
+    "      if (u_visual_options.y > 0.5) yb = u_camera.w + (yb-u_camera.w)/den;\n"
+    "    }\n"
     "  }\n"
+    "  /* Fractional yaw is a separate projective transform. The CPU disables\n"
+    "   * texture perspective for its entire polygon; this uniform check is a\n"
+    "   * redundant primitive-wide guard against mixed zero/nonzero q. */\n"
+    "  float q = (u_visual > 0.5 && a_visual_flags > 1.5 &&\n"
+    "             a_q > 0.0 && abs(u_camera.x) <= 0.0000001) ? a_q : 0.0;\n"
+    "  v_uvq = vec3(a_uv*q, q); v_perspective = q > 0.0 ? 1 : 0;\n"
     "  if (u_xscale < 0.0) {\n"
     "    float s = -u_xscale; float h = u_xhalf / s;\n"
     "    float l = u_xcenter - h, r = u_xcenter + h;\n"
     "    if (xb < l) xb = l + (xb-l)*s; else if (xb > r) xb = r + (xb-r)*s;\n"
     "  } else xb = (xb - u_xcenter)*u_xscale + u_xcenter;\n"
-    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (p.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (yb+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
-    "noperspective in vec2 v_uv; noperspective in vec4 v_col;\n"
+    "noperspective in vec2 v_uv; noperspective in vec3 v_uvq;\n"
+    "noperspective in vec4 v_col; flat in int v_perspective;\n"
+    "noperspective in float v_tint;\n"
     "out vec4 frag; out vec4 blend_factor;\n"
     "flat in ivec2 v_tpage;   /* texture page base, VRAM px */\n"
     "flat in ivec2 v_clut;    /* CLUT base, VRAM px */\n"
@@ -945,9 +987,11 @@ static const char *TEX_FS =
     "  return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;\n"
     "}\n"
     "void main(){\n"
+    "  vec2 sample_uv = v_uv;\n"
+    "  if (v_perspective != 0 && v_uvq.z > 1.0e-12) sample_uv = v_uvq.xy/v_uvq.z;\n"
     "  int stp; vec3 rgb;\n"
     "  if (u_filter == 0) {\n"
-    "    int raw = fetch_texel(int(floor(v_uv.x)), int(floor(v_uv.y)));\n"
+    "    int raw = fetch_texel(int(floor(sample_uv.x)), int(floor(sample_uv.y)));\n"
     "    if (raw == 0) discard;\n"
     "    rgb = col5(raw);\n"
     "    stp = (raw >> 15) & 1;\n"
@@ -958,8 +1002,8 @@ static const char *TEX_FS =
     "     * its opacity with the colour renormalised — so prim edges and\n"
     "     * cutout borders keep their colour instead of dissolving into the\n"
     "     * transparent (black) neighbour and discarding whole edge columns. */\n"
-    "    int iu = int(floor(v_uv.x)), iv = int(floor(v_uv.y));\n"
-    "    float fx = v_uv.x - float(iu) - 0.5, fy = v_uv.y - float(iv) - 0.5;\n"
+    "    int iu = int(floor(sample_uv.x)), iv = int(floor(sample_uv.y));\n"
+    "    float fx = sample_uv.x - float(iu) - 0.5, fy = sample_uv.y - float(iv) - 0.5;\n"
     "    int sx = fx < 0.0 ? -1 : 1, sy = fy < 0.0 ? -1 : 1;\n"
     "    fx = abs(fx); fy = abs(fy);\n"
     "    int c00 = fetch_texel(iu, iv);\n"
@@ -980,6 +1024,7 @@ static const char *TEX_FS =
     "  if (u_semipass == 1 && stp == 1) discard;\n"
     "  if (u_semipass == 2 && stp == 0) discard;\n"
     "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "  if (v_tint > 0.0) rgb = mix(rgb, vec3(1.0,0.15,0.85),v_tint);\n"
     "  float dst_factor = 0.0;\n"
     "  if (u_semimode == 4 && v_semi != 0 && stp != 0) {\n"
     "    dst_factor = v_semi == 1 ? 0.5 : 1.0;\n"
@@ -1624,7 +1669,7 @@ static void flush_tex_batch(void) {
 
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
-    geometry_visual_uniforms(s_tex_uVisual, s_tex_uCamera, 0);
+    geometry_visual_uniforms(s_tex_uVisual, s_tex_uCamera, s_tex_uVisualOptions, 0);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_raw_tex);
     p_glUniform1i(s_uVram, 0);
@@ -1647,11 +1692,11 @@ static void flush_tex_batch(void) {
         s_bd_gate = s_tb_gate;              /* this batch is uniform-gate (flushed on change) */
         gl_perf_mirror_begin();
         wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
-        geometry_visual_uniforms(s_tex_uVisual, s_tex_uCamera, 1);
+        geometry_visual_uniforms(s_tex_uVisual, s_tex_uCamera, s_tex_uVisualOptions, 1);
         wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         if (s_ws_ablate != 2) tex_batch_draw_passes(nverts, semi);
         wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
-        geometry_visual_uniforms(s_tex_uVisual, s_tex_uCamera, 0);
+        geometry_visual_uniforms(s_tex_uVisual, s_tex_uCamera, s_tex_uVisualOptions, 0);
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
         gl_perf_mirror_end();
     }
@@ -1663,7 +1708,7 @@ static void flush_tex_batch(void) {
  * GP0(68h) 1x1 dots; each was two immediate gpu_triangle draws (BufferData +
  * DrawArrays each). Coalesce opaque/semi-uniform tris into one draw. */
 #define FLATBATCH_MAXV 8190                 /* multiple of 3 */
-static float s_fb[FLATBATCH_MAXV * 7];
+static float s_fb[FLATBATCH_MAXV * GEOV];
 static int   s_fb_n = 0;
 static int   s_fb_semi = -2;
 static int   s_fb_mask = -1;
@@ -1672,7 +1717,7 @@ static int mirror_flat_batch_center_only(int nverts) {
     if (!s_wide_fast || s_geometry_correction || nverts <= 0) return 0;
     int lo = (int)s_fb[0], hi = (int)s_fb[0];
     for (int i = 1; i < nverts; i++) {
-        int x = (int)s_fb[i * 7];
+        int x = (int)s_fb[i * GEOV];
         if (x < lo) lo = x; if (x > hi) hi = x;
     }
     return mirror_x_center_only(lo, hi);
@@ -1687,10 +1732,10 @@ static void flush_flat_batch(void) {
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(mask);
     p_glUseProgram(s_geo_prog);
-    geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, 0);
+    geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, s_geo_uVisualOptions, 0);
     p_glBindVertexArray(s_geo_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
-    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * 7 * sizeof(float)),
+    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * GEOV * sizeof(float)),
                    s_fb, PSXGL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, nverts);
 
@@ -1701,11 +1746,11 @@ static void flush_flat_batch(void) {
         s_bd_gate = 0;
         gl_perf_mirror_begin();
         wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
-        geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, 1);
+        geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, s_geo_uVisualOptions, 1);
         wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
         if (s_ws_ablate != 2) glDrawArrays(GL_TRIANGLES, 0, nverts);
         wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
-        geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, 0);
+        geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, s_geo_uVisualOptions, 0);
         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
         gl_perf_mirror_end();
     }
@@ -1713,14 +1758,15 @@ static void flush_flat_batch(void) {
 }
 
 /* Flat / gouraud triangles and lines share the GEO program. mode: GL_TRIANGLES
- * or GL_LINES; verts are (x, y, r, g, b, a, world) tuples with colors as
- * 1555. `world` gates the presentation-only fractional-yaw transform. */
+ * or GL_LINES; vertices carry canonical x/y, color, visual flags, and separate
+ * presentation x/y. Bit 0 of the flags gates the fractional-yaw transform;
+ * bit 1 identifies exact provenance for the optional coverage tint. */
 static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
                          const uint16_t *cs, int n, int semi) {
     float px[3] = {0}, py[3] = {0};
-    int world = 0;
+    int visual_flags = 0;
     if (mode == GL_TRIANGLES && n == 3)
-        world = take_visual_triangle(xs, ys, px, py);
+        visual_flags = take_visual_triangle(xs, ys, px, py, NULL);
     else {
         s_next_world = 0;
         s_next_precise = 0;
@@ -1732,26 +1778,28 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     /* Lines stay immediate (rare); tris batch for MotK 0x68 starfields. */
     if (mode != GL_TRIANGLES || n < 3) {
         flush_flat_batch();
-        float verts[3 * 7];
+        float verts[3 * GEOV];
         float mask_a = s_mask_set ? 1.0f : 0.0f;
         for (int i = 0; i < n; i++) {
-            verts[i*7+0] = (float)xs[i];
-            verts[i*7+1] = (float)ys[i];
-            verts[i*7+2] = ((cs[i] & 0x1F) << 3) / 255.0f;
-            verts[i*7+3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
-            verts[i*7+4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
-            verts[i*7+5] = mask_a;
-            verts[i*7+6] = 0.0f;
+            verts[i*GEOV+0] = (float)xs[i];
+            verts[i*GEOV+1] = (float)ys[i];
+            verts[i*GEOV+2] = ((cs[i] & 0x1F) << 3) / 255.0f;
+            verts[i*GEOV+3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
+            verts[i*GEOV+4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
+            verts[i*GEOV+5] = mask_a;
+            verts[i*GEOV+6] = 0.0f;
+            verts[i*GEOV+7] = (float)xs[i];
+            verts[i*GEOV+8] = (float)ys[i];
         }
         hr_begin(1);
         if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
         mask_stencil(s_mask_set);
         if (mode == GL_LINES) glLineWidth((float)s_scale);
         p_glUseProgram(s_geo_prog);
-        geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, 0);
+        geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, s_geo_uVisualOptions, 0);
         p_glBindVertexArray(s_geo_vao);
         p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
-        p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(n * 7 * sizeof(float)),
+        p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(n * GEOV * sizeof(float)),
                        verts, PSXGL_STREAM_DRAW);
         glDrawArrays(mode, 0, n);
         if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1 &&
@@ -1760,11 +1808,11 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
             s_bd_gate = bd_prim_gate(xs, n, 0);
             gl_perf_mirror_begin();
             wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
-            geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, 1);
+            geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, s_geo_uVisualOptions, 1);
             wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
             if (s_ws_ablate != 2) glDrawArrays(mode, 0, n);
             wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
-            geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, 0);
+            geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, s_geo_uVisualOptions, 0);
             wide_target_end(s_geo_uXoff, s_geo_uXhalf);
             gl_perf_mirror_end();
         }
@@ -1781,14 +1829,16 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
 
     float mask_a = s_mask_set ? 1.0f : 0.0f;
     for (int i = 0; i < n; i++) {
-        float *v = &s_fb[s_fb_n * 7];
-        v[0] = world ? px[i] : (float)xs[i];
-        v[1] = world ? py[i] : (float)ys[i];
+        float *v = &s_fb[s_fb_n * GEOV];
+        v[0] = (float)xs[i];
+        v[1] = (float)ys[i];
         v[2] = ((cs[i] & 0x1F) << 3) / 255.0f;
         v[3] = (((cs[i] >> 5) & 0x1F) << 3) / 255.0f;
         v[4] = (((cs[i] >> 10) & 0x1F) << 3) / 255.0f;
         v[5] = mask_a;
-        v[6] = world ? 1.0f : 0.0f;
+        v[6] = (float)visual_flags;
+        v[7] = visual_flags ? px[i] : (float)xs[i];
+        v[8] = visual_flags ? py[i] : (float)ys[i];
         s_fb_n++;
     }
 }
@@ -1819,8 +1869,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                   const float *col, uint16_t texpage,
                                   uint16_t clut_x, uint16_t clut_y, int rawtex,
                                   int semi, const int *lim) {
-    float px[3], py[3];
-    const int world = take_visual_triangle(xs, ys, px, py);
+    float px[3], py[3], pq[3];
+    const int visual_flags = take_visual_triangle(xs, ys, px, py, pq);
     int lim_buf[4];
     int uv_buf[6];
     if (!lim) {
@@ -1892,8 +1942,8 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
         }
         float *vp = &s_tb[s_tb_n * TEXV];
         for (int i = 0; i < 3; i++, vp += TEXV) {
-            vp[0] = world ? px[i] : (float)xs[i];
-            vp[1] = world ? py[i] : (float)ys[i];
+            vp[0] = (float)xs[i];
+            vp[1] = (float)ys[i];
             vp[2] = (float)us[i];   vp[3] = (float)vs[i];
             vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
             vp[8]  = (float)base_x;  vp[9]  = (float)base_y;        /* a_tpage  */
@@ -1902,7 +1952,10 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[14] = (float)lim[0];  vp[15] = (float)lim[1];        /* a_limits */
             vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
             vp[18] = semi >= 0 ? (float)(semi + 1) : 0.0f;          /* a_semi code */
-            vp[19] = world ? 1.0f : 0.0f;                           /* a_world */
+            vp[19] = (float)visual_flags;                            /* a_visual_flags */
+            vp[20] = visual_flags ? px[i] : (float)xs[i];            /* a_visual_pos */
+            vp[21] = visual_flags ? py[i] : (float)ys[i];
+            vp[22] = pq[i];                                          /* a_q (0 = affine) */
         }
         s_tb_n += 3;
         if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
@@ -1921,9 +1974,10 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int 
     float b = (((c >> 10) & 0x1F) << 3) / 255.0f;
     float a = s_mask_set ? 1.0f : 0.0f;
     float fx0 = (float)wx, fy0 = (float)y, fx1 = (float)(wx + ww), fy1 = (float)(y + h);
-    float verts[6 * 7] = {
-        fx0,fy0,r,g,b,a,0,  fx1,fy0,r,g,b,a,0,  fx0,fy1,r,g,b,a,0,
-        fx1,fy0,r,g,b,a,0,  fx0,fy1,r,g,b,a,0,  fx1,fy1,r,g,b,a,0,
+    float verts[6 * GEOV] = {
+        fx0,fy0,r,g,b,a,0,fx0,fy0,  fx1,fy0,r,g,b,a,0,fx1,fy0,
+        fx0,fy1,r,g,b,a,0,fx0,fy1,  fx1,fy0,r,g,b,a,0,fx1,fy0,
+        fx0,fy1,r,g,b,a,0,fx0,fy1,  fx1,fy1,r,g,b,a,0,fx1,fy1,
     };
     /* Wide target: positions already wide-space so u_xoff = 0; full-width
      * scissor; u_xhalf = g_wide_w/2. */
@@ -1934,7 +1988,7 @@ static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int 
     if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     mask_stencil(s_mask_set);
     p_glUseProgram(s_geo_prog);
-    geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, 0);
+    geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, s_geo_uVisualOptions, 0);
     p_glUniform1f(s_geo_uXoff, 0.0f);
     p_glUniform1f(s_geo_uXhalf, (float)g_wide_w / 2.0f);
     p_glBindVertexArray(s_geo_vao);
@@ -1951,6 +2005,7 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
      * prepared for a rejected polygon leak into the first triangle here. */
     s_next_world = 0;
     s_next_precise = 0;
+    s_next_perspective = 0;
     if (w <= 0 || h <= 0) return;
     /* Full-screen 2D overlay (pause gray-filter / load fade): a flat rect
      * spanning the whole 4:3 framebuffer must cover the whole wide surface too,
@@ -1994,6 +2049,7 @@ static void gpu_textured_rect(int x,int y,int w,int h,
      * triangle, even though it is decomposed into two triangles below. */
     s_next_world = 0;
     s_next_precise = 0;
+    s_next_perspective = 0;
     if (w <= 0 || h <= 0) return;
     float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
     float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
@@ -2134,6 +2190,7 @@ static void glb_set_geometry_correction(int enabled) {
     if (!s_geometry_correction) {
         s_next_world = 0;
         s_next_precise = 0;
+        s_next_perspective = 0;
         s_yaw_sin = 0.0f;
         s_yaw_cos = 1.0f;
     }
@@ -2158,21 +2215,44 @@ static void glb_set_precise_triangle(int enabled,
     s_next_x16[2] = x2; s_next_y16[2] = y2;
 }
 
+static void glb_set_perspective_triangle(int enabled,
+                                         float q0, float q1, float q2) {
+    /* Pre-context fallback draws canonical software VRAM, where perspective
+     * correction is deliberately forbidden. Drop rather than forward it. */
+    s_next_perspective = 0;
+    if (!s_raster_ok || !enabled ||
+        !isfinite(q0) || !isfinite(q1) || !isfinite(q2) ||
+        q0 <= 0.0f || q1 <= 0.0f || q2 <= 0.0f)
+        return;
+    s_next_q[0] = q0;
+    s_next_q[1] = q1;
+    s_next_q[2] = q2;
+    s_next_perspective = 1;
+}
+
 static void glb_set_presentation_yaw(double yaw_units, double full_turn,
-                                     double center_x, double focal_x) {
+                                     double center_x, double center_y,
+                                     double focal_x) {
     /* A frame may still have batched polygons when the vblank mouse hook
      * advances the residual. Land those with the OLD residual first so the
      * presentation transform stays paired with the guest yaw that built them. */
     if (s_raster_ok) { flush_flat_batch(); flush_tex_batch(); }
-    if (!isfinite(yaw_units) || !isfinite(full_turn) || full_turn <= 0.0)
-        yaw_units = 0.0;
+    if (!isfinite(yaw_units)) yaw_units = 0.0;
     if (yaw_units > 4.0) yaw_units = 4.0;
     if (yaw_units < -4.0) yaw_units = -4.0;
-    const double radians = yaw_units * (6.28318530717958647692 / full_turn);
-    s_yaw_sin = (float)sin(radians);
-    s_yaw_cos = (float)cos(radians);
-    s_yaw_center = isfinite(center_x) ? (float)center_x : 160.0f;
-    s_yaw_focal = isfinite(focal_x) && focal_x > 1.0
+    if (!isfinite(full_turn) || full_turn <= 0.0) {
+        s_yaw_sin = 0.0f;
+        s_yaw_cos = 1.0f;
+    } else {
+        const double radians =
+            yaw_units * (6.28318530717958647692 / full_turn);
+        s_yaw_sin = (float)sin(radians);
+        s_yaw_cos = (float)cos(radians);
+    }
+    s_yaw_center_x = isfinite(center_x) ? (float)center_x : 160.0f;
+    s_yaw_center_y_relative = isfinite(center_y)
+        ? (float)center_y : 120.0f;
+    s_yaw_focal_x = isfinite(focal_x) && focal_x > 1.0
         ? (float)focal_x : 160.0f;
 }
 
@@ -2415,6 +2495,13 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
 
 static int init_gpu_raster(void) {
     s_scale = s_req_scale;
+    {
+        const char *full_yaw = getenv("PSX_GEOMETRY_FULL_YAW");
+        const char *coverage_tint = getenv("PSX_GEOMETRY_COVERAGE_TINT");
+        s_geometry_full_yaw = full_yaw && full_yaw[0] && full_yaw[0] != '0';
+        s_geometry_coverage_tint = coverage_tint && coverage_tint[0] &&
+                                   coverage_tint[0] != '0';
+    }
 
     s_geo_prog  = build_program(GEO_VS, GEO_FS);
     s_tex_prog  = build_program_ex(TEX_VS, TEX_FS, 1);
@@ -2484,16 +2571,18 @@ static int init_gpu_raster(void) {
     s_tex_uXcenter = p_glGetUniformLocation(s_tex_prog, "u_xcenter");
     s_geo_uVisual = p_glGetUniformLocation(s_geo_prog, "u_visual");
     s_geo_uCamera = p_glGetUniformLocation(s_geo_prog, "u_camera");
+    s_geo_uVisualOptions = p_glGetUniformLocation(s_geo_prog, "u_visual_options");
     s_tex_uVisual = p_glGetUniformLocation(s_tex_prog, "u_visual");
     s_tex_uCamera = p_glGetUniformLocation(s_tex_prog, "u_camera");
+    s_tex_uVisualOptions = p_glGetUniformLocation(s_tex_prog, "u_visual_options");
     /* Default the new uniforms to the no-op (1.0 scale, 0 centre) -- GLSL would
      * otherwise zero them, collapsing all x to 0. */
     p_glUseProgram(s_geo_prog);
     p_glUniform1f(s_geo_uXscale, 1.0f); p_glUniform1f(s_geo_uXcenter, 0.0f);
-    geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, 0);
+    geometry_visual_uniforms(s_geo_uVisual, s_geo_uCamera, s_geo_uVisualOptions, 0);
     p_glUseProgram(s_tex_prog);
     p_glUniform1f(s_tex_uXscale, 1.0f); p_glUniform1f(s_tex_uXcenter, 0.0f);
-    geometry_visual_uniforms(s_tex_uVisual, s_tex_uCamera, 0);
+    geometry_visual_uniforms(s_tex_uVisual, s_tex_uCamera, s_tex_uVisualOptions, 0);
 
     /* Sample-grid alignment shift: half an HR pixel, set once (S is fixed
      * for the lifetime of the pipeline). Backed off by 1/64 native px so
@@ -2525,12 +2614,14 @@ static int init_gpu_raster(void) {
     p_glBindVertexArray(s_geo_vao);
     p_glGenBuffers(1, &s_geo_vbo);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
-    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void *)0);
+    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)0);
     p_glEnableVertexAttribArray(0);
-    p_glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void *)(2 * sizeof(float)));
+    p_glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)(2 * sizeof(float)));
     p_glEnableVertexAttribArray(1);
-    p_glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 7 * sizeof(float), (void *)(6 * sizeof(float)));
+    p_glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)(6 * sizeof(float)));
     p_glEnableVertexAttribArray(2);
+    p_glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, GEOV * sizeof(float), (void *)(7 * sizeof(float)));
+    p_glEnableVertexAttribArray(3);
 
     p_glGenVertexArrays(1, &s_tex_vao);
     p_glBindVertexArray(s_tex_vao);
@@ -2547,7 +2638,9 @@ static int init_gpu_raster(void) {
         p_glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, st, (void*)(13*sizeof(float))); p_glEnableVertexAttribArray(6); /* raw    */
         p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
         p_glVertexAttribPointer(8, 1, GL_FLOAT, GL_FALSE, st, (void*)(18*sizeof(float))); p_glEnableVertexAttribArray(8); /* semi   */
-        p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* world  */
+        p_glVertexAttribPointer(9, 1, GL_FLOAT, GL_FALSE, st, (void*)(19*sizeof(float))); p_glEnableVertexAttribArray(9); /* visual flags */
+        p_glVertexAttribPointer(10, 2, GL_FLOAT, GL_FALSE, st, (void*)(20*sizeof(float))); p_glEnableVertexAttribArray(10); /* visual pos */
+        p_glVertexAttribPointer(11, 1, GL_FLOAT, GL_FALSE, st, (void*)(22*sizeof(float))); p_glEnableVertexAttribArray(11); /* reciprocal depth */
     }
 
     p_glGenVertexArrays(1, &s_blit_vao);
@@ -2589,6 +2682,12 @@ static int init_gpu_raster(void) {
     gl_perf_init();   /* frame_perf GPU/CPU phase timing (no-op if queries absent) */
     fprintf(stdout, "psxrecomp: GL GPU pipeline ready (internal scale %dx, "
             "mask-bit stencil, texture window, GPU copy/upload)\n", s_scale);
+    if (s_geometry_full_yaw || s_geometry_coverage_tint) {
+        fprintf(stdout, "psxrecomp: geometry diagnostics: full X/Y yaw %s, "
+                "exact-coverage tint %s (presentation mirror only)\n",
+                s_geometry_full_yaw ? "enabled" : "disabled",
+                s_geometry_coverage_tint ? "enabled" : "disabled");
+    }
     return 1;
 }
 
@@ -3863,6 +3962,7 @@ static const GpuRenderBackend GL_BACKEND = {
     .set_geometry_correction = glb_set_geometry_correction,
     .set_world_triangle = glb_set_world_triangle,
     .set_precise_triangle = glb_set_precise_triangle,
+    .set_perspective_triangle = glb_set_perspective_triangle,
     .set_presentation_yaw = glb_set_presentation_yaw,
     .fill_rect = glb_fill_rect, .copy_rect = glb_copy_rect,
     .draw_flat_triangle = glb_draw_flat_triangle, .draw_gouraud_triangle = glb_draw_gouraud_triangle,

@@ -1,5 +1,7 @@
 #include "psx_sdl.h"
+#include "../psxrecomp-overlay/runtime/include/gpu.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -85,6 +87,21 @@ void gpu_geometry_correction_stats(std::uint64_t *world_triangles,
                                    std::uint64_t *precise_triangles) {
     if (world_triangles) *world_triangles = 0;
     if (precise_triangles) *precise_triangles = 0;
+}
+
+std::uint32_t gpu_texture_correction_hits() {
+    return 0;
+}
+
+void gpu_geometry_correction_stats_detailed(
+        GpuGeometryCorrectionStats *stats, std::uint32_t out_size) {
+    if (!stats || out_size == 0) return;
+    GpuGeometryCorrectionStats snapshot{};
+    snapshot.version = GPU_GEOMETRY_DIAGNOSTICS_VERSION;
+    snapshot.size = static_cast<std::uint32_t>(sizeof(snapshot));
+    const std::size_t copy_size = std::min<std::size_t>(out_size,
+                                                        sizeof(snapshot));
+    std::memcpy(stats, &snapshot, copy_size);
 }
 
 }  // extern "C"

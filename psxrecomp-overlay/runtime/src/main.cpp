@@ -5,6 +5,13 @@
  * VRAM at each vblank via callback from gpu_vblank_tick().
  */
 
+/* Keep the Windows min/max macros out of this C++ translation unit. SDL may
+ * include windows.h before the explicit platform includes below, so this must
+ * be defined before any runtime header is included. */
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include "cpu_state.h"
 #include "psx_bios_image.h"    /* the active BIOS's self-description */
 #include "psx_bios_backend.h"  /* routing to whichever BIOS was selected */
@@ -35,6 +42,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
 #include "gpu_vk_renderer.h"
+#include "gte_precision.h"
 #include "frame_pacing.h"
 #include "latency_ring.h"
 #include "sio.h"
@@ -134,8 +142,10 @@ extern "C" void psx_event_step_conservative_env_init(void);
 
 /* SDL_RenderSetVSync was added in SDL 2.0.18. Keep the explicitly supported
  * SDL2 fallback buildable against older distro/toolchain copies; its OpenGL
- * renderer can still release the swap interval through the public GL API. */
-static int psx_sdl_render_set_vsync(SDL_Renderer *renderer, int enabled) {
+ * renderer can still release the swap interval through the public GL API.
+ * Use a project-local name because SDL3's psx_sdl.h already defines its own
+ * psx_sdl_render_set_vsync compatibility helper. */
+static int disruptor_sdl_render_set_vsync_compat(SDL_Renderer *renderer, int enabled) {
 #if defined(PSX_SDL3) || SDL_VERSION_ATLEAST(2, 0, 18)
     return SDL_RenderSetVSync(renderer, enabled);
 #else
@@ -145,6 +155,108 @@ static int psx_sdl_render_set_vsync(SDL_Renderer *renderer, int enabled) {
 }
 
 extern "C" uint64_t gte_get_exec_count(void);
+
+/* Disruptor does not use SWC2 for its resident world-projection loops. These
+ * two reviewed MFC2 sites snapshot SXY2. Six ordinary SW sites publish into
+ * main RAM and one publishes into nine exact scratchpad slots, each only after
+ * an exact instruction and committed-word check. Twenty-four reviewed LW/SW
+ * pairs then carry those proven words into GP0 packets. Keeping every route
+ * behind the game serial prevents another title at the same PCs from
+ * inheriting it. */
+static int configure_disruptor_precision_store_routes(
+        const std::string& game_id) {
+    gte_precision_store_pc_routes_reset();
+    if (game_id != "SLUS-00224") return 1;
+    static const uint32_t mfc2_pcs[] = {
+        0x8004633Cu,
+        0x8004795Cu,
+    };
+    static const uint32_t store_pcs[] = {
+        0x8004641Cu,
+        0x800464BCu,
+        0x80046524u,
+        0x80046540u,
+        0x80046594u,
+        0x800465D8u,
+    };
+    struct PrecisionCopyRoute {
+        uint32_t load_pc;
+        uint32_t load_instruction;
+        uint32_t store_pc;
+        uint32_t store_instruction;
+        uint8_t gpr;
+    };
+    static const PrecisionCopyRoute copy_routes[] = {
+        {0x80046C4Cu, 0x8D0C0004u, 0x80046D04u, 0xAF2C0008u, 12u},
+        {0x80046C50u, 0x8D2D0004u, 0x80046D08u, 0xAF2D0014u, 13u},
+        {0x80046C54u, 0x8D4E0004u, 0x80046D10u, 0xAF2E002Cu, 14u},
+        {0x80046C60u, 0x8D6F0004u, 0x80046D0Cu, 0xAF2F0020u, 15u},
+        {0x80047A80u, 0x8CA80084u, 0x80047A90u, 0xAF280008u, 8u},
+        {0x80047A84u, 0x8CA900A4u, 0x80047A94u, 0xAF290014u, 9u},
+        {0x80047A88u, 0x8CAA00C4u, 0x80047A9Cu, 0xAF2A002Cu, 10u},
+        {0x80047A8Cu, 0x8CAB00BCu, 0x80047A98u, 0xAF2B0020u, 11u},
+        {0x80047B40u, 0x8CA800A4u, 0x80047B50u, 0xAF280008u, 8u},
+        {0x80047B44u, 0x8CA9008Cu, 0x80047B54u, 0xAF290014u, 9u},
+        {0x80047B48u, 0x8CAA00ACu, 0x80047B5Cu, 0xAF2A002Cu, 10u},
+        {0x80047B4Cu, 0x8CAB00C4u, 0x80047B58u, 0xAF2B0020u, 11u},
+        {0x80047C00u, 0x8CA800C4u, 0x80047C10u, 0xAF280008u, 8u},
+        {0x80047C04u, 0x8CA900ACu, 0x80047C14u, 0xAF290014u, 9u},
+        {0x80047C08u, 0x8CAA0094u, 0x80047C1Cu, 0xAF2A002Cu, 10u},
+        {0x80047C0Cu, 0x8CAB00B4u, 0x80047C18u, 0xAF2B0020u, 11u},
+        {0x80047CC4u, 0x8CA800BCu, 0x80047CD4u, 0xAF280008u, 8u},
+        {0x80047CC8u, 0x8CA900C4u, 0x80047CD8u, 0xAF290014u, 9u},
+        {0x80047CCCu, 0x8CAA00B4u, 0x80047CE0u, 0xAF2A002Cu, 10u},
+        {0x80047CD0u, 0x8CAB009Cu, 0x80047CDCu, 0xAF2B0020u, 11u},
+        {0x80047D6Cu, 0x8CA80084u, 0x80047D7Cu, 0xAF280008u, 8u},
+        {0x80047D70u, 0x8CA9008Cu, 0x80047D80u, 0xAF290014u, 9u},
+        {0x80047D74u, 0x8CAA0094u, 0x80047D88u, 0xAF2A002Cu, 10u},
+        {0x80047D78u, 0x8CAB009Cu, 0x80047D84u, 0xAF2B0020u, 11u},
+    };
+    for (uint32_t pc : mfc2_pcs) {
+        if (!gte_precision_mfc2_pc_route_add(
+                pc, 0x480A7000u, 14u)) {
+            std::fprintf(stderr,
+                "psxrecomp: failed to register Disruptor SXY2 MFC2 PC "
+                "0x%08X\n", pc);
+            return 0;
+        }
+    }
+    for (uint32_t pc : store_pcs) {
+        if (!gte_precision_store_pc_route_add(
+                pc, 0xACAA0004u, 14u)) {
+            std::fprintf(stderr,
+                "psxrecomp: failed to register Disruptor SXY2 store PC "
+                "0x%08X\n", pc);
+            return 0;
+        }
+    }
+    if (!gte_precision_scratch_store_pc_route_add(
+            0x80047A0Cu, 0xACAA0004u, 14u,
+            0x1F800084u, 8u, 9u)) {
+        std::fprintf(stderr,
+            "psxrecomp: failed to register Disruptor scratchpad SXY2 "
+            "store route 0x80047A0C\n");
+        return 0;
+    }
+    for (const PrecisionCopyRoute& route : copy_routes) {
+        if (!gte_precision_copy_pc_route_add(
+                route.load_pc, route.load_instruction,
+                route.store_pc, route.store_instruction, route.gpr)) {
+            std::fprintf(stderr,
+                "psxrecomp: failed to register Disruptor projection-copy "
+                "route 0x%08X -> 0x%08X\n",
+                route.load_pc, route.store_pc);
+            return 0;
+        }
+    }
+    std::fprintf(stdout,
+        "psxrecomp: registered %zu MFC2 captures, %zu main-RAM projection "
+        "stores, 1 scratchpad projection store and %zu packet-copy routes\n",
+        sizeof(mfc2_pcs) / sizeof(mfc2_pcs[0]),
+        sizeof(store_pcs) / sizeof(store_pcs[0]),
+        sizeof(copy_routes) / sizeof(copy_routes[0]));
+    return 1;
+}
 
 /* Cross-language globals defined in C translation units. Declared extern "C" at
  * file scope so MSVC gives them C linkage (matching the C definitions); without
@@ -556,6 +668,7 @@ static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 static int           g_video_renderer = PSXRecompV4::DEFAULT_VIDEO_RENDERER;
 static bool          g_geometry_correction = false; /* visual-only subpixel mirror */
+static bool          g_texture_correction = false;  /* visual-only perspective UVs */
 static int           g_fullscreen     = 0;  /* tri-state: 0 windowed, 1 borderless (desktop)
                                               * fullscreen, 2 exclusive fullscreen */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
@@ -4365,7 +4478,7 @@ static void sdl_vblank_present(void) {
         if (!g_present_vsync_disabled && present_ms > 250) {
             g_present_slow_count++;
             if (g_present_slow_count >= 3 &&
-                psx_sdl_render_set_vsync(sdl_renderer, 0) == 0) {
+                disruptor_sdl_render_set_vsync_compat(sdl_renderer, 0) == 0) {
                 g_present_vsync_disabled = 1;
             }
         }
@@ -4987,9 +5100,11 @@ namespace {
 #endif
 
 int main(int argc, char** argv) {
-    /* Force line-buffered output so messages appear even if killed. */
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    std::setvbuf(stderr, nullptr, _IOLBF, 0);
+    /* Keep startup diagnostics visible even if the process is killed. MSVC's
+     * CRT rejects a zero-sized _IOLBF buffer via its invalid-parameter handler,
+     * so use the portable zero-sized _IONBF form for both standard streams. */
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fflush(stderr);
 
@@ -5689,6 +5804,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!configure_disruptor_precision_store_routes(game_id)) return 1;
+
     if (!game_name.empty()) s_picker_game_name = game_name;
 
     /* Layer the launcher-written settings.toml (next to the exe) over the
@@ -5917,6 +6034,8 @@ int main(int argc, char** argv) {
         psx_smooth_60fps_set(atoi(e) ? 1 : 0);
     if (const char *e = std::getenv("PSX_GEOMETRY_CORRECTION"))
         g_geometry_correction = atoi(e) ? true : false;
+    if (const char *e = std::getenv("PSX_TEXTURE_CORRECTION"))
+        g_texture_correction = atoi(e) ? true : false;
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION"))
         g_frame_interpolation = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_FRAME_INTERPOLATION_FPS")) {
@@ -6656,6 +6775,17 @@ session_reboot:
         std::fprintf(stdout,
             "psxrecomp: exact-provenance presentation geometry enabled "
             "(ambiguous SXY fallback disabled; guest GP0/GTE coordinates preserved)\n");
+    if (g_texture_correction && !g_geometry_correction) {
+        std::fprintf(stdout,
+            "psxrecomp: perspective texture correction requested but exact "
+            "geometry is disabled; keeping affine textures\n");
+        g_texture_correction = false;
+    }
+    gpu_texture_correction_set(g_texture_correction ? 1 : 0);
+    if (g_texture_correction)
+        std::fprintf(stdout,
+            "psxrecomp: exact-depth perspective textures enabled on the "
+            "presentation mirror (canonical VRAM remains affine)\n");
     /* Display aspect. Identity at the default 4:3. The present letterbox uses
      * this aspect; native-wide fills it with a genuinely wider frame (no
      * stretch), squash mode stretches the 4:3 frame into it. */

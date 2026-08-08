@@ -125,6 +125,120 @@ void gpu_geometry_camera_yaw_residual_set(double yaw_units);
 void gpu_geometry_correction_stats(uint64_t *world_triangles,
                                    uint64_t *precise_triangles);
 
+/* Independent, default-off perspective texture interpolation for exact world
+ * triangles on the presentation mirror. Canonical VRAM, sprites, rectangles,
+ * UI, and any polygon without strict projective depth remain affine. */
+void gpu_texture_correction_set(int enabled);
+uint32_t gpu_texture_correction_hits(void);
+
+/* Versioned Test-13 diagnostics. Candidate/accepted primitive arrays count
+ * polygons; triangle and vertex totals make quad coverage unambiguous. The
+ * latest_live counters are the most recent presentation which was eligible to
+ * consume the independent corrected surface, while cumulative includes every
+ * geometry-correction candidate since the feature was enabled. */
+#define GPU_GEOMETRY_DIAGNOSTICS_VERSION 1u
+#define GPU_GEOMETRY_REJECT_REASON_COUNT 15u
+#define GPU_GEOMETRY_PRIMITIVE_CLASS_COUNT 8u
+#define GPU_GEOMETRY_OPCODE_COUNT 32u
+#define GPU_GEOMETRY_DEPTH_BUCKET_COUNT 6u
+#define GPU_GEOMETRY_SCREEN_BUCKET_COUNT 10u
+#define GPU_GEOMETRY_CORRECTION_BUCKET_COUNT 5u
+
+typedef enum GpuGeometryRejectReason {
+    GPU_GEOMETRY_REJECT_NO_COMMAND_SOURCE = 0,
+    GPU_GEOMETRY_REJECT_SOURCE_ADDRESS_OVERFLOW,
+    GPU_GEOMETRY_REJECT_TRACKING_DISABLED,
+    GPU_GEOMETRY_REJECT_SPECULATIVE_LOOKUP,
+    GPU_GEOMETRY_REJECT_SOURCE_NOT_RAM,
+    GPU_GEOMETRY_REJECT_SOURCE_UNALIGNED,
+    GPU_GEOMETRY_REJECT_STORE_MISS,
+    GPU_GEOMETRY_REJECT_STORE_COLLISION,
+    GPU_GEOMETRY_REJECT_PROJECTION_INVALID,
+    GPU_GEOMETRY_REJECT_PACKED_MISMATCH,
+    GPU_GEOMETRY_REJECT_ZERO_DEPTH,
+    GPU_GEOMETRY_REJECT_SATURATED,
+    GPU_GEOMETRY_REJECT_INTEGER_MISMATCH,
+    GPU_GEOMETRY_REJECT_ATOMIC_FALLBACK,
+    GPU_GEOMETRY_REJECT_RECTANGLE_FAST_PATH
+} GpuGeometryRejectReason;
+
+typedef enum GpuGeometryPrimitiveClass {
+    GPU_GEOMETRY_PRIMITIVE_FLAT_TRI = 0,
+    GPU_GEOMETRY_PRIMITIVE_TEXTURED_FLAT_TRI,
+    GPU_GEOMETRY_PRIMITIVE_GOURAUD_TRI,
+    GPU_GEOMETRY_PRIMITIVE_TEXTURED_GOURAUD_TRI,
+    GPU_GEOMETRY_PRIMITIVE_FLAT_QUAD,
+    GPU_GEOMETRY_PRIMITIVE_TEXTURED_FLAT_QUAD,
+    GPU_GEOMETRY_PRIMITIVE_GOURAUD_QUAD,
+    GPU_GEOMETRY_PRIMITIVE_TEXTURED_GOURAUD_QUAD
+} GpuGeometryPrimitiveClass;
+
+typedef struct GpuGeometryCorrectionCounters {
+    uint64_t triangle_candidates;
+    uint64_t triangle_accepted;
+    uint64_t polygon_candidates;
+    uint64_t polygon_accepted;
+    uint64_t vertex_candidates;
+    uint64_t vertex_accepted;
+    uint64_t vertex_rejections[GPU_GEOMETRY_REJECT_REASON_COUNT];
+    uint64_t primitive_candidates[GPU_GEOMETRY_PRIMITIVE_CLASS_COUNT];
+    uint64_t primitive_accepted[GPU_GEOMETRY_PRIMITIVE_CLASS_COUNT];
+    /* Polygon opcode 0x20..0x3f, indexed by opcode - 0x20. */
+    uint64_t opcode_candidates[GPU_GEOMETRY_OPCODE_COUNT];
+    uint64_t opcode_accepted[GPU_GEOMETRY_OPCODE_COUNT];
+    /* Accepted vertices: z <256,<1024,<4096,<16384,<32768,>=32768. */
+    uint64_t depth_vertices[GPU_GEOMETRY_DEPTH_BUCKET_COUNT];
+    /* Accepted vertices: 3x3 on-screen cells followed by off-screen. */
+    uint64_t screen_vertices[GPU_GEOMETRY_SCREEN_BUCKET_COUNT];
+    uint64_t correction_vertices;
+    uint64_t correction_abs_x16_sum;
+    uint64_t correction_abs_y16_sum;
+    uint64_t correction_magnitude16_sum;
+    uint64_t correction_magnitude16_max;
+    uint64_t correction_x16_squared_sum;
+    uint64_t correction_y16_squared_sum;
+    /* Set to one if any correction sum has saturated at UINT64_MAX. */
+    uint64_t correction_accumulators_saturated;
+    /* max(|dx|,|dy|): zero, <.25px, <.5px, <.75px, <1px. */
+    uint64_t correction_magnitude_buckets[
+        GPU_GEOMETRY_CORRECTION_BUCKET_COUNT];
+    uint64_t partial_polygon_rejections;
+    uint64_t partial_quad_rejections;
+} GpuGeometryCorrectionCounters;
+
+typedef struct GpuGeometryCorrectionStats {
+    uint32_t version;
+    uint32_t size;
+    uint64_t presentation_sequence;
+    uint64_t corrected_presentations;
+    uint64_t latest_live_presentation;
+    uint32_t latest_live_valid;
+    uint32_t reserved;
+    uint64_t provenance_store_collisions;
+    uint64_t provenance_store_evictions;
+    uint64_t provenance_lookup_collisions;
+    GpuGeometryCorrectionCounters cumulative;
+    GpuGeometryCorrectionCounters latest_live;
+    /* Additive tail field: older size-bounded callers retain the version-1
+     * prefix while current diagnostics expose rejected uncommitted SWC2s. */
+    uint64_t provenance_store_uncommitted_rejections;
+    /* Reviewed MFC2 -> ordinary-SW routes. Attempts count committed-site
+     * observations; accepts entered exact provenance, while packed rejections
+     * identify clipped/repacked output that deliberately stayed canonical. */
+    uint64_t provenance_registered_store_attempts;
+    uint64_t provenance_registered_store_accepts;
+    uint64_t provenance_registered_store_packed_rejections;
+    /* Reviewed projected-vertex-buffer -> GP0 packet copy routes. */
+    uint64_t provenance_copy_load_attempts;
+    uint64_t provenance_copy_load_accepts;
+    uint64_t provenance_copy_store_attempts;
+    uint64_t provenance_copy_store_accepts;
+    uint64_t provenance_copy_store_packed_rejections;
+} GpuGeometryCorrectionStats;
+
+void gpu_geometry_correction_stats_detailed(
+    GpuGeometryCorrectionStats *out, uint32_t out_size);
+
 /* Widescreen proportion correction (active only when aspect != 4:3 and the
  * game's [widescreen] block opts in — see config_loader.h). Tagged
  * character/billboard prims are re-squashed around their projected anchor;

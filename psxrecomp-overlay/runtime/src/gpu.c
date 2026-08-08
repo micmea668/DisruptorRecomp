@@ -11,6 +11,7 @@
  */
 
 #include "gpu.h"
+#include "gte_precision.h"
 #include "mod_memory.h"
 #include "gpu_primitive_reject.h"
 #include "gpu_sw_renderer.h"
@@ -106,8 +107,18 @@ static int      ws_mode    = 0;
 static int      ws_cfg_num = 4, ws_cfg_den = 3;
 static int      ws_geometry_correction = 0;
 static int      s_texture_correction_enabled = 0;
+static int      s_texture_correction_yaw_active = 0;
+static uint32_t s_texture_correction_triangles = 0;
 static uint64_t ws_geometry_world_triangles = 0;
 static uint64_t ws_geometry_precise_triangles = 0;
+static GpuGeometryCorrectionCounters s_geometry_diag_cumulative;
+static GpuGeometryCorrectionCounters s_geometry_diag_live_current;
+static GpuGeometryCorrectionCounters s_geometry_diag_live_latest;
+static uint64_t s_geometry_diag_presentation_sequence;
+static uint64_t s_geometry_diag_corrected_presentations;
+static uint64_t s_geometry_diag_latest_live_presentation;
+static int s_geometry_diag_latest_live_valid;
+static int s_geometry_diag_live_current_touched;
 static void ws_nw_sync_target(void);
 
 #define WS_TAG_BUCKETS 4096                  /* power of two */
@@ -2311,18 +2322,69 @@ static void ws_nw_sync_target(void) {
 extern void gte_geometry_correction_set(int enabled);
 extern void gte_precision_tracking_set(int enabled);
 
+static void geometry_diag_reset(void) {
+    memset(&s_geometry_diag_cumulative, 0,
+           sizeof(s_geometry_diag_cumulative));
+    memset(&s_geometry_diag_live_current, 0,
+           sizeof(s_geometry_diag_live_current));
+    memset(&s_geometry_diag_live_latest, 0,
+           sizeof(s_geometry_diag_live_latest));
+    s_geometry_diag_presentation_sequence = 0;
+    s_geometry_diag_corrected_presentations = 0;
+    s_geometry_diag_latest_live_presentation = 0;
+    s_geometry_diag_latest_live_valid = 0;
+    s_geometry_diag_live_current_touched = 0;
+    gte_precision_diagnostics_reset();
+}
+
+static int geometry_diag_display_active(void) {
+    GpuDisplayInfo display;
+    gpu_get_display_info(&display);
+    return !display.disabled && display.width != 0u && display.height != 0u;
+}
+
+/* Match main.cpp's corrected-present eligibility using state available at GP0
+ * decode time. A known framebuffer target is additionally required because an
+ * offscreen texture draw cannot reach the independent presentation surface. */
+static int geometry_diag_presentation_live(void) {
+    return geometry_diag_display_active() &&
+           ws_geometry_correction && ws_engaged() &&
+           !gpu_ws_present_native_43() && !(display_depth & 1u) &&
+           gr_wide_supported() && ws_is_fb_base(draw_area_left);
+}
+
+static void geometry_diag_finish_presentation(void) {
+    const int live = geometry_diag_display_active() &&
+                     (s_geometry_diag_live_current_touched ||
+                      geometry_diag_presentation_live());
+    ++s_geometry_diag_presentation_sequence;
+    if (live) {
+        s_geometry_diag_live_latest = s_geometry_diag_live_current;
+        ++s_geometry_diag_corrected_presentations;
+        s_geometry_diag_latest_live_presentation =
+            s_geometry_diag_presentation_sequence;
+        s_geometry_diag_latest_live_valid = 1;
+    }
+    memset(&s_geometry_diag_live_current, 0,
+           sizeof(s_geometry_diag_live_current));
+    s_geometry_diag_live_current_touched = 0;
+}
+
 void gpu_geometry_correction_set(int enabled) {
     ws_geometry_correction = enabled ? 1 : 0;
     ws_geometry_world_triangles = 0;
     ws_geometry_precise_triangles = 0;
+    geometry_diag_reset();
     gte_geometry_correction_set(ws_geometry_correction);
-    /* Exact SWC2 packet-address provenance is preferred over the fallback
+    /* Exact committed packet-address provenance is preferred over the fallback
      * packed-SXY cache whenever the game stores GTE results into its OT. */
     gte_precision_tracking_set(ws_geometry_correction ||
                                s_texture_correction_enabled);
     gr_set_geometry_correction(ws_geometry_correction);
-    if (!ws_geometry_correction)
-        gr_set_presentation_yaw(0.0, 256.0, 160.0, 160.0);
+    if (!ws_geometry_correction) {
+        s_texture_correction_yaw_active = 0;
+        gr_set_presentation_yaw(0.0, 256.0, 160.0, 120.0, 160.0);
+    }
     ws_nw_sync_target();
 }
 
@@ -2332,17 +2394,70 @@ void gpu_geometry_correction_stats(uint64_t *world_triangles,
     if (precise_triangles) *precise_triangles = ws_geometry_precise_triangles;
 }
 
+void gpu_geometry_correction_stats_detailed(
+        GpuGeometryCorrectionStats *out, uint32_t out_size) {
+    if (!out || out_size == 0u) return;
+    GtePrecisionDiagnostics provenance = { 0 };
+    GpuGeometryCorrectionStats snapshot;
+    gte_precision_diagnostics(&provenance);
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.version = GPU_GEOMETRY_DIAGNOSTICS_VERSION;
+    snapshot.size = (uint32_t)sizeof(snapshot);
+    snapshot.presentation_sequence = s_geometry_diag_presentation_sequence;
+    snapshot.corrected_presentations = s_geometry_diag_corrected_presentations;
+    snapshot.latest_live_presentation = s_geometry_diag_latest_live_presentation;
+    snapshot.latest_live_valid = (uint32_t)s_geometry_diag_latest_live_valid;
+    snapshot.provenance_store_collisions = provenance.store_collisions;
+    snapshot.provenance_store_evictions = provenance.store_evictions;
+    snapshot.provenance_lookup_collisions = provenance.lookup_collisions;
+    snapshot.cumulative = s_geometry_diag_cumulative;
+    snapshot.latest_live = s_geometry_diag_live_latest;
+    snapshot.provenance_store_uncommitted_rejections =
+        provenance.store_uncommitted_rejections;
+    snapshot.provenance_registered_store_attempts =
+        provenance.registered_store_attempts;
+    snapshot.provenance_registered_store_accepts =
+        provenance.registered_store_accepts;
+    snapshot.provenance_registered_store_packed_rejections =
+        provenance.registered_store_packed_rejections;
+    snapshot.provenance_copy_load_attempts =
+        provenance.copy_load_attempts;
+    snapshot.provenance_copy_load_accepts =
+        provenance.copy_load_accepts;
+    snapshot.provenance_copy_store_attempts =
+        provenance.copy_store_attempts;
+    snapshot.provenance_copy_store_accepts =
+        provenance.copy_store_accepts;
+    snapshot.provenance_copy_store_packed_rejections =
+        provenance.copy_store_packed_rejections;
+    {
+        const uint32_t copy_size = out_size < (uint32_t)sizeof(snapshot)
+            ? out_size : (uint32_t)sizeof(snapshot);
+        memcpy(out, &snapshot, copy_size);
+    }
+}
+
 int gpu_geometry_correction_enabled(void) {
     return ws_geometry_correction;
 }
 
 void gpu_geometry_camera_yaw_residual_set(double yaw_units) {
     double center = (double)ws_disp_w() * 0.5;
+    /* Keep Y relative to the drawing band. The GL backend adds its current
+     * GP0(E5) draw offset after flushing the prior batch, so a framebuffer
+     * switch after VBlank cannot leave the next frame on the old horizon. */
+    double center_y = (double)ws_disp_h() * 0.5;
     double focal = center;
     if (ws_mode == 1 && ws_xden != 0)
         focal = focal * (double)ws_xnum / (double)ws_xden;
+    /* The optional fractional-yaw homography changes effective depth across a
+     * primitive. Until all four vertices can be preflighted against that
+     * renderer-side denominator, keep the whole textured polygon affine. This
+     * avoids a provoking-vertex decision mixing q=0 and q>0 at a screen edge. */
+    s_texture_correction_yaw_active =
+        ws_geometry_correction && yaw_units != 0.0;
     gr_set_presentation_yaw(ws_geometry_correction ? yaw_units : 0.0,
-                            256.0, center, focal);
+                            256.0, center, center_y, focal);
 }
 
 static void ws_clear_all_reveal_margins(void) {
@@ -2479,6 +2594,13 @@ static void gpu_reset_state(int clear_vram) {
     s_d24_upload_x1 = 0;
     s_d24_present_hold = 0;
     s_d24_prev_disp_h = 0;
+
+    /* gr_init can retain backend-side draw state across GP1(00h). Keep the
+     * restored canonical clip and the framebuffer-relative yaw horizon in
+     * lockstep with the power-on GP0 defaults. */
+    gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
+                     (int)draw_area_right, (int)draw_area_bottom);
+    gr_set_draw_offset(draw_offset_x, draw_offset_y);
 }
 
 void gpu_init(void) {
@@ -2655,6 +2777,9 @@ void gpu_vblank_tick(void) {
     }
     g_doff_min_this = 0x7fffffff; g_doff_max_this = -0x7fffffff; g_doff_cnt_this = 0;
     gpustat_poll_count = 0;
+    /* Latch the just-finished frame before the mouse/mod hook samples the
+     * diagnostics below. */
+    geometry_diag_finish_presentation();
     /* Trusted package-selected plugins run on guest VBlank, independent of
      * host presentation, pacing, turbo, or skipped frames. */
     mod_runtime_on_vblank();
@@ -2876,45 +3001,309 @@ static void parse_vertex(uint32_t word, int32_t* x, int32_t* y) {
 
 extern int gte_geometry_correction_enabled(void);
 extern void gte_precision_tracking_set(int enabled);
-extern int gte_precision_load_word(uint32_t addr, uint32_t packed,
-                                   int32_t *x16, int32_t *y16, uint16_t *z);
 
 void gpu_texture_correction_set(int enabled) {
     s_texture_correction_enabled = enabled ? 1 : 0;
+    s_texture_correction_triangles = 0;
+    gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
     gte_precision_tracking_set(s_texture_correction_enabled ||
                                ws_geometry_correction);
 }
 
 uint32_t gpu_texture_correction_hits(void) {
-    return sw_perspective_triangle_count();
+    return s_texture_correction_triangles;
 }
 
-/* Resolve vertices only through the exact RAM address at which an SWC2 stored
- * that projection. A rounded packed SXY value is not a unique identity: many
+static int gp0_source_word_address(int word_index, uint32_t *out) {
+    const uint32_t delta = (uint32_t)word_index * 4u;
+    if (gp0_cmd_source_addr == 0xFFFFFFFFu ||
+        gp0_cmd_source_addr > UINT32_MAX - delta)
+        return 0;
+    *out = gp0_cmd_source_addr + delta;
+    return 1;
+}
+
+static int32_t fixed16_integer_floor(int32_t value) {
+    const int64_t wide = value;
+    if (wide >= 0) return (int32_t)(wide / 65536);
+    return (int32_t)(-(((-wide) + 65535) / 65536));
+}
+
+static uint64_t abs_i64_u64(int64_t value) {
+    return (uint64_t)(value < 0 ? -value : value);
+}
+
+static uint32_t geometry_primitive_class(uint8_t opcode) {
+    const uint32_t quad = (opcode & 0x08u) ? 4u : 0u;
+    const uint32_t gouraud = (opcode & 0x10u) ? 2u : 0u;
+    const uint32_t textured = (opcode & 0x04u) ? 1u : 0u;
+    return quad | gouraud | textured;
+}
+
+static GpuGeometryRejectReason geometry_reject_from_lookup(
+        GtePrecisionLookupResult result) {
+    switch (result) {
+        case GTE_PRECISION_LOOKUP_TRACKING_DISABLED:
+            return GPU_GEOMETRY_REJECT_TRACKING_DISABLED;
+        case GTE_PRECISION_LOOKUP_SPECULATIVE:
+            return GPU_GEOMETRY_REJECT_SPECULATIVE_LOOKUP;
+        case GTE_PRECISION_LOOKUP_SOURCE_NOT_RAM:
+            return GPU_GEOMETRY_REJECT_SOURCE_NOT_RAM;
+        case GTE_PRECISION_LOOKUP_SOURCE_UNALIGNED:
+            return GPU_GEOMETRY_REJECT_SOURCE_UNALIGNED;
+        case GTE_PRECISION_LOOKUP_STORE_MISS:
+            return GPU_GEOMETRY_REJECT_STORE_MISS;
+        case GTE_PRECISION_LOOKUP_STORE_COLLISION:
+            return GPU_GEOMETRY_REJECT_STORE_COLLISION;
+        case GTE_PRECISION_LOOKUP_PROJECTION_INVALID:
+            return GPU_GEOMETRY_REJECT_PROJECTION_INVALID;
+        case GTE_PRECISION_LOOKUP_PACKED_MISMATCH:
+            return GPU_GEOMETRY_REJECT_PACKED_MISMATCH;
+        case GTE_PRECISION_LOOKUP_ZERO_DEPTH:
+            return GPU_GEOMETRY_REJECT_ZERO_DEPTH;
+        case GTE_PRECISION_LOOKUP_SATURATED:
+            return GPU_GEOMETRY_REJECT_SATURATED;
+        case GTE_PRECISION_LOOKUP_PERSPECTIVE_INVALID:
+            return GPU_GEOMETRY_REJECT_PROJECTION_INVALID;
+        case GTE_PRECISION_LOOKUP_ACCEPTED:
+        case GTE_PRECISION_LOOKUP_RESULT_COUNT:
+        default:
+            return GPU_GEOMETRY_REJECT_PROJECTION_INVALID;
+    }
+}
+
+static void geometry_diag_note_candidate(
+        GpuGeometryCorrectionCounters *stats, int count, int triangle_count,
+        uint32_t primitive_class, uint32_t opcode_index) {
+    if (!stats) return;
+    stats->triangle_candidates += (uint64_t)triangle_count;
+    ++stats->polygon_candidates;
+    stats->vertex_candidates += (uint64_t)count;
+    ++stats->primitive_candidates[primitive_class];
+    ++stats->opcode_candidates[opcode_index];
+}
+
+static void geometry_diag_note_rejection(
+        GpuGeometryCorrectionCounters *stats,
+        GpuGeometryRejectReason reason, uint64_t count) {
+    if (stats) stats->vertex_rejections[(uint32_t)reason] += count;
+}
+
+/* Axis-aligned textured quads use a rectangle renderer and never consume the
+ * per-triangle precision metadata. Keep them visible in the coverage
+ * denominator as an explicit, safe canonical fallback. */
+static void geometry_diag_note_rectangle_fast_path(void) {
+    if (!gte_geometry_correction_enabled()) return;
+    const uint8_t opcode = (uint8_t)(gp0_cmd_buf[0] >> 24);
+    const uint32_t opcode_index = (uint32_t)(opcode - 0x20u) & 31u;
+    const uint32_t primitive_class = geometry_primitive_class(opcode);
+    GpuGeometryCorrectionCounters *live = NULL;
+    if (geometry_diag_presentation_live()) {
+        live = &s_geometry_diag_live_current;
+        s_geometry_diag_live_current_touched = 1;
+    }
+    geometry_diag_note_candidate(&s_geometry_diag_cumulative, 4, 2,
+                                 primitive_class, opcode_index);
+    geometry_diag_note_candidate(live, 4, 2,
+                                 primitive_class, opcode_index);
+    geometry_diag_note_rejection(
+        &s_geometry_diag_cumulative,
+        GPU_GEOMETRY_REJECT_RECTANGLE_FAST_PATH, 4);
+    geometry_diag_note_rejection(
+        live, GPU_GEOMETRY_REJECT_RECTANGLE_FAST_PATH, 4);
+}
+
+static uint32_t geometry_depth_bucket(uint16_t z) {
+    if (z < 256u) return 0;
+    if (z < 1024u) return 1;
+    if (z < 4096u) return 2;
+    if (z < 16384u) return 3;
+    if (z < 32768u) return 4;
+    return 5;
+}
+
+static uint32_t geometry_screen_bucket(int32_t x, int32_t y) {
+    const int32_t width = ws_disp_w();
+    const int32_t height = ws_disp_h();
+    if (x < 0 || y < 0 || x >= width || y >= height)
+        return 9;
+    int32_t column = width > 0 ? (x * 3) / width : 0;
+    int32_t row = height > 0 ? (y * 3) / height : 0;
+    if (column > 2) column = 2;
+    if (row > 2) row = 2;
+    return (uint32_t)(row * 3 + column);
+}
+
+static uint32_t geometry_correction_bucket(uint64_t magnitude16) {
+    if (magnitude16 == 0) return 0;
+    if (magnitude16 < 16384u) return 1;
+    if (magnitude16 < 32768u) return 2;
+    if (magnitude16 < 49152u) return 3;
+    return 4;
+}
+
+static void geometry_diag_saturating_add(
+        GpuGeometryCorrectionCounters *stats,
+        uint64_t *destination, uint64_t value) {
+    if (UINT64_MAX - *destination < value) {
+        *destination = UINT64_MAX;
+        stats->correction_accumulators_saturated = 1;
+    } else {
+        *destination += value;
+    }
+}
+
+static void geometry_diag_note_accepted(
+        GpuGeometryCorrectionCounters *stats, int count, int triangle_count,
+        uint32_t primitive_class, uint32_t opcode_index,
+        const int32_t *precise_x, const int32_t *precise_y,
+        const int32_t *raw_x, const int32_t *raw_y,
+        const int32_t *screen_x, const int32_t *screen_y,
+        const uint16_t *z) {
+    if (!stats) return;
+    stats->triangle_accepted += (uint64_t)triangle_count;
+    ++stats->polygon_accepted;
+    stats->vertex_accepted += (uint64_t)count;
+    ++stats->primitive_accepted[primitive_class];
+    ++stats->opcode_accepted[opcode_index];
+    for (int i = 0; i < count; ++i) {
+        const int64_t dx = (int64_t)precise_x[i] -
+                           (int64_t)raw_x[i] * 65536;
+        const int64_t dy = (int64_t)precise_y[i] -
+                           (int64_t)raw_y[i] * 65536;
+        const uint64_t ax = abs_i64_u64(dx);
+        const uint64_t ay = abs_i64_u64(dy);
+        const uint64_t magnitude = ax > ay ? ax : ay;
+        ++stats->depth_vertices[geometry_depth_bucket(z[i])];
+        ++stats->screen_vertices[
+            geometry_screen_bucket(screen_x[i], screen_y[i])];
+        ++stats->correction_vertices;
+        geometry_diag_saturating_add(
+            stats, &stats->correction_abs_x16_sum, ax);
+        geometry_diag_saturating_add(
+            stats, &stats->correction_abs_y16_sum, ay);
+        geometry_diag_saturating_add(
+            stats, &stats->correction_magnitude16_sum, magnitude);
+        if (magnitude > stats->correction_magnitude16_max)
+            stats->correction_magnitude16_max = magnitude;
+        geometry_diag_saturating_add(
+            stats, &stats->correction_x16_squared_sum, ax * ax);
+        geometry_diag_saturating_add(
+            stats, &stats->correction_y16_squared_sum, ay * ay);
+        ++stats->correction_magnitude_buckets[
+            geometry_correction_bucket(magnitude)];
+    }
+}
+
+/* Resolve vertices only through the exact RAM address at which a reviewed GTE
+ * projection store committed that result. A rounded packed SXY value is not a
+ * unique identity: many
  * unrelated 3D vertices can land on the same PS1 pixel. Test 11's packed-SXY
  * fallback therefore paired polygons with unrelated projections and opened
  * cracks between adjacent primitives. Missing provenance is deliberately a
  * canonical-render fallback for the whole polygon. The integer delta folds in
  * draw offsets and any widescreen adjustment already applied. */
 static int resolve_precise_vertices(const int *indices, int count,
+                                    int triangle_count,
                                     const int32_t *vx, const int32_t *vy,
                                     int32_t *fx, int32_t *fy) {
-    if (!gte_geometry_correction_enabled() ||
-        gp0_cmd_source_addr == 0xFFFFFFFFu)
+    if (!gte_geometry_correction_enabled())
         return 0;
+
+    const uint8_t opcode = (uint8_t)(gp0_cmd_buf[0] >> 24);
+    const uint32_t opcode_index = (uint32_t)(opcode - 0x20u) & 31u;
+    const uint32_t primitive_class = geometry_primitive_class(opcode);
+    GpuGeometryCorrectionCounters *live = NULL;
+    if (geometry_diag_presentation_live()) {
+        live = &s_geometry_diag_live_current;
+        s_geometry_diag_live_current_touched = 1;
+    }
+    geometry_diag_note_candidate(&s_geometry_diag_cumulative, count,
+                                 triangle_count,
+                                 primitive_class, opcode_index);
+    geometry_diag_note_candidate(live, count, triangle_count,
+                                 primitive_class, opcode_index);
+
+    if (gp0_cmd_source_addr == 0xFFFFFFFFu) {
+        geometry_diag_note_rejection(&s_geometry_diag_cumulative,
+                                     GPU_GEOMETRY_REJECT_NO_COMMAND_SOURCE,
+                                     (uint64_t)count);
+        geometry_diag_note_rejection(live,
+                                     GPU_GEOMETRY_REJECT_NO_COMMAND_SOURCE,
+                                     (uint64_t)count);
+        return 0;
+    }
+
+    int32_t precise_x[4], precise_y[4], raw_x[4], raw_y[4];
+    uint16_t z[4];
+    int resolved = 0;
 
     for (int i = 0; i < count; ++i) {
         const uint32_t word = gp0_cmd_buf[indices[i]];
-        const uint32_t addr = (gp0_cmd_source_addr +
-                               (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
-        int32_t raw_x, raw_y;
-        if (!gte_precision_load_word(addr, word, &fx[i], &fy[i], NULL))
-            return 0;
-        parse_vertex(word, &raw_x, &raw_y);
-        fx[i] = (int32_t)((int64_t)fx[i] +
-                          (int64_t)(vx[i] - raw_x) * 65536);
-        fy[i] = (int32_t)((int64_t)fy[i] +
-                          (int64_t)(vy[i] - raw_y) * 65536);
+        uint32_t addr;
+        GpuGeometryRejectReason reject;
+        int accepted = 0;
+        if (!gp0_source_word_address(indices[i], &addr)) {
+            reject = GPU_GEOMETRY_REJECT_SOURCE_ADDRESS_OVERFLOW;
+        } else {
+            const GtePrecisionLookupResult result =
+                gte_precision_load_word_ex(addr, word,
+                                           &precise_x[i], &precise_y[i], &z[i]);
+            if (result != GTE_PRECISION_LOOKUP_ACCEPTED) {
+                reject = geometry_reject_from_lookup(result);
+            } else {
+                parse_vertex(word, &raw_x[i], &raw_y[i]);
+                /* This test happens on the retained raw projection. Draw
+                 * offsets and widescreen transforms in vx/vy must not hide a
+                 * saturated or otherwise non-subpixel discrepancy. */
+                if (fixed16_integer_floor(precise_x[i]) != raw_x[i] ||
+                    fixed16_integer_floor(precise_y[i]) != raw_y[i]) {
+                    reject = GPU_GEOMETRY_REJECT_INTEGER_MISMATCH;
+                } else {
+                    accepted = 1;
+                    ++resolved;
+                }
+            }
+        }
+        if (!accepted) {
+            geometry_diag_note_rejection(&s_geometry_diag_cumulative,
+                                         reject, 1);
+            geometry_diag_note_rejection(live, reject, 1);
+        }
+    }
+
+    if (resolved != count) {
+        if (resolved != 0) {
+            geometry_diag_note_rejection(
+                &s_geometry_diag_cumulative,
+                GPU_GEOMETRY_REJECT_ATOMIC_FALLBACK, (uint64_t)resolved);
+            geometry_diag_note_rejection(
+                live, GPU_GEOMETRY_REJECT_ATOMIC_FALLBACK,
+                (uint64_t)resolved);
+            ++s_geometry_diag_cumulative.partial_polygon_rejections;
+            if (live) ++live->partial_polygon_rejections;
+            if (count == 4) {
+                ++s_geometry_diag_cumulative.partial_quad_rejections;
+                if (live) ++live->partial_quad_rejections;
+            }
+        }
+        return 0;
+    }
+
+    geometry_diag_note_accepted(&s_geometry_diag_cumulative, count,
+                                triangle_count,
+                                primitive_class, opcode_index,
+                                precise_x, precise_y, raw_x, raw_y,
+                                raw_x, raw_y, z);
+    geometry_diag_note_accepted(live, count, triangle_count,
+                                primitive_class, opcode_index,
+                                precise_x, precise_y, raw_x, raw_y,
+                                raw_x, raw_y, z);
+    for (int i = 0; i < count; ++i) {
+        fx[i] = (int32_t)((int64_t)precise_x[i] +
+                          (int64_t)(vx[i] - raw_x[i]) * 65536);
+        fy[i] = (int32_t)((int64_t)precise_y[i] +
+                          (int64_t)(vy[i] - raw_y[i]) * 65536);
     }
     return 1;
 }
@@ -2927,7 +3316,7 @@ static void queue_precise_triangle(int exact,
                                    int a, int b, int c) {
     const int geometry_enabled = gte_geometry_correction_enabled();
     gr_set_world_triangle(0);
-    sw_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
+    gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
     if (geometry_enabled) ++ws_geometry_world_triangles;
     if (!geometry_enabled || !exact) {
         gr_set_precise_triangle(0, 0,0, 0,0, 0,0);
@@ -2939,45 +3328,73 @@ static void queue_precise_triangle(int exact,
                             fx[a], fy[a], fx[b], fy[b], fx[c], fy[c]);
 }
 
-static void prepare_precise_triangle(int i0, int i1, int i2,
-                                     const int32_t vx[3], const int32_t vy[3]) {
+static int prepare_precise_triangle(int i0, int i1, int i2,
+                                    const int32_t vx[3], const int32_t vy[3]) {
     const int indices[3] = { i0, i1, i2 };
     int32_t fx[3], fy[3];
-    const int exact = resolve_precise_vertices(indices, 3, vx, vy, fx, fy);
+    const int exact = resolve_precise_vertices(
+        indices, 3, 1, vx, vy, fx, fy);
     queue_precise_triangle(exact, fx, fy, 0, 1, 2);
+    return exact;
 }
 
 /* Resolve a GP0 quad as one unit before either of its raster triangles is
  * submitted. This prevents a partially tracked quad from correcting only one
  * side of its shared diagonal. */
 static int prepare_precise_quad_vertices(const int indices[4],
+                                         int triangle_count,
                                          const int32_t vx[4],
                                          const int32_t vy[4],
                                          int32_t fx[4], int32_t fy[4]) {
-    return resolve_precise_vertices(indices, 4, vx, vy, fx, fy);
+    return resolve_precise_vertices(
+        indices, 4, triangle_count, vx, vy, fx, fy);
 }
 
-/* Enable perspective UVs only when every position word came from an exact
- * SWC2 projection store at that same DMA packet address. This preserves the
- * association through ordering-table reordering and rejects CPU-built UI. */
-static void prepare_texture_triangle(int i0, int i1, int i2) {
-    sw_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
-    if (!s_texture_correction_enabled || gp0_cmd_source_addr == 0xFFFFFFFFu)
-        return;
-    int indices[3] = { i0, i1, i2 };
-    uint16_t z[3];
-    for (int i = 0; i < 3; i++) {
-        uint32_t addr = (gp0_cmd_source_addr + (uint32_t)indices[i] * 4u) & 0x1FFFFCu;
-        if (!gte_precision_load_word(addr, gp0_cmd_buf[indices[i]], NULL, NULL, &z[i]) ||
-            z[i] == 0)
-            return;
+/* Resolve projective depth as one polygon-wide transaction. Geometry's exact
+ * verdict is a prerequisite: this keeps both halves of a quad affine whenever
+ * any one of its four vertices falls back, and excludes CPU-built UI. */
+static int resolve_texture_vertices(int exact, const int *indices, int count,
+                                    float *q) {
+    if (!exact || !s_texture_correction_enabled ||
+        s_texture_correction_yaw_active ||
+        gp0_cmd_source_addr == 0xFFFFFFFFu || count < 3 || count > 4)
+        return 0;
+    uint16_t z[4];
+    for (int i = 0; i < count; i++) {
+        uint32_t addr;
+        if (!gp0_source_word_address(indices[i], &addr) ||
+            gte_precision_load_perspective_word_ex(
+                addr, gp0_cmd_buf[indices[i]], &z[i]) !=
+                GTE_PRECISION_LOOKUP_ACCEPTED)
+            return 0;
     }
-    float q[3] = { 1.0f / (float)z[0], 1.0f / (float)z[1], 1.0f / (float)z[2] };
+    for (int i = 0; i < count; ++i) q[i] = 1.0f / (float)z[i];
     float qmax = q[0];
-    if (q[1] > qmax) qmax = q[1];
-    if (q[2] > qmax) qmax = q[2];
-    if (qmax <= 0.0f) return;
-    sw_set_perspective_triangle(1, q[0] / qmax, q[1] / qmax, q[2] / qmax);
+    for (int i = 1; i < count; ++i)
+        if (q[i] > qmax) qmax = q[i];
+    if (qmax <= 0.0f) return 0;
+    for (int i = 0; i < count; ++i) q[i] /= qmax;
+    return 1;
+}
+
+static void queue_texture_triangle(int exact, const float *q,
+                                   int a, int b, int c) {
+    if (!exact) {
+        gr_set_perspective_triangle(0, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+    gr_set_perspective_triangle(1, q[a], q[b], q[c]);
+    if (s_texture_correction_triangles != UINT32_MAX)
+        ++s_texture_correction_triangles;
+}
+
+/* Triangle wrapper; quads preflight all four vertices once and queue their two
+ * reciprocal-depth orderings explicitly below. */
+static void prepare_texture_triangle(int exact, int i0, int i1, int i2) {
+    const int indices[3] = { i0, i1, i2 };
+    float q[3];
+    const int perspective = resolve_texture_vertices(exact, indices, 3, q);
+    queue_texture_triangle(perspective, q, 0, 1, 2);
 }
 
 /* Write a single pixel to VRAM with draw area clipping and mask bit handling */
@@ -3210,7 +3627,8 @@ static void gp0_exec_mono_quad(void) {
     const int precise_indices[4] = { 1, 2, 3, 4 };
     int32_t precise_x[4], precise_y[4];
     const int precise_quad = prepare_precise_quad_vertices(
-        precise_indices, vx, vy, precise_x, precise_y);
+        precise_indices, (!rej_a) + (!rej_b),
+        vx, vy, precise_x, precise_y);
     if (!rej_a) {
         queue_precise_triangle(precise_quad, precise_x, precise_y, 0, 1, 2);
         gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
@@ -3284,7 +3702,8 @@ static void gp0_exec_shaded_quad(void) {
     const int precise_indices[4] = { 1, 3, 5, 7 };
     int32_t precise_x[4], precise_y[4];
     const int precise_quad = prepare_precise_quad_vertices(
-        precise_indices, vx, vy, precise_x, precise_y);
+        precise_indices, (!rej_a) + (!rej_b),
+        vx, vy, precise_x, precise_y);
     if (!rej_a) {
         queue_precise_triangle(precise_quad, precise_x, precise_y, 0, 1, 2);
         gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
@@ -3363,8 +3782,8 @@ static void gp0_exec_textured_tri(void) {
     if (draw_area_out_bbox(vx, vy, 3)) return;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
-    prepare_precise_triangle(1, 3, 5, vx, vy);
-    prepare_texture_triangle(1, 3, 5);
+    const int precise = prepare_precise_triangle(1, 3, 5, vx, vy);
+    prepare_texture_triangle(precise, 1, 3, 5);
     gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
@@ -3429,6 +3848,7 @@ static void gp0_exec_textured_quad(void) {
         int top_v   = vy[0] < vy[2] ? v[0] : v[2];
         int bot_v   = vy[0] < vy[2] ? v[2] : v[0];
         if (w > 0 && h > 0) {
+            geometry_diag_note_rectangle_fast_path();
             if (right_u - left_u == w && bot_v - top_v == h) {
                 gr_draw_textured_rect(x, y, w, h, left_u, top_v,
                                       clut_x, clut_y, tpage);
@@ -3444,10 +3864,14 @@ static void gp0_exec_textured_quad(void) {
     const int precise_indices[4] = { 1, 3, 5, 7 };
     int32_t precise_x[4], precise_y[4];
     const int precise_quad = prepare_precise_quad_vertices(
-        precise_indices, vx, vy, precise_x, precise_y);
+        precise_indices, (!rej_a) + (!rej_b),
+        vx, vy, precise_x, precise_y);
+    float texture_q[4];
+    const int perspective_quad = resolve_texture_vertices(
+        precise_quad, precise_indices, 4, texture_q);
     if (!rej_a) {
         queue_precise_triangle(precise_quad, precise_x, precise_y, 0, 1, 2);
-        prepare_texture_triangle(1, 3, 5);
+        queue_texture_triangle(perspective_quad, texture_q, 0, 1, 2);
         gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                                   vx[1], vy[1], u[1], v[1],
                                   vx[2], vy[2], u[2], v[2],
@@ -3455,7 +3879,7 @@ static void gp0_exec_textured_quad(void) {
     }
     if (!rej_b) {
         queue_precise_triangle(precise_quad, precise_x, precise_y, 2, 1, 3);
-        prepare_texture_triangle(5, 3, 7);
+        queue_texture_triangle(perspective_quad, texture_q, 2, 1, 3);
         gr_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
                                   vx[1], vy[1], u[1], v[1],
                                   vx[3], vy[3], u[3], v[3],
@@ -3496,8 +3920,8 @@ static void gp0_exec_shaded_textured_tri(void) {
     if (draw_area_out_bbox(vx, vy, 3)) return;
 
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    prepare_precise_triangle(1, 4, 7, vx, vy);
-    prepare_texture_triangle(1, 4, 7);
+    const int precise = prepare_precise_triangle(1, 4, 7, vx, vy);
+    prepare_texture_triangle(precise, 1, 4, 7);
     gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
                                      vx[1], vy[1], u[1], v[1], c[1],
                                      vx[2], vy[2], u[2], v[2], c[2],
@@ -3546,10 +3970,14 @@ static void gp0_exec_shaded_textured_quad(void) {
     const int precise_indices[4] = { 1, 4, 7, 10 };
     int32_t precise_x[4], precise_y[4];
     const int precise_quad = prepare_precise_quad_vertices(
-        precise_indices, vx, vy, precise_x, precise_y);
+        precise_indices, (!rej_a) + (!rej_b),
+        vx, vy, precise_x, precise_y);
+    float texture_q[4];
+    const int perspective_quad = resolve_texture_vertices(
+        precise_quad, precise_indices, 4, texture_q);
     if (!rej_a) {
         queue_precise_triangle(precise_quad, precise_x, precise_y, 0, 1, 2);
-        prepare_texture_triangle(1, 4, 7);
+        queue_texture_triangle(perspective_quad, texture_q, 0, 1, 2);
         gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
                                          vx[1], vy[1], u[1], v[1], c[1],
                                          vx[2], vy[2], u[2], v[2], c[2],
@@ -3557,7 +3985,7 @@ static void gp0_exec_shaded_textured_quad(void) {
     }
     if (!rej_b) {
         queue_precise_triangle(precise_quad, precise_x, precise_y, 2, 1, 3);
-        prepare_texture_triangle(7, 4, 10);
+        queue_texture_triangle(perspective_quad, texture_q, 2, 1, 3);
         gr_draw_shaded_textured_triangle(vx[2], vy[2], u[2], v[2], c[2],
                                          vx[1], vy[1], u[1], v[1], c[1],
                                          vx[3], vy[3], u[3], v[3], c[3],
@@ -5280,9 +5708,11 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     pst_r_init(&r, p, len);
     if (!gpu_snap_parse(&r)) return 0;
     /* Sync renderer clip/scissor to restored GP0(E3/E4); vars alone leave GL
-     * on a stale draw area after savestate load. */
+     * on stale drawing state after savestate load. The offset also selects the
+     * correct framebuffer-relative horizon for optional full-Y yaw. */
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
+    gr_set_draw_offset(draw_offset_x, draw_offset_y);
     ws_nw_sync_target();
     return 1;
 }

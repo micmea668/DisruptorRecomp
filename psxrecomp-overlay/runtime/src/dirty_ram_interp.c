@@ -24,6 +24,7 @@
  */
 
 #include "dirty_ram_interp.h"
+#include "gte_precision.h"
 #include "cpu_state.h"
 #include "debug_server.h"
 #include "interrupts.h"
@@ -2164,7 +2165,9 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
 #ifdef PSX_ENABLE_BLOCK_CYCLES
             psx_gte_read(cpu, rt);
 #endif
-            cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd);
+            cpu->gpr[rt] = gte_precision_mfc2_pc_read(
+                pc, insn, (uint8_t)rd,
+                gte_read_data(cpu, (uint8_t)rd));
             cpu->gpr[0] = 0;
             return 0;
         }
@@ -2231,6 +2234,8 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
             cpu->gpr[rt] = psx_ws_xclip_bound(psx_cyc_load_word(cpu, addr, rt, 1u << rs));
         else
             cpu->gpr[rt] = psx_cyc_load_word(cpu, addr, rt, 1u << rs);
+        cpu->gpr[rt] = gte_precision_copy_pc_read(
+            pc, insn, (uint8_t)rt, addr, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -2286,6 +2291,11 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
         g_debug_last_store_pc = pc;
         parappa_rhythm_log_store(cpu, pc, addr, cpu->gpr[rt], 4u);
         cpu->write_word(addr, cpu->gpr[rt]);
+        gte_precision_scratch_store_pc_word(
+            pc, insn, addr, cpu->gpr[rt]);
+        gte_precision_copy_pc_word(
+            pc, insn, (uint8_t)rt, addr, cpu->gpr[rt]);
+        gte_precision_store_pc_word(pc, insn, addr, cpu->gpr[rt]);
         return 0;
     }
     case 0x2E: { /* SWR */
@@ -3485,6 +3495,7 @@ static void ls_replay_and_compare(CPUState *cpu, uint32_t frame, uint32_t target
     uint32_t    sav_unsup_pc     = g_unsupported_pc;
     uint32_t    sav_unsup_insn   = g_unsupported_insn;
     const char *sav_unsup_reason = g_unsupported_reason;
+    int         gte_sandbox      = gte_replay_side_effects_begin();
     g_ls_replay_active = 1;
     g_ls_mode = 2;
     uint32_t pc = rep.pc;
@@ -3508,6 +3519,7 @@ static void ls_replay_and_compare(CPUState *cpu, uint32_t frame, uint32_t target
     }
     g_ls_mode = 0;
     g_ls_replay_active = 0;
+    if (gte_sandbox) gte_replay_side_effects_end();
     g_unsupported_seen   = sav_unsup_seen;     /* undo any replay-side decode-state leak */
     g_unsupported_pc     = sav_unsup_pc;
     g_unsupported_insn   = sav_unsup_insn;
@@ -3602,6 +3614,7 @@ static void lsf_replay_and_compare(CPUState *native_post, uint32_t frame,
     const char *sav_unsup_reason = g_unsupported_reason;
     uint32_t    sav_store_pc     = g_debug_last_store_pc;
     uint32_t    sav_func_addr    = g_debug_current_func_addr;
+    int         gte_sandbox      = gte_replay_side_effects_begin();
 
     g_ls_replay_active = 1;
     g_ls_mode = 2;
@@ -3637,6 +3650,7 @@ static void lsf_replay_and_compare(CPUState *native_post, uint32_t frame,
 
     g_ls_mode = 0;
     g_ls_replay_active = 0;
+    if (gte_sandbox) gte_replay_side_effects_end();
     g_unsupported_seen   = sav_unsup_seen;
     g_unsupported_pc     = sav_unsup_pc;
     g_unsupported_insn   = sav_unsup_insn;

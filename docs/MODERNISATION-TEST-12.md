@@ -42,11 +42,12 @@ vertex wobble and frame blending as independent settings later.
 ## Live result
 
 The Test 12 comparison removed every reported Test 11-style fracture and
-stretched facet. Exact geometry alone did not produce a noticeable reduction in
-wobble compared with Test 9, and enabling the exact-gated fractional camera did
-not make the wobble noticeably better either. This validates the conservative
-provenance gate as a safety repair, but not the current corrected presentation
-path as a visible improvement.
+stretched facet. A later audit of the archived telemetry changed the meaning of
+that result: every corrected mode reported zero accepted precise geometry. The
+canonical fallback produced the clean image, so the comparison did not exercise
+the retained coordinates or exact-gated fractional camera. It validates removal
+of Test 11's ambiguous rounded-SXY lookup as a fail-closed safety repair, but it
+provides no evidence that retained precision reduces wobble.
 
 Retained Test 9 architecture:
 
@@ -59,8 +60,10 @@ Retained Test 9 architecture:
 
 Validation completed for this source checkpoint:
 
-* The geometry-provenance contract audit proves the packed-SXY fallback is
-  absent, yaw is exact-gated, and all four quad handlers preflight as a unit.
+* The geometry-provenance contract audit proves the ambiguous packed-SXY
+  fallback is absent, yaw is provenance-gated, and all four quad handlers
+  preflight as a unit. Archived live telemetry later established that this
+  checkpoint's SWC2-only producer path had zero coverage in Disruptor.
 * The modified GPU translation unit compiles cleanly as C99.
 * Canonical GTE register/provenance tests pass.
 * Mouse input, registration and fractional-yaw boundary tests pass in all five

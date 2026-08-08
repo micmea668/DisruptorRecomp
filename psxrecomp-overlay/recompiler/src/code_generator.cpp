@@ -18,6 +18,102 @@
 
 namespace PSXRecomp {
 
+/* Disruptor's resident geometry builders read SXY2 with MFC2 and later use an
+ * ordinary SW. Keep these hooks deliberately narrower than the general code
+ * generator: the runtime also checks the game serial, PC and raw instruction.
+ * A shape mismatch at either source PC is a build error, not a silent widening
+ * of the provenance trust boundary. */
+static bool disruptor_precision_mfc2_pc(uint32_t address) {
+    return address == 0x8004633Cu || address == 0x8004795Cu;
+}
+
+static bool disruptor_precision_store_pc(uint32_t address) {
+    switch (address) {
+    case 0x8004641Cu:
+    case 0x800464BCu:
+    case 0x80046524u:
+    case 0x80046540u:
+    case 0x80046594u:
+    case 0x800465D8u:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool disruptor_precision_scratch_store_pc(uint32_t address) {
+    return address == 0x80047A0Cu;
+}
+
+struct DisruptorPrecisionCopySite {
+    uint32_t pc;
+    uint32_t instruction;
+    uint8_t gpr;
+};
+
+static const DisruptorPrecisionCopySite kDisruptorPrecisionCopyLoads[] = {
+    {0x80046C4Cu, 0x8D0C0004u, 12u},
+    {0x80046C50u, 0x8D2D0004u, 13u},
+    {0x80046C54u, 0x8D4E0004u, 14u},
+    {0x80046C60u, 0x8D6F0004u, 15u},
+    {0x80047A80u, 0x8CA80084u, 8u},
+    {0x80047A84u, 0x8CA900A4u, 9u},
+    {0x80047A88u, 0x8CAA00C4u, 10u},
+    {0x80047A8Cu, 0x8CAB00BCu, 11u},
+    {0x80047B40u, 0x8CA800A4u, 8u},
+    {0x80047B44u, 0x8CA9008Cu, 9u},
+    {0x80047B48u, 0x8CAA00ACu, 10u},
+    {0x80047B4Cu, 0x8CAB00C4u, 11u},
+    {0x80047C00u, 0x8CA800C4u, 8u},
+    {0x80047C04u, 0x8CA900ACu, 9u},
+    {0x80047C08u, 0x8CAA0094u, 10u},
+    {0x80047C0Cu, 0x8CAB00B4u, 11u},
+    {0x80047CC4u, 0x8CA800BCu, 8u},
+    {0x80047CC8u, 0x8CA900C4u, 9u},
+    {0x80047CCCu, 0x8CAA00B4u, 10u},
+    {0x80047CD0u, 0x8CAB009Cu, 11u},
+    {0x80047D6Cu, 0x8CA80084u, 8u},
+    {0x80047D70u, 0x8CA9008Cu, 9u},
+    {0x80047D74u, 0x8CAA0094u, 10u},
+    {0x80047D78u, 0x8CAB009Cu, 11u},
+};
+
+static const DisruptorPrecisionCopySite kDisruptorPrecisionCopyStores[] = {
+    {0x80046D04u, 0xAF2C0008u, 12u},
+    {0x80046D08u, 0xAF2D0014u, 13u},
+    {0x80046D10u, 0xAF2E002Cu, 14u},
+    {0x80046D0Cu, 0xAF2F0020u, 15u},
+    {0x80047A90u, 0xAF280008u, 8u},
+    {0x80047A94u, 0xAF290014u, 9u},
+    {0x80047A9Cu, 0xAF2A002Cu, 10u},
+    {0x80047A98u, 0xAF2B0020u, 11u},
+    {0x80047B50u, 0xAF280008u, 8u},
+    {0x80047B54u, 0xAF290014u, 9u},
+    {0x80047B5Cu, 0xAF2A002Cu, 10u},
+    {0x80047B58u, 0xAF2B0020u, 11u},
+    {0x80047C10u, 0xAF280008u, 8u},
+    {0x80047C14u, 0xAF290014u, 9u},
+    {0x80047C1Cu, 0xAF2A002Cu, 10u},
+    {0x80047C18u, 0xAF2B0020u, 11u},
+    {0x80047CD4u, 0xAF280008u, 8u},
+    {0x80047CD8u, 0xAF290014u, 9u},
+    {0x80047CE0u, 0xAF2A002Cu, 10u},
+    {0x80047CDCu, 0xAF2B0020u, 11u},
+    {0x80047D7Cu, 0xAF280008u, 8u},
+    {0x80047D80u, 0xAF290014u, 9u},
+    {0x80047D88u, 0xAF2A002Cu, 10u},
+    {0x80047D84u, 0xAF2B0020u, 11u},
+};
+
+template <size_t N>
+static const DisruptorPrecisionCopySite *disruptor_precision_copy_site(
+        const DisruptorPrecisionCopySite (&sites)[N], uint32_t address) {
+    for (const DisruptorPrecisionCopySite &site : sites) {
+        if (site.pc == address) return &site;
+    }
+    return nullptr;
+}
+
 static bool codegen_cycle_per_insn() {
     // DEFAULT ON for the faithful-timing (cycle-audit) branch: each instruction
     // charges its cost at its own site, so the running cycle count is correct
@@ -1658,11 +1754,26 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     const std::string gte_read = fmt::format(
                         "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read(cpu, {});\n#endif\n    ", rt);
                     if (cop_op == 0x00) { // MFC2 - move from COP2 data
+                        std::string value;
                         if (PSXRecompGTERegisters::data_read_needs_helper(static_cast<uint8_t>(rd))) {
-                            code = gte_read + fmt::format("{} = gte_read_data(cpu, {});  /* mfc2 */", reg_name(rt), rd);
+                            value = fmt::format("gte_read_data(cpu, {})", rd);
                         } else {
-                            code = gte_read + fmt::format("{} = cpu->gte_data[{}];  /* mfc2 */", reg_name(rt), rd);
+                            value = fmt::format("cpu->gte_data[{}]", rd);
                         }
+                        if (disruptor_precision_mfc2_pc(addr)) {
+                            if (rt != 10u || rd != 14u || instr != 0x480A7000u) {
+                                throw std::runtime_error(fmt::format(
+                                    "Disruptor precision MFC2 site 0x{:08X} no longer "
+                                    "matches MFC2 r10,SXY2 (word 0x{:08X})",
+                                    addr, instr));
+                            }
+                            value = fmt::format(
+                                "gte_precision_mfc2_pc_read(0x{:08X}u, "
+                                "0x{:08X}u, {}, {})",
+                                addr, instr, rd, value);
+                        }
+                        code = gte_read + fmt::format(
+                            "{} = {};  /* mfc2 */", reg_name(rt), value);
                     } else if (cop_op == 0x02) { // CFC2 - move from COP2 control
                         if (PSXRecompGTERegisters::ctrl_read_needs_helper(static_cast<uint8_t>(rd))) {
                             code = gte_read + fmt::format("{} = gte_read_ctrl(cpu, {});  /* cfc2 */", reg_name(rt), rd);
@@ -1693,7 +1804,35 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             case 0x20: code = translate_lb(instr); break;     // lb
             case 0x21: code = translate_lh(instr); break;     // lh
             case 0x22: code = translate_lwl(instr); break;    // lwl
-            case 0x23: code = translate_lw(instr); break;     // lw
+            case 0x23: {                                      // lw
+                const DisruptorPrecisionCopySite *site =
+                    disruptor_precision_copy_site(
+                        kDisruptorPrecisionCopyLoads, addr);
+                if (!site) {
+                    code = translate_lw(instr);
+                    break;
+                }
+                const uint32_t rs = get_rs(instr);
+                const uint32_t rt = get_rt(instr);
+                const int16_t offset = get_imm16(instr);
+                if (instr != site->instruction || rt != site->gpr) {
+                    throw std::runtime_error(fmt::format(
+                        "Disruptor precision-copy LW site 0x{:08X} no longer "
+                        "matches word 0x{:08X}/r{} (found 0x{:08X})",
+                        addr, site->instruction, site->gpr, instr));
+                }
+                const std::string load_addr = offset == 0
+                    ? reg_name(rs)
+                    : fmt::format("{} + {}", reg_name(rs), offset);
+                code = fmt::format(
+                    "{{ uint32_t _precision_copy_addr = {}; "
+                    "{} = psx_cyc_load_word(cpu, _precision_copy_addr, {}, "
+                    "0x{:X}u); {} = gte_precision_copy_pc_read("
+                    "0x{:08X}u, 0x{:08X}u, {}, _precision_copy_addr, {}); }}",
+                    load_addr, reg_name(rt), rt, 1u << rs, reg_name(rt),
+                    addr, instr, rt, reg_name(rt));
+                break;
+            }
             case 0x24: code = translate_lbu(instr); break;    // lbu
             case 0x25: code = translate_lhu(instr); break;    // lhu
             case 0x26: code = translate_lwr(instr); break;    // lwr
@@ -1705,7 +1844,69 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             case 0x28: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_sb(instr); break;     // sb
             case 0x29: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_sh(instr); break;     // sh
             case 0x2A: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_swl(instr); break;    // swl
-            case 0x2B: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_sw(instr); break;     // sw
+            case 0x2B: {                                       // sw
+                const DisruptorPrecisionCopySite *copy_site =
+                    disruptor_precision_copy_site(
+                        kDisruptorPrecisionCopyStores, addr);
+                if (copy_site) {
+                    const uint32_t rs = get_rs(instr);
+                    const uint32_t rt = get_rt(instr);
+                    const int16_t offset = get_imm16(instr);
+                    if (instr != copy_site->instruction ||
+                        rt != copy_site->gpr) {
+                        throw std::runtime_error(fmt::format(
+                            "Disruptor precision-copy SW site 0x{:08X} no "
+                            "longer matches word 0x{:08X}/r{} (found "
+                            "0x{:08X})",
+                            addr, copy_site->instruction,
+                            copy_site->gpr, instr));
+                    }
+                    const std::string store_addr = offset == 0
+                        ? reg_name(rs)
+                        : fmt::format("{} + {}", reg_name(rs), offset);
+                    code = fmt::format(
+                        "g_debug_last_store_pc = 0x{:08X}u; "
+                        "{{ psx_store_cycle_barrier(); "
+                        "uint32_t _precision_copy_addr = {}; "
+                        "uint32_t _precision_copy_value = {}; "
+                        "cpu->write_word(_precision_copy_addr, "
+                        "_precision_copy_value); "
+                        "gte_precision_copy_pc_word(0x{:08X}u, "
+                        "0x{:08X}u, {}, _precision_copy_addr, "
+                        "_precision_copy_value); }}",
+                        addr, store_addr, reg_name(rt), addr, instr, rt);
+                    break;
+                }
+                code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) +
+                       translate_sw(instr);
+                if (disruptor_precision_store_pc(addr) ||
+                    disruptor_precision_scratch_store_pc(addr)) {
+                    const uint32_t rs = get_rs(instr);
+                    const uint32_t rt = get_rt(instr);
+                    const int16_t offset = get_imm16(instr);
+                    if (rs != 5u || rt != 10u || offset != 4 ||
+                        instr != 0xACAA0004u) {
+                        throw std::runtime_error(fmt::format(
+                            "Disruptor precision SW site 0x{:08X} no longer "
+                            "matches SW r10,4(r5) (word 0x{:08X})",
+                            addr, instr));
+                    }
+                    const std::string store_addr = fmt::format(
+                        "{} + {}", reg_name(rs), offset);
+                    if (disruptor_precision_scratch_store_pc(addr)) {
+                        code += fmt::format(
+                            " gte_precision_scratch_store_pc_word("
+                            "0x{:08X}u, 0x{:08X}u, {}, {});",
+                            addr, instr, store_addr, reg_name(rt));
+                    } else {
+                        code += fmt::format(
+                            " gte_precision_store_pc_word(0x{:08X}u, "
+                            "0x{:08X}u, {}, {});",
+                            addr, instr, store_addr, reg_name(rt));
+                    }
+                }
+                break;
+            }
             case 0x2E: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_swr(instr); break;    // swr
             case 0x2F:                                         // CACHE - cache op (no-op for static recomp)
                 code = "/* cache (no-op: static recompilation has no I/D cache) */";
@@ -3191,6 +3392,11 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";
     ss << "extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ws backdrop preload (gpu.c) */\n";
     ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n";
+    ss << "extern uint32_t gte_precision_mfc2_pc_read(uint32_t pc, uint32_t insn, uint8_t reg, uint32_t packed);  /* reviewed MFC2 snapshot */\n";
+    ss << "extern void gte_precision_store_pc_word(uint32_t pc, uint32_t insn, uint32_t addr, uint32_t packed);  /* reviewed ordinary SW */\n";
+    ss << "extern void gte_precision_scratch_store_pc_word(uint32_t pc, uint32_t insn, uint32_t addr, uint32_t packed);  /* reviewed scratchpad SW */\n";
+    ss << "extern uint32_t gte_precision_copy_pc_read(uint32_t pc, uint32_t insn, uint8_t gpr, uint32_t addr, uint32_t packed);  /* reviewed packet-copy LW */\n";
+    ss << "extern void gte_precision_copy_pc_word(uint32_t pc, uint32_t insn, uint8_t gpr, uint32_t addr, uint32_t packed);  /* reviewed packet-copy SW */\n";
     ss << "extern uint32_t g_debug_last_store_pc;  /* exact PC of the executing SW/SH/SB — wtrace/readtrace producer attribution (debug_server.c) */\n\n";
 }
 

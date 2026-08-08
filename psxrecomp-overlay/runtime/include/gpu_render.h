@@ -49,8 +49,16 @@ void gr_set_precise_triangle(int enabled,
                              int32_t x0, int32_t y0,
                              int32_t x1, int32_t y1,
                              int32_t x2, int32_t y2);
+/* One-shot reciprocal-depth metadata for the next textured triangle.  Only a
+ * backend with a separate presentation surface should implement this; the
+ * authoritative PS1 framebuffer must retain affine texture interpolation. */
+void gr_set_perspective_triangle(int enabled,
+                                 float q0, float q1, float q2);
+/* center_y is relative to the active drawing band; a backend which stores
+ * absolute VRAM positions must combine it with its current draw offset. */
 void gr_set_presentation_yaw(double yaw_units, double full_turn,
-                             double center_x, double focal_x);
+                             double center_x, double center_y,
+                             double focal_x);
 
 /* Primitives */
 void gr_fill_rect(int x, int y, int w, int h, uint16_t color);
@@ -138,8 +146,11 @@ typedef struct GpuRenderBackend {
                                  int32_t x0, int32_t y0,
                                  int32_t x1, int32_t y1,
                                  int32_t x2, int32_t y2);
+    void (*set_perspective_triangle)(int enabled,
+                                     float q0, float q1, float q2);
     void (*set_presentation_yaw)(double yaw_units, double full_turn,
-                                 double center_x, double focal_x);
+                                 double center_x, double center_y,
+                                 double focal_x);
     void (*fill_rect)(int x, int y, int w, int h, uint16_t color);
     void (*copy_rect)(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
     void (*draw_flat_triangle)(int x0, int y0, int x1, int y1, int x2, int y2,

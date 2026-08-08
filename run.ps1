@@ -1,7 +1,9 @@
 param(
     [switch]$MouseAim,
     [switch]$ModernControls,
-    [switch]$Widescreen
+    [switch]$Widescreen,
+    [switch]$GeometryCorrection,
+    [switch]$PerspectiveTextures
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +23,10 @@ if (!(Test-Path $Disc)) {
 
 $env:PSX_DISRUPTOR_CONTROL_PROBE = '0'
 $env:PSX_DISRUPTOR_MODERN_CONTROLS = if ($ModernControls) { '1' } else { '0' }
+$env:PSX_TEXTURE_CORRECTION = if ($PerspectiveTextures) { '1' } else { '0' }
+if ($GeometryCorrection -or $PerspectiveTextures) {
+    $env:PSX_GEOMETRY_CORRECTION = '1'
+}
 if ($MouseAim -or $ModernControls) {
     if (!(Test-Path (Join-Path $Root 'mouse-aim.ini'))) {
         throw 'mouse-aim.ini is missing.'
@@ -48,6 +54,12 @@ if ($Widescreen) {
 }
 if ($ModernControls) {
     Write-Host 'Modern controls enabled: WASD, LMB fire, RMB psionic, Space jump, E use.'
+}
+if ($GeometryCorrection -or $PerspectiveTextures) {
+    Write-Host 'Exact-provenance presentation geometry enabled.'
+}
+if ($PerspectiveTextures) {
+    Write-Host 'Perspective textures enabled for exact world polygons; canonical VRAM and UI remain affine.'
 }
 
 Push-Location $Root

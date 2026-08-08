@@ -1,5 +1,6 @@
 #include "gte.h"
 #include "cpu_state.h"
+#include "gte_precision.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
@@ -214,15 +215,18 @@ static inline uint32_t geom_test_hash(uint32_t packed) {
 }
 #endif
 
-/* Exact GTE projection provenance for perspective texture correction. The
- * recompiler/interpreters call gte_precision_store after SWC2 writes an SXY
- * register into guest RAM. GPU DMA later supplies that exact RAM address, so
- * depth lookup follows the packet rather than guessing from rounded X/Y. */
+/* Exact GTE projection provenance for perspective texture correction. SWC2
+ * stores are observed directly; reviewed game-specific MFC2 + ordinary-SW
+ * routes use the same committed-word gate. GPU DMA later supplies that exact
+ * RAM address, so depth lookup follows the packet rather than guessing from
+ * rounded X/Y. */
 struct PreciseProjection {
     uint32_t packed;
     int32_t x16, y16;
     uint16_t z;
     uint8_t valid;
+    uint8_t saturated;
+    uint8_t perspective_valid;
 };
 static PreciseProjection s_precise_sxy[4] = {};
 
@@ -235,9 +239,70 @@ struct PrecisionStoreEntry {
 static PrecisionStoreEntry s_precision_store[PRECISION_STORE_SIZE];
 static uint32_t s_precision_generation = 1;
 static int s_precision_tracking = 0;
+static GtePrecisionDiagnostics s_precision_diagnostics = {};
+struct PrecisionWordCommitToken {
+    uint32_t physical;
+    uint8_t domain;
+    uint8_t pending;
+};
+static PrecisionWordCommitToken s_precision_word_commit = {};
+enum PrecisionWordDomain : uint8_t {
+    PRECISION_WORD_DOMAIN_NONE = 0,
+    PRECISION_WORD_DOMAIN_MAIN_RAM = 1,
+    PRECISION_WORD_DOMAIN_SCRATCHPAD = 2,
+};
+#define PRECISION_STORE_PC_ROUTE_MAX 32u
+struct PrecisionStorePcRoute {
+    uint32_t physical_pc;
+    uint32_t instruction;
+    uint8_t gte_reg;
+};
+static PrecisionStorePcRoute
+    s_precision_store_pc_routes[PRECISION_STORE_PC_ROUTE_MAX] = {};
+static uint32_t s_precision_store_pc_route_count = 0;
+#define PRECISION_SCRATCH_STORE_PC_ROUTE_MAX 8u
+struct PrecisionScratchStorePcRoute {
+    uint32_t physical_pc;
+    uint32_t instruction;
+    uint32_t scratch_first;
+    uint32_t scratch_stride;
+    uint32_t scratch_count;
+    uint8_t gte_reg;
+};
+static PrecisionScratchStorePcRoute
+    s_precision_scratch_store_pc_routes[
+        PRECISION_SCRATCH_STORE_PC_ROUTE_MAX] = {};
+static uint32_t s_precision_scratch_store_pc_route_count = 0;
+#define PRECISION_MFC2_PC_ROUTE_MAX 8u
+struct PrecisionMfc2PcRoute {
+    uint32_t physical_pc;
+    uint32_t instruction;
+    uint8_t gte_reg;
+};
+static PrecisionMfc2PcRoute
+    s_precision_mfc2_pc_routes[PRECISION_MFC2_PC_ROUTE_MAX] = {};
+static uint32_t s_precision_mfc2_pc_route_count = 0;
+static PreciseProjection s_precision_mfc2_capture[4] = {};
+#define PRECISION_COPY_PC_ROUTE_MAX 32u
+struct PrecisionCopyPcRoute {
+    uint32_t load_physical_pc;
+    uint32_t load_instruction;
+    uint32_t store_physical_pc;
+    uint32_t store_instruction;
+    uint8_t gpr;
+    PreciseProjection capture;
+};
+static PrecisionCopyPcRoute
+    s_precision_copy_pc_routes[PRECISION_COPY_PC_ROUTE_MAX] = {};
+static uint32_t s_precision_copy_pc_route_count = 0;
 static PreciseProjection s_speculative_saved_sxy[4];
 static uint32_t s_speculative_depth = 0;
 static int s_speculative_timeline_invalidated = 0;
+
+static void precision_copy_captures_clear(void) {
+    for (uint32_t i = 0; i < s_precision_copy_pc_route_count; ++i)
+        s_precision_copy_pc_routes[i].capture.valid = 0;
+}
 
 static void gte_precision_generation_advance(void) {
     if (++s_precision_generation == 0) {
@@ -257,6 +322,11 @@ static void gte_geom_generation_advance(void) {
 
 extern "C" void gte_precision_timeline_invalidate(void) {
     for (int i = 0; i < 4; ++i) s_precise_sxy[i].valid = 0;
+    std::memset(s_precision_mfc2_capture, 0,
+                sizeof(s_precision_mfc2_capture));
+    precision_copy_captures_clear();
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+    s_precision_word_commit.pending = 0;
     /* Raw machine-state restore is authoritative even if host polling reached
      * it during a speculative validation pass. Defer the generation advance
      * until the outer transaction ends so old provenance cannot be restored. */
@@ -269,6 +339,8 @@ extern "C" void gte_precision_timeline_invalidate(void) {
 }
 
 extern "C" void gte_precision_speculative_begin(void) {
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+    s_precision_word_commit.pending = 0;
     if (s_speculative_depth++ == 0) {
         std::memcpy(s_speculative_saved_sxy, s_precise_sxy,
                     sizeof(s_precise_sxy));
@@ -287,6 +359,8 @@ extern "C" void gte_precision_speculative_end(void) {
             std::memcpy(s_precise_sxy, s_speculative_saved_sxy,
                         sizeof(s_precise_sxy));
         }
+        s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+        s_precision_word_commit.pending = 0;
     }
 }
 
@@ -297,54 +371,587 @@ static inline uint32_t precision_hash(uint32_t addr) {
 }
 
 static inline int precision_ram_address(uint32_t addr, uint32_t *physical) {
+    /* Match memory.c: KSEG2/KSEG3 are not translated through the ordinary
+     * 0x1fffffff mask. Apart from cache control, those accesses are unmapped
+     * and must never alias a low-RAM provenance entry. */
+    if (addr >= 0xC0000000u) return 0;
     uint32_t mapped = addr & 0x1FFFFFFFu;
     if (mapped >= 0x00800000u) return 0;
     *physical = mapped & 0x1FFFFCu;
     return 1;
 }
 
-extern "C" void gte_precision_tracking_set(int enabled) {
-    s_precision_tracking = enabled ? 1 : 0;
-    gte_precision_generation_advance();
+static inline int precision_scratch_address(uint32_t addr,
+                                             uint32_t *physical) {
+    /* Use the same KUSEG/KSEG0/KSEG1 translation as memory.c, while keeping
+     * KSEG2/KSEG3 from aliasing a reviewed scratchpad slot. */
+    if (addr >= 0xC0000000u) return 0;
+    const uint32_t mapped = addr & 0x1FFFFFFFu;
+    if (mapped < 0x1F800000u || mapped > 0x1F8003FFu) return 0;
+    *physical = mapped & ~3u;
+    return 1;
 }
 
-extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
-    if (s_speculative_depth != 0 || s_gte_replay_sandbox || !s_precision_tracking ||
-        reg < 12 || reg > 15) return;
-    int index = reg == 15 ? 2 : (int)reg - 12;
-    const PreciseProjection &projection = s_precise_sxy[index];
-    if (!projection.valid) return;
-    uint32_t physical;
-    if (!precision_ram_address(addr, &physical)) return;
+static inline int precision_copy_source_address(uint32_t addr,
+                                                 uint32_t *physical) {
+    return precision_ram_address(addr, physical) ||
+           precision_scratch_address(addr, physical);
+}
+
+static inline int precision_projection_index(uint8_t reg) {
+    if (reg < 12 || reg > 15) return -1;
+    return reg == 15 ? 2 : (int)reg - 12;
+}
+
+static void precision_store_projection(
+        uint32_t physical, const PreciseProjection &projection) {
     PrecisionStoreEntry &entry = s_precision_store[precision_hash(physical)];
+    if (entry.generation != 0 && entry.addr != physical) {
+        ++s_precision_diagnostics.store_collisions;
+        if (entry.generation == s_precision_generation)
+            ++s_precision_diagnostics.store_evictions;
+    }
     entry.addr = physical;
     entry.projection = projection;
     entry.generation = s_precision_generation;
 }
 
+static const PrecisionStorePcRoute *precision_store_pc_route(
+        uint32_t store_pc, uint32_t instruction) {
+    const uint32_t physical_pc = store_pc & 0x1FFFFFFFu;
+    for (uint32_t i = 0; i < s_precision_store_pc_route_count; ++i) {
+        if (s_precision_store_pc_routes[i].physical_pc == physical_pc &&
+            s_precision_store_pc_routes[i].instruction == instruction)
+            return &s_precision_store_pc_routes[i];
+    }
+    return nullptr;
+}
+
+static const PrecisionScratchStorePcRoute *precision_scratch_store_pc_route(
+        uint32_t store_pc, uint32_t instruction) {
+    const uint32_t physical_pc = store_pc & 0x1FFFFFFFu;
+    for (uint32_t i = 0;
+         i < s_precision_scratch_store_pc_route_count; ++i) {
+        const PrecisionScratchStorePcRoute &route =
+            s_precision_scratch_store_pc_routes[i];
+        if (route.physical_pc == physical_pc &&
+            route.instruction == instruction)
+            return &route;
+    }
+    return nullptr;
+}
+
+static inline int precision_scratch_route_contains(
+        const PrecisionScratchStorePcRoute &route, uint32_t physical) {
+    if (physical < route.scratch_first) return 0;
+    const uint32_t delta = physical - route.scratch_first;
+    if ((delta % route.scratch_stride) != 0u) return 0;
+    return (delta / route.scratch_stride) < route.scratch_count;
+}
+
+static const PrecisionMfc2PcRoute *precision_mfc2_pc_route(
+        uint32_t mfc2_pc, uint32_t instruction) {
+    const uint32_t physical_pc = mfc2_pc & 0x1FFFFFFFu;
+    for (uint32_t i = 0; i < s_precision_mfc2_pc_route_count; ++i) {
+        if (s_precision_mfc2_pc_routes[i].physical_pc == physical_pc &&
+            s_precision_mfc2_pc_routes[i].instruction == instruction)
+            return &s_precision_mfc2_pc_routes[i];
+    }
+    return nullptr;
+}
+
+static PrecisionCopyPcRoute *precision_copy_load_pc_route(
+        uint32_t load_pc, uint32_t instruction, uint8_t gpr) {
+    const uint32_t physical_pc = load_pc & 0x1FFFFFFFu;
+    for (uint32_t i = 0; i < s_precision_copy_pc_route_count; ++i) {
+        PrecisionCopyPcRoute &route = s_precision_copy_pc_routes[i];
+        if (route.load_physical_pc == physical_pc &&
+            route.load_instruction == instruction && route.gpr == gpr)
+            return &route;
+    }
+    return nullptr;
+}
+
+static PrecisionCopyPcRoute *precision_copy_store_pc_route(
+        uint32_t store_pc, uint32_t instruction, uint8_t gpr) {
+    const uint32_t physical_pc = store_pc & 0x1FFFFFFFu;
+    for (uint32_t i = 0; i < s_precision_copy_pc_route_count; ++i) {
+        PrecisionCopyPcRoute &route = s_precision_copy_pc_routes[i];
+        if (route.store_physical_pc == physical_pc &&
+            route.store_instruction == instruction && route.gpr == gpr)
+            return &route;
+    }
+    return nullptr;
+}
+
+extern "C" void gte_precision_word_write_begin(void) {
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+    s_precision_word_commit.pending = 0;
+}
+
+extern "C" void gte_precision_main_ram_word_committed(uint32_t physical) {
+    /* memory.c passes its already-folded main-RAM address only after all four
+     * bytes have been written.  Do not turn an unaligned host write into an
+     * adjacent aligned provenance token. */
+    if (physical >= 0x00200000u || (physical & 3u) != 0u) {
+        s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+        s_precision_word_commit.pending = 0;
+        return;
+    }
+    s_precision_word_commit.physical = physical;
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_MAIN_RAM;
+    s_precision_word_commit.pending = 1;
+}
+
+extern "C" void gte_precision_scratch_word_committed(uint32_t physical) {
+    /* memory.c supplies an already-translated physical address after all four
+     * scratchpad bytes commit.  Slot eligibility is checked independently by
+     * the reviewed post-write route. */
+    if (physical < 0x1F800000u || physical > 0x1F8003FCu ||
+        (physical & 3u) != 0u) {
+        s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+        s_precision_word_commit.pending = 0;
+        return;
+    }
+    s_precision_word_commit.physical = physical;
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_SCRATCHPAD;
+    s_precision_word_commit.pending = 1;
+}
+
+extern "C" void gte_precision_tracking_set(int enabled) {
+    s_precision_tracking = enabled ? 1 : 0;
+    std::memset(s_precision_mfc2_capture, 0,
+                sizeof(s_precision_mfc2_capture));
+    precision_copy_captures_clear();
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+    s_precision_word_commit.pending = 0;
+    gte_precision_generation_advance();
+}
+
+extern "C" void gte_precision_store_pc_routes_reset(void) {
+    s_precision_store_pc_route_count = 0;
+    s_precision_scratch_store_pc_route_count = 0;
+    s_precision_mfc2_pc_route_count = 0;
+    s_precision_copy_pc_route_count = 0;
+    std::memset(s_precision_store_pc_routes, 0,
+                sizeof(s_precision_store_pc_routes));
+    std::memset(s_precision_scratch_store_pc_routes, 0,
+                sizeof(s_precision_scratch_store_pc_routes));
+    std::memset(s_precision_mfc2_pc_routes, 0,
+                sizeof(s_precision_mfc2_pc_routes));
+    std::memset(s_precision_copy_pc_routes, 0,
+                sizeof(s_precision_copy_pc_routes));
+    std::memset(s_precision_mfc2_capture, 0,
+                sizeof(s_precision_mfc2_capture));
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+    s_precision_word_commit.pending = 0;
+}
+
+extern "C" int gte_precision_mfc2_pc_route_add(
+        uint32_t mfc2_pc, uint32_t instruction, uint8_t gte_reg) {
+    if ((mfc2_pc & 3u) != 0u || precision_projection_index(gte_reg) < 0 ||
+        ((instruction >> 26) & 0x3Fu) != 0x12u ||
+        ((instruction >> 21) & 0x1Fu) != 0u ||
+        ((instruction >> 11) & 0x1Fu) != gte_reg)
+        return 0;
+    const uint32_t physical_pc = mfc2_pc & 0x1FFFFFFFu;
+    for (uint32_t i = 0; i < s_precision_mfc2_pc_route_count; ++i) {
+        PrecisionMfc2PcRoute &route = s_precision_mfc2_pc_routes[i];
+        if (route.physical_pc != physical_pc) continue;
+        return route.instruction == instruction && route.gte_reg == gte_reg;
+    }
+    if (s_precision_mfc2_pc_route_count >= PRECISION_MFC2_PC_ROUTE_MAX)
+        return 0;
+    PrecisionMfc2PcRoute &route =
+        s_precision_mfc2_pc_routes[s_precision_mfc2_pc_route_count++];
+    route.physical_pc = physical_pc;
+    route.instruction = instruction;
+    route.gte_reg = gte_reg;
+    return 1;
+}
+
+extern "C" int gte_precision_store_pc_route_add(
+        uint32_t store_pc, uint32_t instruction, uint8_t gte_reg) {
+    if ((store_pc & 3u) != 0u || precision_projection_index(gte_reg) < 0 ||
+        ((instruction >> 26) & 0x3Fu) != 0x2Bu)
+        return 0;
+    const uint32_t physical_pc = store_pc & 0x1FFFFFFFu;
+    for (uint32_t i = 0; i < s_precision_store_pc_route_count; ++i) {
+        PrecisionStorePcRoute &route = s_precision_store_pc_routes[i];
+        if (route.physical_pc != physical_pc) continue;
+        return route.instruction == instruction && route.gte_reg == gte_reg;
+    }
+    if (s_precision_store_pc_route_count >= PRECISION_STORE_PC_ROUTE_MAX)
+        return 0;
+    PrecisionStorePcRoute &route =
+        s_precision_store_pc_routes[s_precision_store_pc_route_count++];
+    route.physical_pc = physical_pc;
+    route.instruction = instruction;
+    route.gte_reg = gte_reg;
+    return 1;
+}
+
+extern "C" int gte_precision_scratch_store_pc_route_add(
+        uint32_t store_pc, uint32_t instruction, uint8_t gte_reg,
+        uint32_t scratch_first, uint32_t scratch_stride,
+        uint32_t scratch_count) {
+    if ((store_pc & 3u) != 0u || precision_projection_index(gte_reg) < 0 ||
+        ((instruction >> 26) & 0x3Fu) != 0x2Bu ||
+        scratch_count == 0u || scratch_stride == 0u ||
+        (scratch_first & 3u) != 0u || (scratch_stride & 3u) != 0u ||
+        scratch_first < 0x1F800000u || scratch_first > 0x1F8003FCu)
+        return 0;
+
+    /* Prove the final registered slot without overflow, and keep every slot
+     * wholly within the physical 1 KiB scratchpad. */
+    const uint64_t scratch_last =
+        (uint64_t)scratch_first +
+        (uint64_t)scratch_stride * (uint64_t)(scratch_count - 1u);
+    if (scratch_last > 0x1F8003FCull) return 0;
+
+    const uint32_t physical_pc = store_pc & 0x1FFFFFFFu;
+    for (uint32_t i = 0;
+         i < s_precision_scratch_store_pc_route_count; ++i) {
+        PrecisionScratchStorePcRoute &route =
+            s_precision_scratch_store_pc_routes[i];
+        if (route.physical_pc != physical_pc) continue;
+        return route.instruction == instruction &&
+               route.gte_reg == gte_reg &&
+               route.scratch_first == scratch_first &&
+               route.scratch_stride == scratch_stride &&
+               route.scratch_count == scratch_count;
+    }
+    if (s_precision_scratch_store_pc_route_count >=
+        PRECISION_SCRATCH_STORE_PC_ROUTE_MAX)
+        return 0;
+    PrecisionScratchStorePcRoute &route =
+        s_precision_scratch_store_pc_routes[
+            s_precision_scratch_store_pc_route_count++];
+    route.physical_pc = physical_pc;
+    route.instruction = instruction;
+    route.scratch_first = scratch_first;
+    route.scratch_stride = scratch_stride;
+    route.scratch_count = scratch_count;
+    route.gte_reg = gte_reg;
+    return 1;
+}
+
+extern "C" int gte_precision_copy_pc_route_add(
+        uint32_t load_pc, uint32_t load_instruction,
+        uint32_t store_pc, uint32_t store_instruction, uint8_t gpr) {
+    if ((load_pc & 3u) != 0u || (store_pc & 3u) != 0u || gpr == 0u ||
+        gpr >= 32u || ((load_instruction >> 26) & 0x3Fu) != 0x23u ||
+        ((store_instruction >> 26) & 0x3Fu) != 0x2Bu ||
+        ((load_instruction >> 16) & 0x1Fu) != gpr ||
+        ((store_instruction >> 16) & 0x1Fu) != gpr)
+        return 0;
+    const uint32_t load_physical_pc = load_pc & 0x1FFFFFFFu;
+    const uint32_t store_physical_pc = store_pc & 0x1FFFFFFFu;
+    for (uint32_t i = 0; i < s_precision_copy_pc_route_count; ++i) {
+        PrecisionCopyPcRoute &route = s_precision_copy_pc_routes[i];
+        if (route.load_physical_pc != load_physical_pc &&
+            route.store_physical_pc != store_physical_pc)
+            continue;
+        return route.load_physical_pc == load_physical_pc &&
+               route.load_instruction == load_instruction &&
+               route.store_physical_pc == store_physical_pc &&
+               route.store_instruction == store_instruction &&
+               route.gpr == gpr;
+    }
+    if (s_precision_copy_pc_route_count >= PRECISION_COPY_PC_ROUTE_MAX)
+        return 0;
+    PrecisionCopyPcRoute &route =
+        s_precision_copy_pc_routes[s_precision_copy_pc_route_count++];
+    route.load_physical_pc = load_physical_pc;
+    route.load_instruction = load_instruction;
+    route.store_physical_pc = store_physical_pc;
+    route.store_instruction = store_instruction;
+    route.gpr = gpr;
+    route.capture.valid = 0;
+    return 1;
+}
+
+extern "C" uint32_t gte_precision_mfc2_pc_read(
+        uint32_t mfc2_pc, uint32_t instruction, uint8_t gte_reg,
+        uint32_t packed) {
+    const PrecisionMfc2PcRoute *route =
+        precision_mfc2_pc_route(mfc2_pc, instruction);
+    if (!route || route->gte_reg != gte_reg)
+        return packed;
+    if (s_speculative_depth != 0 || s_gte_replay_sandbox ||
+        !s_precision_tracking)
+        return packed;
+
+    const int index = precision_projection_index(gte_reg);
+    if (index < 0) return packed;
+    PreciseProjection &capture = s_precision_mfc2_capture[index];
+    capture.valid = 0;
+    const PreciseProjection &projection = s_precise_sxy[index];
+    if (projection.valid && projection.packed == packed)
+        capture = projection;
+    return packed;
+}
+
+extern "C" uint32_t gte_precision_copy_pc_read(
+        uint32_t load_pc, uint32_t instruction, uint8_t gpr,
+        uint32_t addr, uint32_t packed) {
+    PrecisionCopyPcRoute *route =
+        precision_copy_load_pc_route(load_pc, instruction, gpr);
+    if (!route) return packed;
+    if (s_speculative_depth != 0 || s_gte_replay_sandbox ||
+        !s_precision_tracking)
+        return packed;
+    ++s_precision_diagnostics.copy_load_attempts;
+
+    /* Every authoritative execution replaces the prior capture, including a
+     * source miss. An older equal packed value must never survive this load. */
+    route->capture.valid = 0;
+    if ((addr & 3u) != 0u) return packed;
+    uint32_t physical;
+    if (!precision_copy_source_address(addr, &physical)) return packed;
+    const PrecisionStoreEntry &entry =
+        s_precision_store[precision_hash(physical)];
+    if (entry.generation != s_precision_generation || entry.addr != physical ||
+        !entry.projection.valid || entry.projection.packed != packed)
+        return packed;
+    route->capture = entry.projection;
+    ++s_precision_diagnostics.copy_load_accepts;
+    return packed;
+}
+
+extern "C" void gte_precision_store_word(uint32_t addr, uint8_t reg) {
+    /* Consume before every early return.  Speculative validation, disabled
+     * tracking and ineligible GTE registers must not leave a real or replayed
+     * write token available to a later SWC2 callback. */
+    const uint32_t committed_physical = s_precision_word_commit.physical;
+    const uint8_t committed_domain = s_precision_word_commit.domain;
+    const int committed = s_precision_word_commit.pending != 0;
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+    s_precision_word_commit.pending = 0;
+    if (s_speculative_depth != 0 || s_gte_replay_sandbox || !s_precision_tracking ||
+        reg < 12 || reg > 15 || (addr & 3u) != 0u) return;
+    uint32_t physical;
+    if (!precision_ram_address(addr, &physical)) return;
+    int commit_matches = committed &&
+        committed_domain == PRECISION_WORD_DOMAIN_MAIN_RAM &&
+        committed_physical == physical;
+#ifdef PSX_GTE_REGISTER_TEST
+    /* The pinned standalone register fixture links gte.cpp without memory.c
+     * and directly seeds then stores precision entries.  Preserve that
+     * historical test seam only when no producer token exists; an explicitly
+     * armed mismatched token still exercises the production rejection. */
+    if (!committed) commit_matches = 1;
+#endif
+    if (!commit_matches) {
+        ++s_precision_diagnostics.store_uncommitted_rejections;
+        return;
+    }
+    int index = precision_projection_index(reg);
+    const PreciseProjection &projection = s_precise_sxy[index];
+    if (!projection.valid) return;
+    precision_store_projection(physical, projection);
+}
+
+extern "C" void gte_precision_store_pc_word(
+        uint32_t store_pc, uint32_t instruction, uint32_t addr,
+        uint32_t packed) {
+    /* Most ordinary SWs are not reviewed projection stores and must leave the
+     * token available for an immediately-following SWC2 callback. */
+    const PrecisionStorePcRoute *route =
+        precision_store_pc_route(store_pc, instruction);
+    if (!route) return;
+
+    const uint32_t committed_physical = s_precision_word_commit.physical;
+    const uint8_t committed_domain = s_precision_word_commit.domain;
+    const int committed = s_precision_word_commit.pending != 0;
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+    s_precision_word_commit.pending = 0;
+
+    if (s_speculative_depth != 0 || s_gte_replay_sandbox ||
+        !s_precision_tracking || (addr & 3u) != 0u)
+        return;
+    ++s_precision_diagnostics.registered_store_attempts;
+    uint32_t physical;
+    if (!precision_ram_address(addr, &physical)) return;
+    if (!committed || committed_domain != PRECISION_WORD_DOMAIN_MAIN_RAM ||
+        committed_physical != physical) {
+        ++s_precision_diagnostics.store_uncommitted_rejections;
+        return;
+    }
+
+    const int index = precision_projection_index(route->gte_reg);
+    if (index < 0) return;
+    const PreciseProjection &projection = s_precision_mfc2_capture[index];
+    if (!projection.valid) return;
+    if (projection.packed != packed) {
+        ++s_precision_diagnostics.registered_store_packed_rejections;
+        return;
+    }
+    precision_store_projection(physical, projection);
+    ++s_precision_diagnostics.registered_store_accepts;
+}
+
+extern "C" void gte_precision_scratch_store_pc_word(
+        uint32_t store_pc, uint32_t instruction,
+        uint32_t addr, uint32_t packed) {
+    /* An unrelated SW callback must not steal the token from the matching
+     * reviewed helper that immediately follows it. */
+    const PrecisionScratchStorePcRoute *route =
+        precision_scratch_store_pc_route(store_pc, instruction);
+    if (!route) return;
+
+    const uint32_t committed_physical = s_precision_word_commit.physical;
+    const uint8_t committed_domain = s_precision_word_commit.domain;
+    const int committed = s_precision_word_commit.pending != 0;
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+    s_precision_word_commit.pending = 0;
+
+    if (s_speculative_depth != 0 || s_gte_replay_sandbox ||
+        !s_precision_tracking || (addr & 3u) != 0u)
+        return;
+    ++s_precision_diagnostics.registered_store_attempts;
+
+    uint32_t physical;
+    if (!precision_scratch_address(addr, &physical) ||
+        !precision_scratch_route_contains(*route, physical))
+        return;
+    if (!committed ||
+        committed_domain != PRECISION_WORD_DOMAIN_SCRATCHPAD ||
+        committed_physical != physical) {
+        ++s_precision_diagnostics.store_uncommitted_rejections;
+        return;
+    }
+
+    const int index = precision_projection_index(route->gte_reg);
+    if (index < 0) return;
+    const PreciseProjection &projection = s_precision_mfc2_capture[index];
+    if (!projection.valid) return;
+    if (projection.packed != packed) {
+        ++s_precision_diagnostics.registered_store_packed_rejections;
+        return;
+    }
+    precision_store_projection(physical, projection);
+    ++s_precision_diagnostics.registered_store_accepts;
+}
+
+extern "C" void gte_precision_copy_pc_word(
+        uint32_t store_pc, uint32_t instruction, uint8_t gpr,
+        uint32_t addr, uint32_t packed) {
+    PrecisionCopyPcRoute *route =
+        precision_copy_store_pc_route(store_pc, instruction, gpr);
+    if (!route) return;
+
+    const uint32_t committed_physical = s_precision_word_commit.physical;
+    const uint8_t committed_domain = s_precision_word_commit.domain;
+    const int committed = s_precision_word_commit.pending != 0;
+    s_precision_word_commit.domain = PRECISION_WORD_DOMAIN_NONE;
+    s_precision_word_commit.pending = 0;
+
+    /* Replay/speculative execution may consume only its transient memory token;
+     * it must neither replace nor erase an authoritative load capture. */
+    if (s_speculative_depth != 0 || s_gte_replay_sandbox ||
+        !s_precision_tracking)
+        return;
+    ++s_precision_diagnostics.copy_store_attempts;
+
+    const PreciseProjection projection = route->capture;
+    route->capture.valid = 0;
+    if ((addr & 3u) != 0u) return;
+    uint32_t physical;
+    if (!precision_ram_address(addr, &physical)) return;
+    if (!committed || committed_domain != PRECISION_WORD_DOMAIN_MAIN_RAM ||
+        committed_physical != physical) {
+        ++s_precision_diagnostics.store_uncommitted_rejections;
+        return;
+    }
+    if (!projection.valid) return;
+    if (projection.packed != packed) {
+        ++s_precision_diagnostics.copy_store_packed_rejections;
+        return;
+    }
+    precision_store_projection(physical, projection);
+    ++s_precision_diagnostics.copy_store_accepts;
+}
+
 extern "C" void gte_precision_invalidate_word(uint32_t addr) {
     if (s_speculative_depth != 0 || s_gte_replay_sandbox || !s_precision_tracking) return;
     uint32_t physical;
-    if (!precision_ram_address(addr, &physical)) return;
+    if (!precision_copy_source_address(addr, &physical)) return;
     PrecisionStoreEntry &entry = s_precision_store[precision_hash(physical)];
     if (entry.generation == s_precision_generation && entry.addr == physical)
         entry.generation = 0;
 }
 
+static GtePrecisionLookupResult precision_lookup_projection(
+        uint32_t addr, uint32_t packed,
+        const PreciseProjection **projection) {
+    if (projection) *projection = nullptr;
+    if (s_speculative_depth != 0)
+        return GTE_PRECISION_LOOKUP_SPECULATIVE;
+    if (!s_precision_tracking)
+        return GTE_PRECISION_LOOKUP_TRACKING_DISABLED;
+    if ((addr & 3u) != 0u)
+        return GTE_PRECISION_LOOKUP_SOURCE_UNALIGNED;
+    uint32_t physical;
+    if (!precision_ram_address(addr, &physical))
+        return GTE_PRECISION_LOOKUP_SOURCE_NOT_RAM;
+    const PrecisionStoreEntry &entry = s_precision_store[precision_hash(physical)];
+    if (entry.generation != s_precision_generation)
+        return GTE_PRECISION_LOOKUP_STORE_MISS;
+    if (entry.addr != physical) {
+        ++s_precision_diagnostics.lookup_collisions;
+        return GTE_PRECISION_LOOKUP_STORE_COLLISION;
+    }
+    if (!entry.projection.valid)
+        return GTE_PRECISION_LOOKUP_PROJECTION_INVALID;
+    if (entry.projection.packed != packed)
+        return GTE_PRECISION_LOOKUP_PACKED_MISMATCH;
+    if (entry.projection.z == 0)
+        return GTE_PRECISION_LOOKUP_ZERO_DEPTH;
+    if (entry.projection.saturated)
+        return GTE_PRECISION_LOOKUP_SATURATED;
+    if (projection) *projection = &entry.projection;
+    return GTE_PRECISION_LOOKUP_ACCEPTED;
+}
+
+extern "C" GtePrecisionLookupResult gte_precision_load_word_ex(
+        uint32_t addr, uint32_t packed,
+        int32_t *x16, int32_t *y16, uint16_t *z) {
+    const PreciseProjection *projection = nullptr;
+    const GtePrecisionLookupResult result =
+        precision_lookup_projection(addr, packed, &projection);
+    if (result != GTE_PRECISION_LOOKUP_ACCEPTED) return result;
+    if (x16) *x16 = projection->x16;
+    if (y16) *y16 = projection->y16;
+    if (z) *z = projection->z;
+    return GTE_PRECISION_LOOKUP_ACCEPTED;
+}
+
+extern "C" GtePrecisionLookupResult gte_precision_load_perspective_word_ex(
+        uint32_t addr, uint32_t packed, uint16_t *z) {
+    const PreciseProjection *projection = nullptr;
+    const GtePrecisionLookupResult result =
+        precision_lookup_projection(addr, packed, &projection);
+    if (result != GTE_PRECISION_LOOKUP_ACCEPTED) return result;
+    if (!projection->perspective_valid)
+        return GTE_PRECISION_LOOKUP_PERSPECTIVE_INVALID;
+    if (z) *z = projection->z;
+    return GTE_PRECISION_LOOKUP_ACCEPTED;
+}
+
 extern "C" int gte_precision_load_word(uint32_t addr, uint32_t packed,
                                         int32_t *x16, int32_t *y16,
                                         uint16_t *z) {
-    if (s_speculative_depth != 0 || !s_precision_tracking) return 0;
-    uint32_t physical;
-    if (!precision_ram_address(addr, &physical)) return 0;
-    const PrecisionStoreEntry &entry = s_precision_store[precision_hash(physical)];
-    if (entry.generation != s_precision_generation || entry.addr != physical ||
-        !entry.projection.valid || entry.projection.packed != packed)
-        return 0;
-    if (x16) *x16 = entry.projection.x16;
-    if (y16) *y16 = entry.projection.y16;
-    if (z) *z = entry.projection.z;
-    return entry.projection.z != 0;
+    return gte_precision_load_word_ex(addr, packed, x16, y16, z) ==
+           GTE_PRECISION_LOOKUP_ACCEPTED;
+}
+
+extern "C" void gte_precision_diagnostics(GtePrecisionDiagnostics *out) {
+    if (out) *out = s_precision_diagnostics;
+}
+
+extern "C" void gte_precision_diagnostics_reset(void) {
+    s_precision_diagnostics = {};
 }
 
 extern "C" void gte_geometry_correction_set(int enabled) {
@@ -875,7 +1482,16 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
         s_precise_sxy[2].x16 = (int32_t)sx16;
         s_precise_sxy[2].y16 = (int32_t)sy16;
         s_precise_sxy[2].z = gte->SZ[3];
-        s_precise_sxy[2].valid = gte->SZ[3] != 0;
+        s_precise_sxy[2].valid = 1;
+        s_precise_sxy[2].saturated =
+            static_cast<int16_t>(gte->SXY[2] & 0xFFFF) != sx ||
+            static_cast<int16_t>((uint32_t)gte->SXY[2] >> 16) != sy;
+        /* Perspective textures need the original camera depth, not a value
+         * clamped into SZ3, and must reject the GTE's near divide-overflow
+         * region. Geometry can still use the retained X/Y when this bit is 0. */
+        s_precise_sxy[2].perspective_valid =
+            gte->H != 0 && gte->MAC3 > 0 && gte->MAC3 <= 0xFFFF &&
+            (uint32_t)gte->SZ[3] * 2u > (uint32_t)gte->H;
         s_precise_sxy[3] = s_precise_sxy[2];
     }
     // Step 5: Depth cueing (MAC0/IR0) — only for last vertex of RTPT or RTPS
@@ -1504,6 +2120,7 @@ static uint32_t s_gte_replay_saved_caller_ra = 0;
 extern "C" int gte_replay_side_effects_begin(void) {
     using namespace PSXRecomp::GTE;
     if (s_gte_replay_sandbox) return 0;
+    gte_precision_word_write_begin();
     s_gte_replay_saved_caller_ra = s_gte_caller_ra;
     s_gte_replay_sandbox = 1;
     return 1;
@@ -1513,6 +2130,7 @@ extern "C" void gte_replay_side_effects_end(void) {
     if (!s_gte_replay_sandbox) return;
     s_gte_caller_ra = s_gte_replay_saved_caller_ra;
     s_gte_replay_sandbox = 0;
+    gte_precision_word_write_begin();
 }
 
 static uint32_t gte_cpu_lzcr(uint32_t value);
@@ -2020,6 +2638,14 @@ extern "C" void gte_test_seed_precise_projection(uint32_t index,
     p.y16 = y16;
     p.z = z;
     p.valid = 1;
+    p.saturated = 0;
+    p.perspective_valid = 1;
+}
+
+extern "C" void gte_test_set_precise_perspective_valid(uint32_t index,
+                                                          int valid) {
+    if (index >= 4) return;
+    PSXRecomp::GTE::s_precise_sxy[index].perspective_valid = valid ? 1 : 0;
 }
 
 extern "C" void gte_test_get_precise_projection(uint32_t index,

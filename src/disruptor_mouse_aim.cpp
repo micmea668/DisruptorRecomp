@@ -15,6 +15,7 @@
  */
 
 #include "psx_sdl.h"
+#include "../psxrecomp-overlay/runtime/include/gpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -35,8 +36,6 @@ extern "C" int gpu_ws_present_native_43(void);
 extern "C" int ws_native_wide_active(void);
 extern "C" int ws_nw_extra(void);
 extern "C" void gpu_geometry_camera_yaw_residual_set(double yaw_units);
-extern "C" void gpu_geometry_correction_stats(uint64_t *world_triangles,
-                                                uint64_t *precise_triangles);
 extern "C" SDL_Window *sdl_window;
 
 namespace {
@@ -345,6 +344,110 @@ void apply_mouse_x(double raw_x) {
     g_mouse.interval_yaw_steps += yaw_steps;
 }
 
+void log_u64_array(std::FILE *log, const char *key,
+                   const uint64_t *values, size_t count) {
+    std::fprintf(log, " %s=", key);
+    for (size_t i = 0; i < count; ++i) {
+        std::fprintf(log, "%s%llu", i == 0 ? "" : ",",
+                     static_cast<unsigned long long>(values[i]));
+    }
+}
+
+void log_geometry_diagnostics_scope(
+        const char *scope, uint64_t frame,
+        const GpuGeometryCorrectionStats& snapshot,
+        const GpuGeometryCorrectionCounters& counters) {
+    std::fprintf(
+        g_mouse.log,
+        "geometry_diag version=%u size=%u frame=%llu scope=%s "
+        "presentation=%llu corrected_presentations=%llu "
+        "latest_live_presentation=%llu latest_live_valid=%u "
+        "triangle_candidates=%llu triangle_accepted=%llu "
+        "polygon_candidates=%llu polygon_accepted=%llu "
+        "vertex_candidates=%llu vertex_accepted=%llu "
+        "partial_polygon_rejections=%llu partial_quad_rejections=%llu "
+        "correction_vertices=%llu "
+        "correction_abs_x16_sum=%llu correction_abs_y16_sum=%llu "
+        "correction_magnitude16_sum=%llu correction_magnitude16_max=%llu "
+        "correction_x16_squared_sum=%llu correction_y16_squared_sum=%llu "
+        "correction_accumulators_saturated=%llu "
+        "provenance_store_collisions=%llu provenance_store_evictions=%llu "
+        "provenance_lookup_collisions=%llu "
+        "provenance_store_uncommitted_rejections=%llu "
+        "provenance_registered_store_attempts=%llu "
+        "provenance_registered_store_accepts=%llu "
+        "provenance_registered_store_packed_rejections=%llu "
+        "provenance_copy_load_attempts=%llu "
+        "provenance_copy_load_accepts=%llu "
+        "provenance_copy_store_attempts=%llu "
+        "provenance_copy_store_accepts=%llu "
+        "provenance_copy_store_packed_rejections=%llu",
+        snapshot.version, snapshot.size,
+        static_cast<unsigned long long>(frame), scope,
+        static_cast<unsigned long long>(snapshot.presentation_sequence),
+        static_cast<unsigned long long>(snapshot.corrected_presentations),
+        static_cast<unsigned long long>(snapshot.latest_live_presentation),
+        snapshot.latest_live_valid,
+        static_cast<unsigned long long>(counters.triangle_candidates),
+        static_cast<unsigned long long>(counters.triangle_accepted),
+        static_cast<unsigned long long>(counters.polygon_candidates),
+        static_cast<unsigned long long>(counters.polygon_accepted),
+        static_cast<unsigned long long>(counters.vertex_candidates),
+        static_cast<unsigned long long>(counters.vertex_accepted),
+        static_cast<unsigned long long>(counters.partial_polygon_rejections),
+        static_cast<unsigned long long>(counters.partial_quad_rejections),
+        static_cast<unsigned long long>(counters.correction_vertices),
+        static_cast<unsigned long long>(counters.correction_abs_x16_sum),
+        static_cast<unsigned long long>(counters.correction_abs_y16_sum),
+        static_cast<unsigned long long>(counters.correction_magnitude16_sum),
+        static_cast<unsigned long long>(counters.correction_magnitude16_max),
+        static_cast<unsigned long long>(counters.correction_x16_squared_sum),
+        static_cast<unsigned long long>(counters.correction_y16_squared_sum),
+        static_cast<unsigned long long>(
+            counters.correction_accumulators_saturated),
+        static_cast<unsigned long long>(snapshot.provenance_store_collisions),
+        static_cast<unsigned long long>(snapshot.provenance_store_evictions),
+        static_cast<unsigned long long>(snapshot.provenance_lookup_collisions),
+        static_cast<unsigned long long>(
+            snapshot.provenance_store_uncommitted_rejections),
+        static_cast<unsigned long long>(
+            snapshot.provenance_registered_store_attempts),
+        static_cast<unsigned long long>(
+            snapshot.provenance_registered_store_accepts),
+        static_cast<unsigned long long>(
+            snapshot.provenance_registered_store_packed_rejections),
+        static_cast<unsigned long long>(
+            snapshot.provenance_copy_load_attempts),
+        static_cast<unsigned long long>(
+            snapshot.provenance_copy_load_accepts),
+        static_cast<unsigned long long>(
+            snapshot.provenance_copy_store_attempts),
+        static_cast<unsigned long long>(
+            snapshot.provenance_copy_store_accepts),
+        static_cast<unsigned long long>(
+            snapshot.provenance_copy_store_packed_rejections));
+    log_u64_array(g_mouse.log, "reject", counters.vertex_rejections,
+                  GPU_GEOMETRY_REJECT_REASON_COUNT);
+    log_u64_array(g_mouse.log, "primitive_candidates",
+                  counters.primitive_candidates,
+                  GPU_GEOMETRY_PRIMITIVE_CLASS_COUNT);
+    log_u64_array(g_mouse.log, "primitive_accepted",
+                  counters.primitive_accepted,
+                  GPU_GEOMETRY_PRIMITIVE_CLASS_COUNT);
+    log_u64_array(g_mouse.log, "opcode_candidates",
+                  counters.opcode_candidates, GPU_GEOMETRY_OPCODE_COUNT);
+    log_u64_array(g_mouse.log, "opcode_accepted",
+                  counters.opcode_accepted, GPU_GEOMETRY_OPCODE_COUNT);
+    log_u64_array(g_mouse.log, "depth_vertices", counters.depth_vertices,
+                  GPU_GEOMETRY_DEPTH_BUCKET_COUNT);
+    log_u64_array(g_mouse.log, "screen_vertices", counters.screen_vertices,
+                  GPU_GEOMETRY_SCREEN_BUCKET_COUNT);
+    log_u64_array(g_mouse.log, "correction_buckets",
+                  counters.correction_magnitude_buckets,
+                  GPU_GEOMETRY_CORRECTION_BUCKET_COUNT);
+    std::fputc('\n', g_mouse.log);
+}
+
 void mouse_aim_frame() {
     if (!g_mouse.enabled || !sdl_window) return;
     ++g_mouse.frame;
@@ -395,13 +498,19 @@ void mouse_aim_frame() {
     if (g_mouse.log && g_mouse.frame % 60u == 0u) {
         uint64_t geometry_world = 0;
         uint64_t geometry_precise = 0;
+        const uint32_t texture_perspective = gpu_texture_correction_hits();
+        GpuGeometryCorrectionStats geometry_diagnostics{};
         gpu_geometry_correction_stats(&geometry_world, &geometry_precise);
+        gpu_geometry_correction_stats_detailed(
+            &geometry_diagnostics,
+            static_cast<uint32_t>(sizeof(geometry_diagnostics)));
         std::fprintf(g_mouse.log,
                      "sample frame=%llu captured=%s mouse_x=%.3f yaw_steps=%lld "
                      "yaw=0x%02X yaw_residual=%.6f motion_samples=%llu "
-                     "modern_press_mask=0x%04X geometry_world=%llu "
-                     "geometry_precise=%llu "
-                     "ws_margin=%d ws_native_active=%d ws_pinned_43=%d "
+                      "modern_press_mask=0x%04X geometry_world=%llu "
+                      "geometry_precise=%llu "
+                      "texture_perspective=%u "
+                      "ws_margin=%d ws_native_active=%d ws_pinned_43=%d "
                      "ws_extra=%d\n",
                      static_cast<unsigned long long>(g_mouse.frame),
                      g_mouse.captured ? "true" : "false",
@@ -411,11 +520,18 @@ void mouse_aim_frame() {
                      g_mouse.fractional_yaw,
                      static_cast<unsigned long long>(g_mouse.motion_samples),
                      static_cast<unsigned>(g_mouse.interval_modern_press_mask),
-                     static_cast<unsigned long long>(geometry_world),
-                     static_cast<unsigned long long>(geometry_precise),
+                      static_cast<unsigned long long>(geometry_world),
+                      static_cast<unsigned long long>(geometry_precise),
+                      static_cast<unsigned>(texture_perspective),
                      static_cast<int>(psx_mod_widescreen_x_margin()),
                      ws_native_wide_active(), gpu_ws_present_native_43(),
                      ws_nw_extra());
+        log_geometry_diagnostics_scope(
+            "cumulative", g_mouse.frame, geometry_diagnostics,
+            geometry_diagnostics.cumulative);
+        log_geometry_diagnostics_scope(
+            "latest_live", g_mouse.frame, geometry_diagnostics,
+            geometry_diagnostics.latest_live);
         std::fflush(g_mouse.log);
         g_mouse.interval_mouse_x = 0.0;
         g_mouse.interval_yaw_steps = 0;

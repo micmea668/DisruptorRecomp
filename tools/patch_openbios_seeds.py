@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Apply the project-local OpenBIOS discovery boundary fix.
+"""Apply the project-local OpenBIOS framework fixes.
 
 The pinned PSXRecomp revision's ELF seed list marks osDbgPrintf's entry but
 not the verified first data byte after it. Whole-function discovery can then
 follow an unconditional branch into the adjacent data and omit osDbgPrintf.
-This patch is deliberately small, checked, and idempotent so a fresh framework
-checkout produces the same BIOS translation used by this project.
+
+The same revision also emits a const-qualified object as a file-scope C
+initializer. That is not a C constant expression and MSVC rejects the generated
+OpenBIOS dispatch table. Emit the count as an enum constant instead.
+
+Both patches are deliberately small, checked, and idempotent so a fresh
+framework checkout produces the same BIOS translation used by this project.
 """
 
 from __future__ import annotations
@@ -24,6 +29,16 @@ PATCH_SEED = {
         "fallthrough analysis from entering adjacent data"
     ),
 }
+EMITTER_OLD = (
+    '        out += fmt::format("static const uint32_t '
+    '{}psx_bios_kernel_body_count = {}u;\\n\\n",\n'
+    '                           g_sym_prefix, kb_count);'
+)
+EMITTER_NEW = (
+    '        out += fmt::format("enum {{ '
+    '{}psx_bios_kernel_body_count = {}u }};\\n\\n",\n'
+    '                           g_sym_prefix, kb_count);'
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +51,24 @@ def parse_args() -> argparse.Namespace:
         help="path to the pinned PSXRecomp checkout",
     )
     return parser.parse_args()
+
+
+def prepare_emitter_patch(framework: Path):
+    emitter_path = framework / "recompiler" / "src" / "full_function_emitter.cpp"
+    if not emitter_path.is_file():
+        raise SystemExit(f"OpenBIOS emitter source not found: {emitter_path}")
+
+    source = emitter_path.read_text(encoding="utf-8")
+    old_count = source.count(EMITTER_OLD)
+    new_count = source.count(EMITTER_NEW)
+    if old_count == 0 and new_count == 1:
+        return emitter_path, None
+    if old_count != 1 or new_count != 0:
+        raise SystemExit(
+            "Unexpected OpenBIOS kernel-body count emitter; refusing to patch"
+        )
+
+    return emitter_path, source.replace(EMITTER_OLD, EMITTER_NEW)
 
 
 def main() -> int:
@@ -68,33 +101,47 @@ def main() -> int:
     if matches:
         if len(matches) != 1 or matches[0] != PATCH_SEED:
             raise SystemExit(f"Conflicting OpenBIOS seed already exists at {ADDRESS}")
-        print(f"OpenBIOS boundary seed already present: {ADDRESS}")
-        return 0
+        seed_update = False
+    else:
+        if len(seeds) != 646:
+            raise SystemExit(
+                f"Expected the pinned 646-seed baseline, found {len(seeds)}; "
+                "refusing to guess"
+            )
+        dbg_printf = [
+            seed for seed in seeds
+            if int(seed.get("address", "0"), 16) == 0xBFC091EC
+        ]
+        if len(dbg_printf) != 1 or dbg_printf[0].get("label") != "osDbgPrintf":
+            raise SystemExit("Pinned osDbgPrintf seed was not found at 0xBFC091EC")
 
-    if len(seeds) != 646:
-        raise SystemExit(
-            f"Expected the pinned 646-seed baseline, found {len(seeds)}; refusing to guess"
+        insert_at = next(
+            (index for index, seed in enumerate(seeds)
+             if int(seed["address"], 16) > int(ADDRESS, 16)),
+            len(seeds),
         )
-    dbg_printf = [
-        seed for seed in seeds
-        if int(seed.get("address", "0"), 16) == 0xBFC091EC
-    ]
-    if len(dbg_printf) != 1 or dbg_printf[0].get("label") != "osDbgPrintf":
-        raise SystemExit("Pinned osDbgPrintf seed was not found at 0xBFC091EC")
+        seeds.insert(insert_at, PATCH_SEED)
+        document["seed_count"] = len(seeds)
+        seed_update = True
 
-    insert_at = next(
-        (index for index, seed in enumerate(seeds)
-         if int(seed["address"], 16) > int(ADDRESS, 16)),
-        len(seeds),
-    )
-    seeds.insert(insert_at, PATCH_SEED)
-    document["seed_count"] = len(seeds)
+    # Validate both pinned inputs before writing either one. A layout mismatch
+    # must never leave a fresh checkout with only half of this patch applied.
+    emitter_path, emitter_update = prepare_emitter_patch(args.framework)
 
-    with seed_path.open("w", encoding="utf-8", newline="\n") as stream:
-        json.dump(document, stream, indent=2)
-        stream.write("\n")
+    if seed_update:
+        with seed_path.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(document, stream, indent=2)
+            stream.write("\n")
+        print(f"Applied OpenBIOS boundary seed: {ADDRESS}")
+    else:
+        print(f"OpenBIOS boundary seed already present: {ADDRESS}")
 
-    print(f"Applied OpenBIOS boundary seed: {ADDRESS}")
+    if emitter_update is not None:
+        with emitter_path.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(emitter_update)
+        print("Applied OpenBIOS constant-expression emitter fix")
+    else:
+        print("OpenBIOS constant-expression emitter fix already present")
     return 0
 
 

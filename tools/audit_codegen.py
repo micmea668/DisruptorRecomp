@@ -63,6 +63,78 @@ HORIZONTAL_SIDE_PLANE_SITES = {
     "0x8003BD0C": "0x0062102A",
 }
 
+PRECISION_MFC2_SITES = {
+    0x8004633C: 0x480A7000,
+    0x8004795C: 0x480A7000,
+}
+
+PRECISION_STORE_SITES = {
+    0x8004641C: 0xACAA0004,
+    0x800464BC: 0xACAA0004,
+    0x80046524: 0xACAA0004,
+    0x80046540: 0xACAA0004,
+    0x80046594: 0xACAA0004,
+    0x800465D8: 0xACAA0004,
+}
+
+PRECISION_COPY_LOAD_SITES = {
+    0x80046C4C: (0x8D0C0004, 12),
+    0x80046C50: (0x8D2D0004, 13),
+    0x80046C54: (0x8D4E0004, 14),
+    0x80046C60: (0x8D6F0004, 15),
+    0x80047A80: (0x8CA80084, 8),
+    0x80047A84: (0x8CA900A4, 9),
+    0x80047A88: (0x8CAA00C4, 10),
+    0x80047A8C: (0x8CAB00BC, 11),
+    0x80047B40: (0x8CA800A4, 8),
+    0x80047B44: (0x8CA9008C, 9),
+    0x80047B48: (0x8CAA00AC, 10),
+    0x80047B4C: (0x8CAB00C4, 11),
+    0x80047C00: (0x8CA800C4, 8),
+    0x80047C04: (0x8CA900AC, 9),
+    0x80047C08: (0x8CAA0094, 10),
+    0x80047C0C: (0x8CAB00B4, 11),
+    0x80047CC4: (0x8CA800BC, 8),
+    0x80047CC8: (0x8CA900C4, 9),
+    0x80047CCC: (0x8CAA00B4, 10),
+    0x80047CD0: (0x8CAB009C, 11),
+    0x80047D6C: (0x8CA80084, 8),
+    0x80047D70: (0x8CA9008C, 9),
+    0x80047D74: (0x8CAA0094, 10),
+    0x80047D78: (0x8CAB009C, 11),
+}
+
+PRECISION_COPY_STORE_SITES = {
+    0x80046D04: (0xAF2C0008, 12),
+    0x80046D08: (0xAF2D0014, 13),
+    0x80046D10: (0xAF2E002C, 14),
+    0x80046D0C: (0xAF2F0020, 15),
+    0x80047A90: (0xAF280008, 8),
+    0x80047A94: (0xAF290014, 9),
+    0x80047A9C: (0xAF2A002C, 10),
+    0x80047A98: (0xAF2B0020, 11),
+    0x80047B50: (0xAF280008, 8),
+    0x80047B54: (0xAF290014, 9),
+    0x80047B5C: (0xAF2A002C, 10),
+    0x80047B58: (0xAF2B0020, 11),
+    0x80047C10: (0xAF280008, 8),
+    0x80047C14: (0xAF290014, 9),
+    0x80047C1C: (0xAF2A002C, 10),
+    0x80047C18: (0xAF2B0020, 11),
+    0x80047CD4: (0xAF280008, 8),
+    0x80047CD8: (0xAF290014, 9),
+    0x80047CE0: (0xAF2A002C, 10),
+    0x80047CDC: (0xAF2B0020, 11),
+    0x80047D7C: (0xAF280008, 8),
+    0x80047D80: (0xAF290014, 9),
+    0x80047D88: (0xAF2A002C, 10),
+    0x80047D84: (0xAF2B0020, 11),
+}
+
+PRECISION_SCRATCH_STORE_SITES = {
+    0x80047A0C: 0xACAA0004,
+}
+
 # Tests 4-6 widened Disruptor's portal spans into negative X.  Its static-world
 # renderer was authored around unsigned 0..320 spans, and yaw-dependent portal
 # selection became unstable.  Test 7 instead keeps every portal/outcode bound
@@ -244,6 +316,101 @@ def main() -> int:
         HORIZONTAL_SIDE_PLANE_SITES
     ):
         failures.append("unexpected horizontal side-plane helper call count")
+
+    precision_mfc2_matches = re.findall(
+        r"gte_precision_mfc2_pc_read\(0x([0-9A-F]{8})u, "
+        r"0x([0-9A-F]{8})u, 14,",
+        shard_text,
+    )
+    generated_precision_mfc2 = {
+        int(address, 16): int(word, 16)
+        for address, word in precision_mfc2_matches
+    }
+    if (generated_precision_mfc2 != PRECISION_MFC2_SITES or len(
+        precision_mfc2_matches
+    ) != len(PRECISION_MFC2_SITES)):
+        failures.append(
+            "reviewed precision MFC2 hooks differ: expected "
+            + str(PRECISION_MFC2_SITES)
+            + ", found "
+            + str(generated_precision_mfc2)
+        )
+
+    precision_store_matches = re.findall(
+        r"gte_precision_store_pc_word\(0x([0-9A-F]{8})u, "
+        r"0x([0-9A-F]{8})u,",
+        shard_text,
+    )
+    generated_precision_stores = {
+        int(address, 16): int(word, 16)
+        for address, word in precision_store_matches
+    }
+    if (generated_precision_stores != PRECISION_STORE_SITES or len(
+        precision_store_matches
+    ) != len(PRECISION_STORE_SITES)):
+        failures.append(
+            "reviewed precision SW hooks differ: expected "
+            + str(PRECISION_STORE_SITES)
+            + ", found "
+            + str(generated_precision_stores)
+        )
+
+    precision_scratch_store_matches = re.findall(
+        r"gte_precision_scratch_store_pc_word\(0x([0-9A-F]{8})u, "
+        r"0x([0-9A-F]{8})u,",
+        shard_text,
+    )
+    generated_precision_scratch_stores = {
+        int(address, 16): int(word, 16)
+        for address, word in precision_scratch_store_matches
+    }
+    if (generated_precision_scratch_stores != PRECISION_SCRATCH_STORE_SITES or
+            len(precision_scratch_store_matches) !=
+            len(PRECISION_SCRATCH_STORE_SITES)):
+        failures.append(
+            "reviewed precision scratchpad SW hooks differ: expected "
+            + str(PRECISION_SCRATCH_STORE_SITES)
+            + ", found "
+            + str(generated_precision_scratch_stores)
+        )
+
+    precision_copy_load_matches = re.findall(
+        r"gte_precision_copy_pc_read\(0x([0-9A-F]{8})u,\s*"
+        r"0x([0-9A-F]{8})u,\s*(\d+),",
+        shard_text,
+    )
+    generated_precision_copy_loads = {
+        int(address, 16): (int(word, 16), int(gpr))
+        for address, word, gpr in precision_copy_load_matches
+    }
+    if (generated_precision_copy_loads != PRECISION_COPY_LOAD_SITES or len(
+        precision_copy_load_matches
+    ) != len(PRECISION_COPY_LOAD_SITES)):
+        failures.append(
+            "reviewed precision packet-copy LW hooks differ: expected "
+            + str(PRECISION_COPY_LOAD_SITES)
+            + ", found "
+            + str(generated_precision_copy_loads)
+        )
+
+    precision_copy_store_matches = re.findall(
+        r"gte_precision_copy_pc_word\(0x([0-9A-F]{8})u,\s*"
+        r"0x([0-9A-F]{8})u,\s*(\d+),",
+        shard_text,
+    )
+    generated_precision_copy_stores = {
+        int(address, 16): (int(word, 16), int(gpr))
+        for address, word, gpr in precision_copy_store_matches
+    }
+    if (generated_precision_copy_stores != PRECISION_COPY_STORE_SITES or len(
+        precision_copy_store_matches
+    ) != len(PRECISION_COPY_STORE_SITES)):
+        failures.append(
+            "reviewed precision packet-copy SW hooks differ: expected "
+            + str(PRECISION_COPY_STORE_SITES)
+            + ", found "
+            + str(generated_precision_copy_stores)
+        )
 
     for site in VANILLA_PORTAL_AND_POINT_SITES:
         if site not in shard_text:

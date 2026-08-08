@@ -16,6 +16,18 @@ psxrecomp_add_runtime_target(psx-runtime
     DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN"
     EXE_NAME "PSXRecomp"
 )
+if(WIN32)
+    target_compile_definitions(
+        psx-runtime PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:NOMINMAX>")
+endif()
+if(MSVC)
+    # audio_trace.c is the sole runtime source using C11 atomics. Keep the
+    # generated C in MSVC's extension-compatible C mode: its static tables use
+    # address constants that strict /std:c11 rejects.
+    set_property(SOURCE "${PSXRECOMP_ROOT}/runtime/src/audio_trace.c"
+        APPEND PROPERTY COMPILE_OPTIONS
+        "/std:c11" "/experimental:c11atomics")
+endif()
 
 if(BUILD_TESTING)
     add_executable(launcher_device_roundtrip_test

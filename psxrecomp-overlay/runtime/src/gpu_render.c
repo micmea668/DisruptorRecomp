@@ -28,6 +28,7 @@ static const GpuRenderBackend SW_BACKEND = {
     .set_geometry_correction       = NULL,
     .set_world_triangle            = NULL,
     .set_precise_triangle          = sw_set_precise_triangle,
+    .set_perspective_triangle      = NULL,
     .set_presentation_yaw          = NULL,
     .fill_rect                     = sw_fill_rect,
     .copy_rect                     = sw_copy_rect,
@@ -118,10 +119,17 @@ void gr_set_precise_triangle(int enabled,
     if (g_b->set_precise_triangle)
         g_b->set_precise_triangle(enabled, x0, y0, x1, y1, x2, y2);
 }
+void gr_set_perspective_triangle(int enabled,
+                                 float q0, float q1, float q2) {
+    if (g_b->set_perspective_triangle)
+        g_b->set_perspective_triangle(enabled, q0, q1, q2);
+}
 void gr_set_presentation_yaw(double yaw_units, double full_turn,
-                             double center_x, double focal_x) {
+                             double center_x, double center_y,
+                             double focal_x) {
     if (g_b->set_presentation_yaw)
-        g_b->set_presentation_yaw(yaw_units, full_turn, center_x, focal_x);
+        g_b->set_presentation_yaw(yaw_units, full_turn,
+                                  center_x, center_y, focal_x);
 }
 void gr_fill_rect(int x, int y, int w, int h, uint16_t c)  { g_b->fill_rect(x, y, w, h, c); }
 void gr_copy_rect(int sx, int sy, int dx, int dy, int w, int h) { g_b->copy_rect(sx, sy, dx, dy, w, h); }

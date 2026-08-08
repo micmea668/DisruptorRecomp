@@ -1,4 +1,5 @@
 # Reviewed files applied from psxrecomp-overlay/ to the pinned framework.
+# Prefix an entry with '+' only when the overlay intentionally creates it.
 recompiler/include/code_generator.h
 recompiler/src/code_generator.cpp
 recompiler/src/config_loader.cpp
@@ -8,6 +9,7 @@ recompiler/tests/recompiler_patch_test.cpp
 recompiler/tests/test_reachable_discovery_codegen.py
 runtime/CMakeLists.txt
 runtime/include/dirty_ram_interp.h
++runtime/include/gte_precision.h
 runtime/include/gpu.h
 runtime/include/gpu_render.h
 runtime/include/gpu_sw_renderer.h

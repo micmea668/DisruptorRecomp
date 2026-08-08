@@ -5,7 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 FRAMEWORK="$ROOT/psxrecomp"
 PIN=$(tr -d '[:space:]' < "$ROOT/PSXRECOMP_PIN")
 
-for command in git cmake python3; do
+for command in git cmake ctest python3; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "Missing prerequisite: $command" >&2
         exit 1
@@ -47,6 +47,7 @@ cd "$ROOT"
 # shellcheck disable=SC2086
 cmake -S . -B build $GENERATOR -DCMAKE_BUILD_TYPE=Release \
     -DPSX_RECOMP_UI=OFF -DPSX_ENABLE_VULKAN=OFF
-cmake --build build --parallel --target psx-runtime
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 
 echo "Build complete. Add the matching BIN/CUE, then run ./run.sh."

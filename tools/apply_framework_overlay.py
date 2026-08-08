@@ -46,18 +46,29 @@ def main() -> int:
         parser.error(f"not a PSXRecomp checkout: {framework}")
 
     relative_paths: list[Path] = []
+    new_relative_paths: set[Path] = set()
     for line_number, raw_line in enumerate(
         manifest.read_text(encoding="utf-8").splitlines(), start=1
     ):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+        allow_new = line.startswith("+")
+        if allow_new:
+            line = line[1:].strip()
+            if not line:
+                parser.error(
+                    f"empty new-file entry in {manifest} at line {line_number}"
+                )
         posix_path = PurePosixPath(line)
         if posix_path.is_absolute() or ".." in posix_path.parts:
             parser.error(
                 f"unsafe path in {manifest} at line {line_number}: {line}"
             )
-        relative_paths.append(Path(*posix_path.parts))
+        relative = Path(*posix_path.parts)
+        relative_paths.append(relative)
+        if allow_new:
+            new_relative_paths.add(relative)
 
     if not relative_paths:
         parser.error(f"framework overlay manifest is empty: {manifest}")
@@ -76,30 +87,45 @@ def main() -> int:
             print(f"  missing {path}", file=sys.stderr)
         return 1
 
-    missing = [
+    destinations = [framework / relative for relative in relative_paths]
+    missing_existing = [
         relative
-        for relative in relative_paths
-        if not (framework / relative).is_file()
+        for destination, relative in zip(destinations, relative_paths)
+        if relative not in new_relative_paths and not destination.is_file()
     ]
-    if missing:
+    invalid_new = [
+        relative
+        for destination, relative in zip(destinations, relative_paths)
+        if relative in new_relative_paths
+        and (not destination.parent.is_dir()
+             or (destination.exists() and not destination.is_file()))
+    ]
+    if missing_existing or invalid_new:
         print(
             "Refusing to apply the overlay because the pinned framework layout "
             "does not match:",
             file=sys.stderr,
         )
-        for path in missing:
+        for path in missing_existing:
             print(f"  missing {path}", file=sys.stderr)
+        for path in invalid_new:
+            print(f"  invalid destination for new file {path}", file=sys.stderr)
         return 1
 
-    for source, relative in zip(sources, relative_paths):
-        shutil.copy2(source, framework / relative)
+    # Manifest membership is the review boundary. Only '+' entries may add a
+    # file inside an existing framework directory; unmarked entries retain the
+    # pinned-layout typo/removal guard.
+    for source, destination in zip(sources, destinations):
+        shutil.copy2(source, destination)
 
     mismatched = [
         relative
-        for source, relative in zip(sources, relative_paths)
+        for source, destination, relative in zip(
+            sources, destinations, relative_paths
+        )
         if not filecmp.cmp(
             source,
-            framework / relative,
+            destination,
             shallow=False,
         )
     ]

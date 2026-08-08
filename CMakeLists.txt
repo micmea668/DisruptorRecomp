@@ -4,6 +4,12 @@ project(DisruptorRecomp C CXX)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 17)
 
+if(WIN32 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR
+        "DisruptorRecomp supports 64-bit Windows builds only. "
+        "Use an x64 Visual Studio developer environment.")
+endif()
+
 set(PSXRECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/psxrecomp" CACHE PATH
     "Path to the pinned PSXRecomp checkout")
 
@@ -48,8 +54,40 @@ psxrecomp_add_runtime_target(psx-runtime
     DEFAULT_GAME_CONFIG_PATH "game.toml"
     EXE_NAME "DisruptorRecompiled"
 )
+if(WIN32)
+    target_compile_definitions(
+        psx-runtime PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:NOMINMAX>")
+endif()
+if(MSVC)
+    # audio_trace.c is the sole runtime source using C11 atomics. Keep the
+    # generated C in MSVC's extension-compatible C mode: its static tables use
+    # address constants that strict /std:c11 rejects.
+    set_property(SOURCE "${PSXRECOMP_ROOT}/runtime/src/audio_trace.c"
+        APPEND PROPERTY COMPILE_OPTIONS
+        "/std:c11" "/experimental:c11atomics")
+endif()
 
 include(CTest)
+if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+    add_test(NAME disruptor_geometry_provenance_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_geometry_provenance_contract.py")
+
+    add_test(NAME disruptor_phase_a_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_phase_a_contract.py")
+
+    add_test(NAME disruptor_perspective_texture_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_perspective_texture_contract.py")
+
+    add_test(NAME disruptor_framework_overlay_new_file
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_framework_overlay_new_file.py")
+endif()
+
 if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
     add_executable(disruptor-mouse-aim-test
         tests/disruptor_mouse_aim_test.cpp)
@@ -62,6 +100,18 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
         tests/presentation_yaw_math_test.cpp)
     target_compile_features(disruptor-presentation-yaw-math-test PRIVATE cxx_std_17)
 
+    add_executable(disruptor-gte-precision-store-pc-test
+        tests/gte_precision_store_pc_test.cpp
+        "${PSXRECOMP_ROOT}/runtime/src/gte.cpp")
+    target_include_directories(disruptor-gte-precision-store-pc-test PRIVATE
+        "${PSXRECOMP_ROOT}/runtime/include")
+    target_compile_definitions(disruptor-gte-precision-store-pc-test PRIVATE
+        PSX_NO_DEBUG_TOOLS=1
+        PSX_GTE_REGISTER_TEST=1
+        PSX_ENABLE_BLOCK_CYCLES=1)
+    target_compile_features(disruptor-gte-precision-store-pc-test PRIVATE
+        cxx_std_17)
+
     add_test(NAME disruptor_mouse_aim
         COMMAND disruptor-mouse-aim-test)
     set_tests_properties(disruptor_mouse_aim PROPERTIES
@@ -69,6 +119,9 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
 
     add_test(NAME disruptor_presentation_yaw_math
         COMMAND disruptor-presentation-yaw-math-test)
+
+    add_test(NAME disruptor_gte_precision_store_pc
+        COMMAND disruptor-gte-precision-store-pc-test)
 
     add_test(NAME disruptor_mouse_aim_registration
         COMMAND disruptor-mouse-aim-test --registration)

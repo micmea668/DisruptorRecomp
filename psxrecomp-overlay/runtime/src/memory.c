@@ -14,6 +14,7 @@
 #include "dma.h"
 #include "fntrace.h"
 #include "gpu.h"
+#include "gte_precision.h"
 #include "mdec.h"
 #include "mod_memory.h"
 #include "sio.h"
@@ -901,6 +902,7 @@ static uint32_t s_bios_checksum = 0;
 uint32_t memory_get_bios_checksum(void) { return s_bios_checksum; }
 
 void memory_init(const char* bios_path) {
+    gte_precision_word_write_begin();
     memset(ram, 0, sizeof(ram));
     memset(scratchpad, 0, sizeof(scratchpad));
     /* Rematch re-enters without process exit — wipe sticky I/O regs that
@@ -1478,10 +1480,13 @@ static inline void d44_note(uint32_t phys, uint32_t old, uint32_t val) {
 }
 
 static void psx_write_word_raw(uint32_t addr, uint32_t val);
-extern void gte_precision_invalidate_word(uint32_t addr);
 void psx_write_word(uint32_t addr, uint32_t val) {
     extern void (*g_overlay_flush_pending_cycles)(void);
     if (g_overlay_flush_pending_cycles) g_overlay_flush_pending_cycles();
+    /* The immediately following provenance callback may trust only a commit
+     * from this write attempt.  Clear after the cycle flush because flushing
+     * can itself perform guest writes. */
+    gte_precision_word_write_begin();
     if (g_ls_mode == 2) { ls_write_hook(addr, 4, val); return; }
     if (g_ds_recording) {
         if (g_dma_exec_depth > 0) ds_note_dma_write();
@@ -1495,7 +1500,6 @@ void psx_write_word(uint32_t addr, uint32_t val) {
 }
 static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     g_guest_store_count++;
-    gte_precision_invalidate_word(addr);
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
     /* KSEG2 guard — see psx_read_word_raw. */
@@ -1560,6 +1564,9 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
                 return;
             }
         }
+        /* All discard/suppression paths are now behind us.  Only a write that
+         * actually changes main RAM may invalidate prior provenance. */
+        gte_precision_invalidate_word(addr);
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
         parity_trace_note_write(phys, 4, effective_store_pc());
@@ -1574,6 +1581,10 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
         ram[phys + 3] = (uint8_t)(val >> 24);
+        gte_precision_main_ram_word_committed(phys);
+        /* The matching emitted/interpreted guest-store callback consumes this
+         * token after write_word returns. DMA, HLE and mod writes deliberately
+         * have no such callback, so a sticky debug PC cannot grant provenance. */
         return;
     }
     {
@@ -1594,6 +1605,9 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
+        /* All discard/suppression paths are behind us.  Invalidate any
+         * reviewed scratch provenance before the replacement bytes land. */
+        gte_precision_invalidate_word(addr);
         debug_server_trace_write_check(phys,
             (uint32_t)scratchpad[off]
           | ((uint32_t)scratchpad[off + 1] << 8)
@@ -1604,6 +1618,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         scratchpad[off + 1] = (uint8_t)(val >> 8);
         scratchpad[off + 2] = (uint8_t)(val >> 16);
         scratchpad[off + 3] = (uint8_t)(val >> 24);
+        gte_precision_scratch_word_committed(phys);
         return;
     }
     if (phys >= 0x1F801000u && phys <= 0x1F803FFFu) {
@@ -1682,7 +1697,6 @@ void psx_write_half(uint32_t addr, uint16_t val) {
 }
 static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     g_guest_store_count++;
-    gte_precision_invalidate_word(addr);
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
         /* KSEG2 guard — see psx_read_word_raw. */
@@ -1690,6 +1704,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
+        gte_precision_invalidate_word(addr);
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
         parity_trace_note_write(phys, 2, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 2);
@@ -1722,6 +1737,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
         uint32_t off = phys - 0x1F800000u;
+        gte_precision_invalidate_word(addr);
         debug_server_trace_write_check(phys,
             (uint32_t)scratchpad[off] | ((uint32_t)scratchpad[off + 1] << 8),
             (uint32_t)val, 2);
@@ -2018,7 +2034,6 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
 }
 static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     g_guest_store_count++;
-    gte_precision_invalidate_word(addr);
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
         /* KSEG2 guard — see psx_read_word_raw. */
@@ -2026,6 +2041,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
+        gte_precision_invalidate_word(addr);
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
         parity_trace_note_write(phys, 1, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 1);
@@ -2054,6 +2070,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     }
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return;
     if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
+        gte_precision_invalidate_word(addr);
         debug_server_trace_write_check(phys, (uint32_t)scratchpad[phys - 0x1F800000u],
                                        (uint32_t)val, 1);
         scratchpad[phys - 0x1F800000u] = val;
