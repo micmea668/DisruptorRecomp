@@ -143,6 +143,23 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+    add_executable(disruptor-user-settings-test
+        tests/user_settings_persistence_test.cpp
+        "${PSXRECOMP_ROOT}/recompiler/src/config_loader.cpp"
+        "${PSXRECOMP_ROOT}/recompiler/src/ps1_exe_parser.cpp")
+    target_include_directories(disruptor-user-settings-test PRIVATE
+        "${PSXRECOMP_ROOT}/recompiler/src"
+        "${PSXRECOMP_ROOT}/recompiler/include"
+        "${PSXRECOMP_ROOT}/recompiler/lib/fmt/include"
+        "${PSXRECOMP_ROOT}/recompiler/lib/toml11")
+    target_compile_definitions(disruptor-user-settings-test PRIVATE
+        FMT_HEADER_ONLY=1
+        "$<$<CXX_COMPILER_ID:MSVC>:NOMINMAX>"
+        "$<$<CXX_COMPILER_ID:MSVC>:WIN32_LEAN_AND_MEAN>")
+    target_compile_features(disruptor-user-settings-test PRIVATE cxx_std_17)
+    add_test(NAME disruptor_user_settings_persistence
+        COMMAND disruptor-user-settings-test)
+
     add_executable(disruptor-mouse-aim-test
         tests/disruptor_mouse_aim_test.cpp)
     target_include_directories(disruptor-mouse-aim-test PRIVATE

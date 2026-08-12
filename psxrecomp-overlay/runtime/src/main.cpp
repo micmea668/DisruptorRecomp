@@ -510,6 +510,13 @@ static HostUiState& host_ui_state() {
     return state;
 }
 
+static std::string g_host_user_settings_path_utf8;
+
+extern "C" const char *psx_host_user_settings_path(void) {
+    return g_host_user_settings_path_utf8.empty()
+        ? nullptr : g_host_user_settings_path_utf8.c_str();
+}
+
 extern "C" int psx_host_ui_register(const PsxHostUiHooks *hooks) {
     if (!hooks || hooks->abi_version != PSX_HOST_UI_ABI_VERSION ||
         hooks->struct_size < sizeof(PsxHostUiHooks))
@@ -4504,6 +4511,22 @@ static void sdl_vblank_present(void) {
                 if (gl_renderer_present_wide_fbo((int)di.display_x, (int)di.display_y,
                                                  (int)h, g_video_aa ? 1 : 0))
                     return;
+                /* A correction/native-wide surface can be unavailable for its
+                 * first frame (allocation failure, an as-yet unknown display
+                 * base, or a live mode transition).  The GL renderer's CPU
+                 * mirror is intentionally native-scale even when the FBO uses
+                 * SSAA, so falling through to the generic CPU-hires path would
+                 * upload a 1x image as though it were Nx and show a tiny box.
+                 * Present the authoritative canonical FBO for this frame; the
+                 * compositor can retry on the next one. */
+                pres_entry->path          = PRES_PATH_CANONICAL;
+                pres_entry->wide_fellback = 1;
+                pres_entry->present_w     = (uint16_t)w;
+                gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
+                                         (int)w, (int)h,
+                                         g_video_aa ? 1 : 0,
+                                         nw_pin ? 1 : 0);
+                return;
             } else {
                 gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                          (int)present_w, (int)h, g_video_aa ? 1 : 0,
@@ -6045,6 +6068,7 @@ int main(int argc, char** argv) {
     {
         std::filesystem::path settings_path =
             exe_dir_from_argv(argv[0]) / "settings.toml";
+        g_host_user_settings_path_utf8 = settings_path.u8string();
 #if defined(RECOMP_LAUNCHER)
         g_lnch_settings_path = settings_path;
 #endif
@@ -6147,10 +6171,29 @@ int main(int argc, char** argv) {
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
         if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
         if (us.has_vsync)             g_video_vsync       = us.vsync;
+#if defined(DISRUPTOR_DEV_MENU)
+        /* Disruptor's in-game menu deliberately treats interpolation
+         * activation as session-only: the current temporal crossfade is too
+         * blurry for a release default.  A legacy settings.toml may still
+         * contain frame_interpolation=true from the generic launcher, but this
+         * game does not auto-restore it.  The explicit environment below
+         * remains available for one-run A/B testing. */
+        g_frame_interpolation = 0;
+#else
         if (us.has_frame_interpolation)
             g_frame_interpolation = us.frame_interpolation ? 1 : 0;
+#endif
         if (us.has_frame_interpolation_fps)
             g_frame_interpolation_fps = us.frame_interpolation_fps;
+        if (us.has_frame_interpolation_blend) {
+            g_frame_interpolation_blend_default =
+                us.frame_interpolation_blend;
+            g_frame_interpolation_blend = us.frame_interpolation_blend;
+        }
+        if (us.has_geometry_correction)
+            g_geometry_correction = us.geometry_correction;
+        if (us.has_perspective_textures)
+            g_texture_correction = us.perspective_textures;
         if (us.has_parappa_timing_mode || us.has_parappa_timing_extra_early ||
             us.has_parappa_timing_extra_late) {
             parappa_apply_timing_setting(
@@ -6385,7 +6428,14 @@ int main(int argc, char** argv) {
     if (want_launcher) {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) == 0) {
             int lr = 2; /* 0 = launch, 1 = quit, 2 = unavailable */
-            PSXRecompV4::UserSettings seed;
+            /* Merge launcher edits into the canonical file instead of
+             * constructing a fresh snapshot.  Game-owned sections (including
+             * [disruptor]) and settings not exposed by recomp-ui must survive
+             * a later launcher save. */
+            PSXRecompV4::UserSettings seed =
+                PSXRecompV4::load_user_settings(
+                    exe_dir_from_argv(argv[0]) / "settings.toml");
+            if (seed.parse_error) seed = PSXRecompV4::UserSettings{};
             seed.renderer = g_video_renderer;             seed.has_renderer = true;
             seed.supersampling = g_video_scale;           seed.has_supersampling = true;
             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;

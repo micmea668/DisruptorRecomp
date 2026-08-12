@@ -85,6 +85,12 @@ int psx_host_ui_register(const PsxHostUiHooks *hooks);
 uint32_t psx_host_ui_capture_flags(void);
 int psx_host_ui_game_input_captured(void);
 
+/* UTF-8 path to the runtime's canonical user settings file.  The pointer is
+ * process-owned and remains valid for the active runtime session.  This keeps
+ * a game-owned UI on the same executable-relative settings.toml as the
+ * launcher without making it rediscover platform/AppImage path rules. */
+const char *psx_host_user_settings_path(void);
+
 /* Live, session-only video controls.  Persistence belongs to the game UI.
  * Vsync accepts -1 (adaptive), 0 (immediate), or 1 (synchronised).
  * Interpolation target accepts -1 (uncapped), 0 (display refresh), or 60..1000

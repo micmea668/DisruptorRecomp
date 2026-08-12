@@ -21,22 +21,11 @@ if (!(Test-Path $Disc)) {
     throw "The full Disruptor BIN/CUE is required. Expected: input/Disruptor (USA).cue"
 }
 
-$env:PSX_DISRUPTOR_CONTROL_PROBE = '0'
-$env:PSX_DISRUPTOR_MODERN_CONTROLS = if ($ModernControls) { '1' } else { '0' }
-$env:PSX_TEXTURE_CORRECTION = if ($PerspectiveTextures) { '1' } else { '0' }
-if ($GeometryCorrection -or $PerspectiveTextures) {
-    $env:PSX_GEOMETRY_CORRECTION = '1'
-}
 if ($MouseAim -or $ModernControls) {
     if (!(Test-Path (Join-Path $Root 'mouse-aim.ini'))) {
         throw 'mouse-aim.ini is missing.'
     }
-    $env:PSX_DISRUPTOR_MOUSE_AIM = '1'
-    $env:PSX_FPS_TELEMETRY = '0'
     Write-Host 'Mouse aim enabled: middle-click in gameplay to capture; middle-click or Esc releases.'
-}
-else {
-    $env:PSX_DISRUPTOR_MOUSE_AIM = '0'
 }
 
 $RuntimeDirectory = Split-Path -Parent $Runtime
@@ -63,11 +52,60 @@ if ($PerspectiveTextures) {
 }
 Write-Host 'OpenGL dev-menu builds: press the backquote (`) key; Escape closes it.'
 
-Push-Location $Root
+$EnvironmentOverrides = @{
+    PSX_DISRUPTOR_CONTROL_PROBE = '0'
+}
+if ($ModernControls) {
+    $EnvironmentOverrides['PSX_DISRUPTOR_MODERN_CONTROLS'] = '1'
+}
+if ($MouseAim -or $ModernControls) {
+    $EnvironmentOverrides['PSX_DISRUPTOR_MOUSE_AIM'] = '1'
+    $EnvironmentOverrides['PSX_FPS_TELEMETRY'] = '0'
+}
+if ($GeometryCorrection -or $PerspectiveTextures) {
+    $EnvironmentOverrides['PSX_GEOMETRY_CORRECTION'] = '1'
+}
+if ($PerspectiveTextures) {
+    $EnvironmentOverrides['PSX_TEXTURE_CORRECTION'] = '1'
+}
+
+$EnvironmentVariableNames = @($EnvironmentOverrides.Keys)
+$SavedEnvironment = @{}
+foreach ($Name in $EnvironmentVariableNames) {
+    $Entry = Get-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+    $SavedEnvironment[$Name] = @{
+        Exists = $null -ne $Entry
+        Value = if ($null -ne $Entry) { $Entry.Value } else { $null }
+    }
+}
+
+$LocationPushed = $false
+$RuntimeExitCode = 1
 try {
+    # Only explicitly requested launch options override persisted settings.
+    # These process-environment changes are restored after the child exits.
+    foreach ($Name in $EnvironmentVariableNames) {
+        [Environment]::SetEnvironmentVariable($Name, $EnvironmentOverrides[$Name], 'Process')
+    }
+
+    Push-Location $Root
+    $LocationPushed = $true
     & $Runtime --game $GameConfig --disc $Disc
-    exit $LASTEXITCODE
+    $RuntimeExitCode = $LASTEXITCODE
 }
 finally {
-    Pop-Location
+    if ($LocationPushed) {
+        Pop-Location
+    }
+    foreach ($Name in $EnvironmentVariableNames) {
+        $SavedValue = $SavedEnvironment[$Name]
+        if ($SavedValue.Exists) {
+            [Environment]::SetEnvironmentVariable($Name, $SavedValue.Value, 'Process')
+        }
+        else {
+            [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
+        }
+    }
 }
+
+exit $RuntimeExitCode

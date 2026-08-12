@@ -982,12 +982,12 @@ struct GameConfig {
     uint32_t ws_bg2d_packet_cap       = 1000;
 };
 
-// UserSettings — the launcher-written, user-editable override layer.
+// UserSettings — the launcher/in-game-UI-written, user-editable override layer.
 //
 // Lives in a `settings.toml` next to the runtime exe (NOT in the repo). It is
 // layered on top of the bundled game.toml at startup: any field present here
 // overrides the corresponding game.toml value, and the command line overrides
-// both. Absent fields fall through to game.toml. The launcher seeds this file
+// both. Absent fields fall through to game.toml. A settings UI seeds this file
 // from game.toml defaults the first time it writes.
 //
 // Unlike game.toml, paths here are stored verbatim (the user picked them); they
@@ -1033,6 +1033,8 @@ struct UserSettings {
     bool has_vsync             = false; int  vsync             = 1;
     bool has_frame_interpolation = false; bool frame_interpolation = false;
     bool has_frame_interpolation_fps = false; int frame_interpolation_fps = 0;
+    // Frame-interpolation blend policy: 0 = linear, 1 = adaptive.
+    bool has_frame_interpolation_blend = false; int frame_interpolation_blend = 0;
     // [launcher] — when true, boot straight into the game and skip the GUI
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.
@@ -1081,6 +1083,17 @@ struct UserSettings {
     bool has_parappa_timing_mode = false; std::string parappa_timing_mode = "stock";
     bool has_parappa_timing_extra_early = false; int parappa_timing_extra_early = 0;
     bool has_parappa_timing_extra_late = false; int parappa_timing_extra_late = 0;
+
+    // [disruptor] — Disruptor-specific, live-safe enhancement settings.
+    // Kept optional so a missing key continues to inherit the launch-time
+    // default or an explicit per-run override.
+    bool has_mouse_aim = false; bool mouse_aim = false;
+    bool has_modern_controls = false; bool modern_controls = false;
+    bool has_horizontal_sensitivity = false; double horizontal_sensitivity = 0.1;
+    bool has_invert_horizontal = false; bool invert_horizontal = false;
+    bool has_high_precision_camera = false; bool high_precision_camera = false;
+    bool has_geometry_correction = false; bool geometry_correction = false;
+    bool has_perspective_textures = false; bool perspective_textures = false;
 };
 
 // GameOptions — the game's OWN native OPTION-screen settings, declared in a
@@ -1122,7 +1135,9 @@ GameOptions load_game_options(const std::filesystem::path& path);
 // never throws.
 UserSettings load_user_settings(const std::filesystem::path& path);
 
-// Write settings.toml deterministically. Returns false on I/O failure.
+// Write settings.toml deterministically through a same-directory temporary
+// file and atomically replace the destination. Returns false on I/O failure;
+// the previous destination is left intact and the temporary file is removed.
 bool save_user_settings(const std::filesystem::path& path, const UserSettings& s);
 
 // Locate the project root by walking upward from `config_path` until a

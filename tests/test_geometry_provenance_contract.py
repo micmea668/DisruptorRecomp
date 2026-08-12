@@ -77,6 +77,20 @@ def function_body(source: str, name: str) -> str:
     raise AssertionError(f"unterminated function: {name}")
 
 
+def block_body_after(source: str, marker: str) -> str:
+    marker_pos = source.index(marker)
+    start = source.index("{", marker_pos + len(marker))
+    depth = 0
+    for pos in range(start, len(source)):
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start + 1 : pos]
+    raise AssertionError(f"unterminated block after: {marker}")
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
@@ -479,6 +493,54 @@ def main() -> int:
             "geometry toggle must preserve texture provenance tracking")
     require("ws_geometry_correction" in texture_set,
             "texture toggle must preserve geometry provenance tracking")
+
+    sync_target = function_body(source, "ws_nw_sync_target")
+    sync_target_code = re.sub(
+        r"/\*.*?\*/|//[^\n]*", "", sync_target, flags=re.S)
+    require(re.search(
+                r"\bvisual_only\s*=\s*ws_geometry_correction\s*;",
+                sync_target_code) is not None,
+            "exact geometry must provision its visual-only mirror at 4:3")
+    require(re.search(r"\bws_engaged\s*\(", sync_target_code) is None,
+            "the 4:3 correction mirror must not depend on widescreen engagement")
+    require("!native_wide && !visual_only" in sync_target_code and
+            "gr_wide_configure" in sync_target_code and
+            re.search(r"native_wide\s*\?\s*ws_nw_offset\(\)\s*:\s*0",
+                      sync_target_code) is not None,
+            "visual-only correction must use the same-width, zero-offset mirror")
+
+    fill_rect = function_body(source, "gp0_exec_fill_rect")
+    fill_rect_code = re.sub(
+        r"/\*.*?\*/|//[^\n]*", "", fill_rect, flags=re.S)
+    require("gr_wide_clear" in fill_rect_code and
+            re.search(
+                r"ws_native_wide_active\s*\(\s*\)\s*\|\|\s*"
+                r"ws_geometry_correction",
+                fill_rect_code) is not None,
+            "canonical framebuffer clears must also clear the 4:3 correction mirror")
+    require(re.search(
+                r"ws_geometry_correction\s*&&\s*ws_engaged\s*\(",
+                fill_rect_code) is None,
+            "4:3 correction clears must not depend on widescreen engagement")
+    require("ws_is_fb_base" in fill_rect_code,
+            "mirror clears must remain limited to known display framebuffers")
+
+    gl_fbo_start = main_source.index(
+        "if (g_gl_active && g_gl_fbo_present && !di.depth24)")
+    cpu_hires_pos = main_source.index(
+        "gl_renderer_sync_cpu", gl_fbo_start)
+    gl_fbo = main_source[gl_fbo_start:cpu_hires_pos]
+    wide_branch = block_body_after(gl_fbo, "if (wide_present)")
+    wide_fbo_pos = wide_branch.index("gl_renderer_present_wide_fbo")
+    vram_fallback_pos = wide_branch.find(
+        "gl_renderer_present_vram", wide_fbo_pos)
+    fallback_return_pos = wide_branch.find("return;", vram_fallback_pos)
+    require(vram_fallback_pos >= 0 and fallback_return_pos > vram_fallback_pos,
+            "a failed GL correction/wide FBO present must fall back directly "
+            "to the VRAM presenter")
+    require(main_source.index("gl_renderer_present_wide_fbo", gl_fbo_start) <
+            cpu_hires_pos,
+            "the direct GL fallback must remain ahead of CPU-hires readback")
 
     print("geometry provenance contract: PASS")
     return 0

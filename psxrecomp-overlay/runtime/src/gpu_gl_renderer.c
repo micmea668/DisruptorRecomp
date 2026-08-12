@@ -2820,6 +2820,18 @@ void gl_renderer_shutdown(void) {
     rect_clear(&s_d24_skip_fb);
 }
 
+/* Host UI callbacks are allowed to change live renderer settings.  Those
+ * setters can flush queued geometry and consequently bind an internal FBO and
+ * its VRAM-sized viewport while ImGui is already building the current frame.
+ * Reassert the window target after the callback so the state cannot leak into
+ * this swap (or into ImGui's next-frame state backup). */
+static void render_host_ui_for_swap(int drawable_w, int drawable_h) {
+    if (!psx_host_ui_gl_visible()) return;
+    psx_host_ui_render_gl(drawable_w, drawable_h);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    glViewport(0, 0, drawable_w, drawable_h);
+}
+
 /* CPU-readout present (24-bit FMV frames and the PSX_GL_FORCE_CPU_PRESENT
  * diagnostic): full-window clear, then a quad into the letterbox rect.
  * force_4_3 pins the rect to native 4:3 regardless of the display aspect —
@@ -2879,7 +2891,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0); p_glUseProgram(0);
     pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
-    if (psx_host_ui_gl_visible()) psx_host_ui_render_gl(ww, wh);
+    render_host_ui_for_swap(ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -2894,7 +2906,7 @@ void gl_renderer_present_blank(void) {
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     pres_record(GL_PRES_BLANK, 0, 0, 0, 0, 0, 0, ww, wh);
-    if (psx_host_ui_gl_visible()) psx_host_ui_render_gl(ww, wh);
+    render_host_ui_for_swap(ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -3879,7 +3891,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
-    if (psx_host_ui_gl_visible()) psx_host_ui_render_gl(ww, wh);
+    render_host_ui_for_swap(ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -3979,7 +3991,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     present_target_quad(tex, g_wide_w, VRAM_H,
                         0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
-    if (psx_host_ui_gl_visible()) psx_host_ui_render_gl(ww, wh);
+    render_host_ui_for_swap(ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);

@@ -175,7 +175,8 @@ With GCC, CMake, Python and optionally Ninja installed:
     ./build.sh
     ./run.sh
 
-Use `./run.sh --modern-controls --widescreen` for the combined opt-in test.
+Use `./run.sh --modern-controls --widescreen --geometry-correction
+--perspective-textures` for the combined opt-in test.
 Linux is primarily a compiler and diagnostic target; Windows remains the
 release target.
 
@@ -196,11 +197,21 @@ coverage, provenance misses, perspective-texture use, interpolation state and
 widescreen state. System records which renderer/audio/allocation settings still
 require a restart.
 
-Settings are session-only in this first milestone. The overlay suspends the
-secondary interpolation presenter while visible so Dear ImGui always renders
-on the main OpenGL context; it never writes PlayStation RAM or VRAM. Configure
-with `-DDISRUPTOR_DEV_MENU=OFF` to omit the menu and its integrity-pinned Dear
-ImGui dependency.
+Reviewed live settings are persisted in the user-owned `settings.toml` beside
+the executable (the development build uses `build/settings.toml`). Saves merge
+only fields changed in the menu and publish through an atomic replacement, so
+an I/O failure leaves the previous file intact. Explicit launch switches or
+environment values override saved preferences for that run. Mouse aim, modern
+controls, sensitivity/inversion, sub-byte camera, exact geometry, perspective
+textures and VSync persist; the interpolator remembers target/blend but its
+activation remains session-only because its current crossfade is too blurry
+for release. Menu layout/open state, mouse capture and diagnostics never
+persist.
+
+The overlay suspends the secondary interpolation presenter while visible so
+Dear ImGui always renders on the main OpenGL context; it never writes
+PlayStation RAM or VRAM. Configure with `-DDISRUPTOR_DEV_MENU=OFF` to omit the
+menu and its integrity-pinned Dear ImGui dependency.
 
 ## Mouse implementation
 

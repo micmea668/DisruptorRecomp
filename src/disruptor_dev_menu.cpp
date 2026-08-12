@@ -8,9 +8,11 @@
  */
 
 #include "disruptor_mouse_aim.h"
+#include "config_loader.h"
 #include "gpu.h"
 #include "gpu_gl_renderer.h"
 #include "host_ui.h"
+#include "psx_keybinds.h"
 
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
@@ -21,8 +23,12 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <string>
 
 namespace {
 
@@ -33,9 +39,353 @@ struct DevMenuState {
     bool open = false;
     bool restore_mouse_capture = false;
     bool interpolation_apply_failed = false;
+    bool base_keybinds_valid = false;
+    std::array<SDL_Scancode, PSX_KB_COUNT> base_keybinds{};
 };
 
 DevMenuState g_menu;
+
+namespace fs = std::filesystem;
+
+enum PreferenceDirty : uint32_t {
+    PREF_MOUSE_AIM         = 1u << 0,
+    PREF_MODERN_CONTROLS   = 1u << 1,
+    PREF_SENSITIVITY       = 1u << 2,
+    PREF_INVERT_X          = 1u << 3,
+    PREF_PRECISE_CAMERA    = 1u << 4,
+    PREF_GEOMETRY          = 1u << 5,
+    PREF_TEXTURES          = 1u << 6,
+    PREF_VSYNC             = 1u << 7,
+    PREF_INTERP_TARGET     = 1u << 8,
+    PREF_INTERP_BLEND      = 1u << 9,
+};
+
+struct PreferenceState {
+    fs::path path;
+    PSXRecompV4::UserSettings pending;
+    uint32_t dirty = 0;
+    bool loaded = false;
+    bool save_failed = false;
+    std::string status;
+};
+
+PreferenceState g_preferences;
+
+bool env_override_present(const char *name) {
+    return name && std::getenv(name) != nullptr;
+}
+
+static constexpr std::array<SDL_Scancode, PSX_KB_COUNT> kModernKeybinds = {
+    SDL_SCANCODE_W, SDL_SCANCODE_S,
+    SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT,
+    SDL_SCANCODE_RETURN, SDL_SCANCODE_SPACE,
+    SDL_SCANCODE_F, SDL_SCANCODE_E,
+    SDL_SCANCODE_Q, SDL_SCANCODE_R,
+    SDL_SCANCODE_A, SDL_SCANCODE_D,
+    SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+    SDL_SCANCODE_P, SDL_SCANCODE_TAB,
+    SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+    SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+    SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+    SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+};
+
+static constexpr std::array<SDL_Scancode, PSX_KB_COUNT> kOriginalKeybinds = {
+    SDL_SCANCODE_UP, SDL_SCANCODE_DOWN,
+    SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT,
+    SDL_SCANCODE_X, SDL_SCANCODE_S,
+    SDL_SCANCODE_Z, SDL_SCANCODE_A,
+    SDL_SCANCODE_Q, SDL_SCANCODE_W,
+    SDL_SCANCODE_E, SDL_SCANCODE_R,
+    SDL_SCANCODE_T, SDL_SCANCODE_Y,
+    SDL_SCANCODE_RETURN, SDL_SCANCODE_RSHIFT,
+    SDL_SCANCODE_UP, SDL_SCANCODE_DOWN,
+    SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT,
+    SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+    SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+};
+
+void capture_base_keybinds() {
+    if (g_menu.base_keybinds_valid) return;
+    bool is_packaged_modern_preset = true;
+    for (int i = 0; i < PSX_KB_COUNT; ++i) {
+        g_menu.base_keybinds[static_cast<size_t>(i)] =
+            psx_keybinds_get_button(1, i);
+        if (g_menu.base_keybinds[static_cast<size_t>(i)] !=
+            kModernKeybinds[static_cast<size_t>(i)])
+            is_packaged_modern_preset = false;
+    }
+    /* run.ps1/run.sh install the packaged modern map for an explicit launch
+     * flag.  Treat that exact map as an overlay, not the restore baseline, so
+     * turning Modern controls off live really returns to the packaged classic
+     * mapping.  Any custom/non-exact map is preserved verbatim instead. */
+    if (is_packaged_modern_preset)
+        g_menu.base_keybinds = kOriginalKeybinds;
+    g_menu.base_keybinds_valid = true;
+}
+
+void apply_modern_keybinds(bool enabled) {
+    capture_base_keybinds();
+    if (!enabled) {
+        for (int i = 0; i < PSX_KB_COUNT; ++i)
+            psx_keybinds_set_button(
+                1, i, g_menu.base_keybinds[static_cast<size_t>(i)]);
+        return;
+    }
+
+    for (int i = 0; i < PSX_KB_COUNT; ++i)
+        psx_keybinds_set_button(
+            1, i, kModernKeybinds[static_cast<size_t>(i)]);
+}
+
+void set_modern_controls_live(bool enabled) {
+    apply_modern_keybinds(enabled);
+    disruptor_modern_controls_set_enabled(enabled ? 1 : 0);
+}
+
+void mark_mouse_aim(bool value) {
+    g_preferences.pending.has_mouse_aim = true;
+    g_preferences.pending.mouse_aim = value;
+    g_preferences.dirty |= PREF_MOUSE_AIM;
+}
+
+void mark_modern_controls(bool value) {
+    g_preferences.pending.has_modern_controls = true;
+    g_preferences.pending.modern_controls = value;
+    g_preferences.dirty |= PREF_MODERN_CONTROLS;
+}
+
+void mark_sensitivity(double value) {
+    g_preferences.pending.has_horizontal_sensitivity = true;
+    g_preferences.pending.horizontal_sensitivity = value;
+    g_preferences.dirty |= PREF_SENSITIVITY;
+}
+
+void mark_invert_x(bool value) {
+    g_preferences.pending.has_invert_horizontal = true;
+    g_preferences.pending.invert_horizontal = value;
+    g_preferences.dirty |= PREF_INVERT_X;
+}
+
+void mark_precise_camera(bool value) {
+    g_preferences.pending.has_high_precision_camera = true;
+    g_preferences.pending.high_precision_camera = value;
+    g_preferences.dirty |= PREF_PRECISE_CAMERA;
+}
+
+void mark_geometry(bool value) {
+    g_preferences.pending.has_geometry_correction = true;
+    g_preferences.pending.geometry_correction = value;
+    g_preferences.dirty |= PREF_GEOMETRY;
+}
+
+void mark_textures(bool value) {
+    g_preferences.pending.has_perspective_textures = true;
+    g_preferences.pending.perspective_textures = value;
+    g_preferences.dirty |= PREF_TEXTURES;
+}
+
+void mark_vsync(int value) {
+    g_preferences.pending.has_vsync = true;
+    g_preferences.pending.vsync = value;
+    g_preferences.dirty |= PREF_VSYNC;
+}
+
+void mark_interpolation_target(int value) {
+    g_preferences.pending.has_frame_interpolation_fps = true;
+    g_preferences.pending.frame_interpolation_fps = value;
+    g_preferences.dirty |= PREF_INTERP_TARGET;
+}
+
+void mark_interpolation_blend(int value) {
+    g_preferences.pending.has_frame_interpolation_blend = true;
+    g_preferences.pending.frame_interpolation_blend = value;
+    g_preferences.dirty |= PREF_INTERP_BLEND;
+}
+
+void merge_dirty_preferences(PSXRecompV4::UserSettings &settings) {
+    const auto &pending = g_preferences.pending;
+    if (g_preferences.dirty & PREF_MOUSE_AIM) {
+        settings.has_mouse_aim = true;
+        settings.mouse_aim = pending.mouse_aim;
+    }
+    if (g_preferences.dirty & PREF_MODERN_CONTROLS) {
+        settings.has_modern_controls = true;
+        settings.modern_controls = pending.modern_controls;
+    }
+    if (g_preferences.dirty & PREF_SENSITIVITY) {
+        settings.has_horizontal_sensitivity = true;
+        settings.horizontal_sensitivity = pending.horizontal_sensitivity;
+    }
+    if (g_preferences.dirty & PREF_INVERT_X) {
+        settings.has_invert_horizontal = true;
+        settings.invert_horizontal = pending.invert_horizontal;
+    }
+    if (g_preferences.dirty & PREF_PRECISE_CAMERA) {
+        settings.has_high_precision_camera = true;
+        settings.high_precision_camera = pending.high_precision_camera;
+    }
+    if (g_preferences.dirty & PREF_GEOMETRY) {
+        settings.has_geometry_correction = true;
+        settings.geometry_correction = pending.geometry_correction;
+    }
+    if (g_preferences.dirty & PREF_TEXTURES) {
+        settings.has_perspective_textures = true;
+        settings.perspective_textures = pending.perspective_textures;
+    }
+    if (g_preferences.dirty & PREF_VSYNC) {
+        settings.has_vsync = true;
+        settings.vsync = pending.vsync;
+    }
+    if (g_preferences.dirty & PREF_INTERP_TARGET) {
+        settings.has_frame_interpolation_fps = true;
+        settings.frame_interpolation_fps = pending.frame_interpolation_fps;
+    }
+    if (g_preferences.dirty & PREF_INTERP_BLEND) {
+        settings.has_frame_interpolation_blend = true;
+        settings.frame_interpolation_blend = pending.frame_interpolation_blend;
+    }
+}
+
+bool flush_preferences() {
+    if (g_preferences.dirty == 0) return true;
+    if (g_preferences.path.empty()) {
+        g_preferences.save_failed = true;
+        g_preferences.status = "Runtime settings path is unavailable.";
+        return false;
+    }
+
+    PSXRecompV4::UserSettings settings =
+        PSXRecompV4::load_user_settings(g_preferences.path);
+    if (settings.parse_error) {
+        g_preferences.save_failed = true;
+        g_preferences.status =
+            "settings.toml is invalid; it was left untouched.";
+        return false;
+    }
+    merge_dirty_preferences(settings);
+    if (!PSXRecompV4::save_user_settings(g_preferences.path, settings)) {
+        g_preferences.save_failed = true;
+        g_preferences.status =
+            "Could not save settings; the previous file is intact.";
+        return false;
+    }
+
+    g_preferences.dirty = 0;
+    g_preferences.save_failed = false;
+    g_preferences.status = "Settings saved.";
+    std::fprintf(stdout, "disruptor: saved in-game settings to %s\n",
+                 g_preferences.path.u8string().c_str());
+    return true;
+}
+
+void apply_saved_preferences(const PSXRecompV4::UserSettings &settings) {
+    /* Force the legacy INI + environment fallback to load before the saved
+     * layer is applied.  Presence (including an explicit zero) makes an
+     * environment value authoritative for this launch. */
+    (void)disruptor_mouse_horizontal_sensitivity();
+    (void)disruptor_mouse_invert_horizontal();
+
+    if (settings.has_mouse_aim &&
+        !env_override_present("PSX_DISRUPTOR_MOUSE_AIM"))
+        disruptor_mouse_aim_set_enabled(settings.mouse_aim ? 1 : 0);
+    if (settings.has_modern_controls &&
+        !env_override_present("PSX_DISRUPTOR_MODERN_CONTROLS"))
+        set_modern_controls_live(settings.modern_controls);
+    if (settings.has_horizontal_sensitivity &&
+        !env_override_present("PSX_DISRUPTOR_MOUSE_SENSITIVITY"))
+        (void)disruptor_mouse_set_horizontal_sensitivity(
+            settings.horizontal_sensitivity);
+    if (settings.has_invert_horizontal &&
+        !env_override_present("PSX_DISRUPTOR_MOUSE_INVERT_X"))
+        disruptor_mouse_set_invert_horizontal(
+            settings.invert_horizontal ? 1 : 0);
+    if (settings.has_high_precision_camera &&
+        !env_override_present("PSX_DISRUPTOR_HIGH_PRECISION_CAMERA"))
+        disruptor_high_precision_camera_set_enabled(
+            settings.high_precision_camera ? 1 : 0);
+
+    /* An inherited explicit environment override can enable Modern controls
+     * without a run-script switch (and therefore without its preset copy).
+     * Always reconcile the live mode with the in-memory keyboard overlay so
+     * S/A do not retain conflicting classic face-button bindings. */
+    apply_modern_keybinds(disruptor_modern_controls_enabled() != 0);
+
+    /* main.cpp applies these fields before the environment layer.  Repeat the
+     * live application here so a host-UI soft session also gets the saved
+     * state, while still respecting explicit per-launch overrides. */
+    if (settings.has_geometry_correction &&
+        !env_override_present("PSX_GEOMETRY_CORRECTION"))
+        gpu_geometry_correction_set(settings.geometry_correction ? 1 : 0);
+    if (settings.has_perspective_textures &&
+        !env_override_present("PSX_TEXTURE_CORRECTION")) {
+        gpu_texture_correction_set(
+            settings.perspective_textures &&
+                    gpu_geometry_correction_enabled()
+                ? 1 : 0);
+    }
+}
+
+void apply_pending_preferences() {
+    const auto &pending = g_preferences.pending;
+    if (g_preferences.dirty & PREF_MOUSE_AIM)
+        disruptor_mouse_aim_set_enabled(pending.mouse_aim ? 1 : 0);
+    if (g_preferences.dirty & PREF_MODERN_CONTROLS)
+        set_modern_controls_live(pending.modern_controls);
+    if (g_preferences.dirty & PREF_SENSITIVITY)
+        (void)disruptor_mouse_set_horizontal_sensitivity(
+            pending.horizontal_sensitivity);
+    if (g_preferences.dirty & PREF_INVERT_X)
+        disruptor_mouse_set_invert_horizontal(
+            pending.invert_horizontal ? 1 : 0);
+    if (g_preferences.dirty & PREF_PRECISE_CAMERA)
+        disruptor_high_precision_camera_set_enabled(
+            pending.high_precision_camera ? 1 : 0);
+    if (g_preferences.dirty & PREF_GEOMETRY)
+        gpu_geometry_correction_set(pending.geometry_correction ? 1 : 0);
+    if (g_preferences.dirty & PREF_TEXTURES)
+        gpu_texture_correction_set(
+            pending.perspective_textures &&
+                    gpu_geometry_correction_enabled()
+                ? 1 : 0);
+    if (g_preferences.dirty & PREF_VSYNC)
+        (void)psx_host_video_set_vsync(pending.vsync);
+    if (g_preferences.dirty & (PREF_INTERP_TARGET | PREF_INTERP_BLEND)) {
+        int enabled = 0;
+        int target = 0;
+        int blend = 0;
+        psx_host_video_get_interpolation(&enabled, &target, &blend);
+        if (g_preferences.dirty & PREF_INTERP_TARGET)
+            target = pending.frame_interpolation_fps;
+        if (g_preferences.dirty & PREF_INTERP_BLEND)
+            blend = pending.frame_interpolation_blend;
+        (void)psx_host_video_set_interpolation(enabled, target, blend);
+    }
+}
+
+void load_preferences_for_session() {
+    const char *path = psx_host_user_settings_path();
+    if (!path || !path[0]) {
+        g_preferences.loaded = false;
+        g_preferences.status = "Runtime settings path is unavailable.";
+        return;
+    }
+    g_preferences.path = fs::u8path(path);
+    const PSXRecompV4::UserSettings settings =
+        PSXRecompV4::load_user_settings(g_preferences.path);
+    if (settings.parse_error) {
+        g_preferences.loaded = false;
+        g_preferences.status =
+            "settings.toml is invalid; saved menu values were not applied.";
+        return;
+    }
+    capture_base_keybinds();
+    apply_saved_preferences(settings);
+    apply_pending_preferences();
+    g_preferences.loaded = true;
+    if (!g_preferences.save_failed)
+        g_preferences.status = "Settings loaded.";
+}
 
 bool imgui_sdl_init(SDL_Window *window) {
 #if defined(PSX_SDL3)
@@ -102,7 +452,10 @@ bool initialize_imgui() {
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.IniFilename = nullptr;  // persistence is an explicit later milestone
+    /* Persist only the reviewed gameplay/presentation fields below.  ImGui's
+     * ambient layout file is deliberately disabled: it is relative-path,
+     * independently written, and outside our atomic settings contract. */
+    io.IniFilename = nullptr;
     apply_disruptor_style();
 
     if (!imgui_sdl_init(g_menu.window)) {
@@ -134,6 +487,7 @@ void set_menu_open(bool open) {
         g_menu.open = true;
     } else {
         g_menu.open = false;
+        (void)flush_preferences();
         if (g_menu.restore_mouse_capture)
             (void)disruptor_mouse_set_captured(1);
         g_menu.restore_mouse_capture = false;
@@ -156,13 +510,17 @@ void draw_status_badge(const char *label, const ImVec4 &colour) {
 
 void draw_controls_tab() {
     bool mouse_aim = disruptor_mouse_aim_enabled() != 0;
-    if (ImGui::Checkbox("Horizontal mouse aim", &mouse_aim))
+    if (ImGui::Checkbox("Horizontal mouse aim", &mouse_aim)) {
         disruptor_mouse_aim_set_enabled(mouse_aim ? 1 : 0);
+        mark_mouse_aim(mouse_aim);
+    }
     draw_status_badge("LIVE", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
 
     bool modern = disruptor_modern_controls_enabled() != 0;
-    if (ImGui::Checkbox("Modern keyboard and mouse controls", &modern))
-        disruptor_modern_controls_set_enabled(modern ? 1 : 0);
+    if (ImGui::Checkbox("Modern keyboard and mouse controls", &modern)) {
+        set_modern_controls_live(modern);
+        mark_modern_controls(modern);
+    }
     draw_status_badge("LIVE", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
 
     float sensitivity =
@@ -170,18 +528,24 @@ void draw_controls_tab() {
     if (ImGui::SliderFloat("Horizontal sensitivity", &sensitivity,
                            0.005f, 2.0f, "%.3f",
                            ImGuiSliderFlags_Logarithmic)) {
-        (void)disruptor_mouse_set_horizontal_sensitivity(sensitivity);
+        const double applied =
+            disruptor_mouse_set_horizontal_sensitivity(sensitivity);
+        mark_sensitivity(applied);
     }
 
     bool invert_x = disruptor_mouse_invert_horizontal() != 0;
-    if (ImGui::Checkbox("Invert horizontal mouse", &invert_x))
+    if (ImGui::Checkbox("Invert horizontal mouse", &invert_x)) {
         disruptor_mouse_set_invert_horizontal(invert_x ? 1 : 0);
+        mark_invert_x(invert_x);
+    }
 
     bool high_precision = disruptor_high_precision_camera_enabled() != 0;
     const bool exact_geometry = gpu_geometry_correction_enabled() != 0;
     if (!exact_geometry) ImGui::BeginDisabled();
-    if (ImGui::Checkbox("Sub-byte camera presentation", &high_precision))
+    if (ImGui::Checkbox("Sub-byte camera presentation", &high_precision)) {
         disruptor_high_precision_camera_set_enabled(high_precision ? 1 : 0);
+        mark_precise_camera(high_precision);
+    }
     if (!exact_geometry) ImGui::EndDisabled();
     draw_status_badge("EXPERIMENTAL", ImVec4(1.0f, 0.73f, 0.25f, 1.0f));
     if (!exact_geometry)
@@ -197,9 +561,12 @@ void draw_controls_tab() {
 }
 
 void apply_geometry_enabled(bool enabled) {
-    if (!enabled && gpu_texture_correction_enabled())
+    if (!enabled && gpu_texture_correction_enabled()) {
         gpu_texture_correction_set(0);
+        mark_textures(false);
+    }
     gpu_geometry_correction_set(enabled ? 1 : 0);
+    mark_geometry(enabled);
 }
 
 void draw_enhancements_tab() {
@@ -210,8 +577,10 @@ void draw_enhancements_tab() {
 
     bool textures = gpu_texture_correction_enabled() != 0;
     if (!geometry) ImGui::BeginDisabled();
-    if (ImGui::Checkbox("Perspective-correct world textures", &textures))
+    if (ImGui::Checkbox("Perspective-correct world textures", &textures)) {
         gpu_texture_correction_set(textures ? 1 : 0);
+        mark_textures(textures);
+    }
     if (!geometry) ImGui::EndDisabled();
     draw_status_badge("LIVE", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
     if (!geometry)
@@ -238,25 +607,32 @@ void draw_enhancements_tab() {
     for (int i = 0; i < 5; ++i) {
         if (target_fps == kTargets[i]) target_index = i;
     }
-    if (!interpolation_enabled) ImGui::BeginDisabled();
     if (ImGui::Combo("Presentation target", &target_index,
                      kTargetLabels, 5)) {
         target_fps = kTargets[target_index];
         g_menu.interpolation_apply_failed =
-            psx_host_video_set_interpolation(1, target_fps, blend) == 0;
+            psx_host_video_set_interpolation(
+                interpolation_enabled ? 1 : 0, target_fps, blend) == 0;
+        if (!g_menu.interpolation_apply_failed)
+            mark_interpolation_target(target_fps);
     }
     static const char *kBlendLabels[] = {
         "Linear crossfade", "Motion-adaptive clarity"};
     if (ImGui::Combo("Blend mode", &blend, kBlendLabels, 2)) {
         g_menu.interpolation_apply_failed =
-            psx_host_video_set_interpolation(1, target_fps, blend) == 0;
+            psx_host_video_set_interpolation(
+                interpolation_enabled ? 1 : 0, target_fps, blend) == 0;
+        if (!g_menu.interpolation_apply_failed)
+            mark_interpolation_blend(blend);
     }
-    if (!interpolation_enabled) ImGui::EndDisabled();
 
     ImGui::TextWrapped(
         "Interpolation blends completed host images. Guest simulation, audio "
         "and input remain at the original cadence; ghosting and additional "
         "visual latency are possible.");
+    ImGui::TextDisabled(
+        "Activation is session-only and starts disabled next launch; target "
+        "and blend preferences are remembered.");
     if (g_menu.interpolation_apply_failed)
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
                            "The renderer rejected the requested interpolation setting.");
@@ -267,8 +643,10 @@ void draw_enhancements_tab() {
     static const char *kVsyncLabels[] = {
         "Adaptive", "Immediate", "Synchronised"};
     if (interpolation_enabled) ImGui::BeginDisabled();
-    if (ImGui::Combo("VSync", &vsync_index, kVsyncLabels, 3))
-        (void)psx_host_video_set_vsync(vsync_index - 1);
+    if (ImGui::Combo("VSync", &vsync_index, kVsyncLabels, 3)) {
+        const int requested = vsync_index - 1;
+        if (psx_host_video_set_vsync(requested)) mark_vsync(requested);
+    }
     if (interpolation_enabled) ImGui::EndDisabled();
     if (interpolation_enabled)
         ImGui::TextDisabled("Interpolation owns presentation cadence and uses immediate swaps.");
@@ -339,9 +717,29 @@ void draw_diagnostics_tab() {
 
 void draw_system_tab() {
     ImGui::TextWrapped(
-        "This first developer-menu milestone keeps changes for the current "
-        "session only. Safe, atomic settings persistence will be added after "
-        "the live controls have been validated in gameplay.");
+        "Live menu choices are merged into the runtime's user-owned "
+        "settings.toml. Writes use an atomic replacement, so a failed save "
+        "leaves the previous file intact. Explicit launch flags still win "
+        "for that run.");
+    ImGui::SeparatorText("Settings persistence");
+    ImGui::TextWrapped("Path: %s",
+        g_preferences.path.empty()
+            ? "unavailable" : g_preferences.path.u8string().c_str());
+    if (g_preferences.save_failed)
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                           "Not saved");
+    else if (g_preferences.dirty)
+        ImGui::TextColored(ImVec4(1.0f, 0.73f, 0.25f, 1.0f),
+                           "Unsaved changes");
+    else
+        ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.45f, 1.0f), "Saved");
+    if (!g_preferences.status.empty())
+        ImGui::TextWrapped("%s", g_preferences.status.c_str());
+    if (g_preferences.dirty && ImGui::Button("Save now"))
+        (void)flush_preferences();
+    ImGui::TextDisabled(
+        "Frame-interpolation activation, menu layout, mouse capture and "
+        "diagnostic counters are intentionally not persisted.");
     ImGui::SeparatorText("Restart required");
     ImGui::BulletText("Renderer backend");
     ImGui::BulletText("Supersampling/internal framebuffer allocation");
@@ -360,7 +758,7 @@ void draw_menu() {
         ImGui::TextDisabled("Press ` to toggle; Escape closes the menu.");
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.73f, 0.25f, 1.0f),
-                           "Session-only developer build");
+                           "Developer build");
         ImGui::TextColored(ImVec4(1.0f, 0.73f, 0.25f, 1.0f),
                            "The game is not paused while this menu is open.");
 
@@ -391,10 +789,16 @@ void draw_menu() {
 void on_runtime_ready(void *, SDL_Window *window, int backend) {
     g_menu.window = window;
     g_menu.backend = backend;
+    load_preferences_for_session();
     if (backend == PSX_HOST_UI_BACKEND_OPENGL) (void)initialize_imgui();
 }
 
 void on_runtime_shutdown(void *) {
+    (void)flush_preferences();
+    if (disruptor_mouse_captured())
+        (void)disruptor_mouse_set_captured(0);
+    if (g_menu.base_keybinds_valid)
+        apply_modern_keybinds(false);
     g_menu.open = false;
     g_menu.restore_mouse_capture = false;
     if (g_menu.imgui_ready) {

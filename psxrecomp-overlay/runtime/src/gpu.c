@@ -2302,7 +2302,12 @@ static int ws_is_fb_base(uint32_t bx) {
  * disable mirroring for this draw. Called when the draw env changes. */
 static void ws_nw_sync_target(void) {
     const int native_wide = ws_native_wide_active();
-    const int visual_only = ws_geometry_correction && ws_engaged();
+    /* The corrected presentation mirror is also required at authentic 4:3.
+     * main.cpp's game-entry gate deliberately considers that mode engaged even
+     * though this file's ws_engaged() means only "a non-identity wide mode".
+     * Gating visual-only here on ws_mode therefore left 4:3 correction without
+     * a surface and sent OpenGL into its CPU fallback at the wrong SSAA scale. */
+    const int visual_only = ws_geometry_correction;
     if (!native_wide && !visual_only) {
         gr_wide_disable_target();
         return;
@@ -2348,7 +2353,7 @@ static int geometry_diag_display_active(void) {
  * offscreen texture draw cannot reach the independent presentation surface. */
 static int geometry_diag_presentation_live(void) {
     return geometry_diag_display_active() &&
-           ws_geometry_correction && ws_engaged() &&
+           ws_geometry_correction &&
            !gpu_ws_present_native_43() && !(display_depth & 1u) &&
            gr_wide_supported() && ws_is_fb_base(draw_area_left);
 }
@@ -4218,11 +4223,12 @@ static void gp0_exec_fill_rect(void) {
      * supersampling mirror (no-op cost when supersampling is off). */
     gr_fill_rect((int)dst_x, (int)dst_y, (int)width, (int)height, color16);
 
-    /* Native-wide: when the game clears a display buffer, clear the full width
-     * of that buffer's wide surface over the same rows — refreshing the centred
-     * content region and keeping the revealed margins clean. */
-    if ((ws_native_wide_active() ||
-         (ws_geometry_correction && ws_engaged())) && ws_is_fb_base(dst_x)) {
+    /* Keep every active presentation mirror in lockstep with the canonical
+     * framebuffer clear.  The exact-geometry mirror is also used at authentic
+     * 4:3, where this file's ws_engaged() is deliberately false; gating it on
+     * wide mode left prior frames resident and produced persistent trails. */
+    if ((ws_native_wide_active() || ws_geometry_correction) &&
+        ws_is_fb_base(dst_x)) {
         gr_wide_clear((int)dst_x, (int)dst_y, (int)height, color16);
     }
 }

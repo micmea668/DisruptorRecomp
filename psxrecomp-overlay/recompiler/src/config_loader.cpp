@@ -3,12 +3,26 @@
 #include "config_loader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "bios_rom_alias.h"
 #include "fmt/format.h"
@@ -2125,7 +2139,7 @@ GameOptions load_game_options(const fs::path& path) {
     return go;
 }
 
-// ---- UserSettings (settings.toml) — launcher-written override layer ----
+// ---- UserSettings (settings.toml) — user-interface-written override layer ----
 
 UserSettings load_user_settings(const fs::path& path) {
     UserSettings s;
@@ -2219,6 +2233,13 @@ UserSettings load_user_settings(const fs::path& path) {
             s.frame_interpolation_fps = toml::find<int>(v, "frame_interpolation_fps");
             if (s.frame_interpolation_fps == 0 || s.frame_interpolation_fps >= 90)
                 s.has_frame_interpolation_fps = true;
+        });
+        if (v.contains("frame_interpolation_blend")) try_get([&]{
+            const auto n = toml::find<int64_t>(v, "frame_interpolation_blend");
+            if (n == 0 || n == 1) {
+                s.frame_interpolation_blend = static_cast<int>(n);
+                s.has_frame_interpolation_blend = true;
+            }
         });
         if (v.contains("aspect_ratio")) try_get([&]{
             const auto m = toml::find<std::string>(v, "aspect_ratio");
@@ -2360,15 +2381,91 @@ UserSettings load_user_settings(const fs::path& path) {
             if (n >= 0 && n <= 32767) { s.deadzone = (int)n; s.has_deadzone = true; }
         });
     }
+    if (doc.contains("disruptor")) {
+        const toml::value& d = toml::find(doc, "disruptor");
+        if (d.contains("mouse_aim")) try_get([&]{
+            s.mouse_aim = toml::find<bool>(d, "mouse_aim");
+            s.has_mouse_aim = true;
+        });
+        if (d.contains("modern_controls")) try_get([&]{
+            s.modern_controls = toml::find<bool>(d, "modern_controls");
+            s.has_modern_controls = true;
+        });
+        if (d.contains("horizontal_sensitivity")) try_get([&]{
+            double n = 0.0;
+            try {
+                n = toml::find<double>(d, "horizontal_sensitivity");
+            } catch (const std::exception&) {
+                n = static_cast<double>(
+                    toml::find<int64_t>(d, "horizontal_sensitivity"));
+            }
+            if (std::isfinite(n) && n >= 0.005 && n <= 2.0) {
+                s.horizontal_sensitivity = n;
+                s.has_horizontal_sensitivity = true;
+            }
+        });
+        if (d.contains("invert_horizontal")) try_get([&]{
+            s.invert_horizontal = toml::find<bool>(d, "invert_horizontal");
+            s.has_invert_horizontal = true;
+        });
+        if (d.contains("high_precision_camera")) try_get([&]{
+            s.high_precision_camera = toml::find<bool>(d, "high_precision_camera");
+            s.has_high_precision_camera = true;
+        });
+        if (d.contains("geometry_correction")) try_get([&]{
+            s.geometry_correction = toml::find<bool>(d, "geometry_correction");
+            s.has_geometry_correction = true;
+        });
+        if (d.contains("perspective_textures")) try_get([&]{
+            s.perspective_textures = toml::find<bool>(d, "perspective_textures");
+            s.has_perspective_textures = true;
+        });
+    }
     return s;
 }
+
+namespace {
+
+fs::path user_settings_temp_path(const fs::path& destination) {
+    static std::atomic<uint64_t> sequence{0};
+#ifdef _WIN32
+    const auto process_id = static_cast<uint64_t>(::GetCurrentProcessId());
+#else
+    const auto process_id = static_cast<uint64_t>(::getpid());
+#endif
+    const auto tick = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+
+    fs::path temporary = destination;
+    temporary += fmt::format(".tmp.{}.{}.{}", process_id, tick,
+                             sequence.fetch_add(1, std::memory_order_relaxed));
+    return temporary;
+}
+
+bool atomic_replace_user_settings(const fs::path& temporary,
+                                  const fs::path& destination) {
+#ifdef _WIN32
+    return ::MoveFileExW(temporary.c_str(), destination.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return std::rename(temporary.c_str(), destination.c_str()) == 0;
+#endif
+}
+
+void remove_user_settings_temp(const fs::path& temporary) {
+    std::error_code ignored;
+    fs::remove(temporary, ignored);
+}
+
+} // namespace
 
 bool save_user_settings(const fs::path& path, const UserSettings& s) {
     std::error_code ec;
     if (!path.parent_path().empty())
         fs::create_directories(path.parent_path(), ec);  // best-effort
 
-    std::ofstream f(path, std::ios::trunc);
+    const fs::path temporary = user_settings_temp_path(path);
+    std::ofstream f(temporary, std::ios::trunc);
     if (!f.is_open()) return false;
 
     // TOML strings use forward slashes so backslash escaping is never an issue.
@@ -2377,7 +2474,7 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         return str;
     };
 
-    f << "# psxrecomp user settings - written by the launcher. Safe to hand-edit.\n";
+    f << "# psxrecomp user settings - written by settings UIs. Safe to hand-edit.\n";
     f << "# Overrides the bundled game.toml; the command line overrides this file.\n\n";
 
     f << "[video]\n";
@@ -2417,6 +2514,10 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "frame_interpolation = " << (s.frame_interpolation ? "true" : "false") << "\n";
     if (s.has_frame_interpolation_fps)
         f << "frame_interpolation_fps = " << s.frame_interpolation_fps << "\n";
+    if (s.has_frame_interpolation_blend &&
+        (s.frame_interpolation_blend == 0 ||
+         s.frame_interpolation_blend == 1))
+        f << "frame_interpolation_blend = " << s.frame_interpolation_blend << "\n";
     if (s.has_aspect_ratio)
         f << "aspect_ratio      = \"" << s.aspect_num << ":" << s.aspect_den << "\"\n";
     if (s.has_adaptive_view)
@@ -2483,7 +2584,45 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "extra_late = " << s.parappa_timing_extra_late << "\n";
     }
 
-    return f.good();
+    if (s.has_mouse_aim || s.has_modern_controls ||
+        s.has_horizontal_sensitivity || s.has_invert_horizontal ||
+        s.has_high_precision_camera || s.has_geometry_correction ||
+        s.has_perspective_textures) {
+        f << "\n[disruptor]\n";
+        if (s.has_mouse_aim)
+            f << "mouse_aim = " << (s.mouse_aim ? "true" : "false") << "\n";
+        if (s.has_modern_controls)
+            f << "modern_controls = " << (s.modern_controls ? "true" : "false") << "\n";
+        if (s.has_horizontal_sensitivity &&
+            std::isfinite(s.horizontal_sensitivity) &&
+            s.horizontal_sensitivity >= 0.005 &&
+            s.horizontal_sensitivity <= 2.0) {
+            f << "horizontal_sensitivity = "
+              << std::setprecision(std::numeric_limits<double>::max_digits10)
+              << s.horizontal_sensitivity << "\n";
+        }
+        if (s.has_invert_horizontal)
+            f << "invert_horizontal = " << (s.invert_horizontal ? "true" : "false") << "\n";
+        if (s.has_high_precision_camera)
+            f << "high_precision_camera = " << (s.high_precision_camera ? "true" : "false") << "\n";
+        if (s.has_geometry_correction)
+            f << "geometry_correction = " << (s.geometry_correction ? "true" : "false") << "\n";
+        if (s.has_perspective_textures)
+            f << "perspective_textures = " << (s.perspective_textures ? "true" : "false") << "\n";
+    }
+
+    f.flush();
+    const bool write_ok = f.good();
+    f.close();
+    if (!write_ok || f.fail()) {
+        remove_user_settings_temp(temporary);
+        return false;
+    }
+    if (!atomic_replace_user_settings(temporary, path)) {
+        remove_user_settings_temp(temporary);
+        return false;
+    }
+    return true;
 }
 
 } // namespace PSXRecompV4

@@ -11,20 +11,23 @@ DISC="$ROOT/input/Disruptor (USA).cue"
 MOUSE_AIM=0
 MODERN_CONTROLS=0
 WIDESCREEN=0
+GEOMETRY_CORRECTION=0
+PERSPECTIVE_TEXTURES=0
 for arg in "$@"; do
     case "$arg" in
-        --mouse-aim)       MOUSE_AIM=1 ;;
-        --modern-controls) MODERN_CONTROLS=1; MOUSE_AIM=1 ;;
-        --widescreen)      WIDESCREEN=1 ;;
+        --mouse-aim)            MOUSE_AIM=1 ;;
+        --modern-controls)      MODERN_CONTROLS=1; MOUSE_AIM=1 ;;
+        --widescreen)           WIDESCREEN=1 ;;
+        --geometry-correction)  GEOMETRY_CORRECTION=1 ;;
+        --perspective-textures) PERSPECTIVE_TEXTURES=1; GEOMETRY_CORRECTION=1 ;;
         *)
-            echo "Usage: ./run.sh [--mouse-aim] [--modern-controls] [--widescreen]" >&2
+            echo "Usage: ./run.sh [--mouse-aim] [--modern-controls] [--widescreen] [--geometry-correction] [--perspective-textures]" >&2
             exit 2
             ;;
     esac
 done
 
 export PSX_DISRUPTOR_CONTROL_PROBE=0
-export PSX_DISRUPTOR_MODERN_CONTROLS=$MODERN_CONTROLS
 if [ "$MOUSE_AIM" -eq 1 ]; then
     [ -f "$ROOT/mouse-aim.ini" ] || {
         echo "mouse-aim.ini is missing." >&2
@@ -33,8 +36,15 @@ if [ "$MOUSE_AIM" -eq 1 ]; then
     export PSX_DISRUPTOR_MOUSE_AIM=1
     export PSX_FPS_TELEMETRY=0
     echo "Mouse aim enabled: middle-click in gameplay to capture; middle-click or Esc releases."
-else
-    export PSX_DISRUPTOR_MOUSE_AIM=0
+fi
+if [ "$MODERN_CONTROLS" -eq 1 ]; then
+    export PSX_DISRUPTOR_MODERN_CONTROLS=1
+fi
+if [ "$GEOMETRY_CORRECTION" -eq 1 ]; then
+    export PSX_GEOMETRY_CORRECTION=1
+fi
+if [ "$PERSPECTIVE_TEXTURES" -eq 1 ]; then
+    export PSX_TEXTURE_CORRECTION=1
 fi
 
 if [ "$MODERN_CONTROLS" -eq 1 ]; then
@@ -48,6 +58,13 @@ GAME_CONFIG=game.toml
 if [ "$WIDESCREEN" -eq 1 ]; then
     GAME_CONFIG=game-widescreen.toml
     echo "Experimental native-wide 16:9 enabled; menus and movies remain 4:3."
+fi
+
+if [ "$GEOMETRY_CORRECTION" -eq 1 ]; then
+    echo 'Exact-provenance presentation geometry enabled.'
+fi
+if [ "$PERSPECTIVE_TEXTURES" -eq 1 ]; then
+    echo 'Perspective textures enabled for exact world polygons; canonical VRAM and UI remain affine.'
 fi
 
 echo 'OpenGL dev-menu builds: press the backquote (`) key; Escape closes it.'
