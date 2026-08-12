@@ -3010,6 +3010,10 @@ void gpu_texture_correction_set(int enabled) {
                                ws_geometry_correction);
 }
 
+int gpu_texture_correction_enabled(void) {
+    return s_texture_correction_enabled;
+}
+
 uint32_t gpu_texture_correction_hits(void) {
     return s_texture_correction_triangles;
 }

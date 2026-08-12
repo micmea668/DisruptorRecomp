@@ -13,11 +13,58 @@ endif()
 set(PSXRECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/psxrecomp" CACHE PATH
     "Path to the pinned PSXRecomp checkout")
 
+option(DISRUPTOR_DEV_MENU
+    "Build the in-game Disruptor settings and diagnostics menu"
+    ON)
+
+set(DISRUPTOR_EXTRA_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_control_probe.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_mouse_aim.cpp")
+
 # The project deliberately uses the redistributable OpenBIOS backend only.
 set(PSXRECOMP_BIOS_STEMS "OpenBIOS" CACHE STRING "" FORCE)
 set(PSX_RECOMP_UI OFF CACHE BOOL "" FORCE)
 
 include("${PSXRECOMP_ROOT}/runtime/runtime.cmake")
+
+if(DISRUPTOR_DEV_MENU)
+    include(FetchContent)
+    FetchContent_Declare(disruptor_imgui
+        URL
+            "https://github.com/ocornut/imgui/archive/refs/tags/v1.92.6.tar.gz"
+        URL_HASH
+            "SHA256=5b17c01f69545bde732b14936d89ce0f508adb83e8b56fa82448371845172bc3"
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(disruptor_imgui)
+
+    if(PSX_SDL3)
+        set(DISRUPTOR_IMGUI_SDL_BACKEND
+            "${disruptor_imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp")
+    else()
+        set(DISRUPTOR_IMGUI_SDL_BACKEND
+            "${disruptor_imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp")
+    endif()
+
+    add_library(disruptor-imgui STATIC
+        "${disruptor_imgui_SOURCE_DIR}/imgui.cpp"
+        "${disruptor_imgui_SOURCE_DIR}/imgui_draw.cpp"
+        "${disruptor_imgui_SOURCE_DIR}/imgui_tables.cpp"
+        "${disruptor_imgui_SOURCE_DIR}/imgui_widgets.cpp"
+        "${DISRUPTOR_IMGUI_SDL_BACKEND}"
+        "${disruptor_imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp")
+    target_include_directories(disruptor-imgui PUBLIC
+        "${disruptor_imgui_SOURCE_DIR}"
+        "${disruptor_imgui_SOURCE_DIR}/backends")
+    target_link_libraries(disruptor-imgui PRIVATE ${PSX_SDL_LIBRARIES})
+    target_compile_features(disruptor-imgui PUBLIC cxx_std_17)
+    if(WIN32)
+        target_compile_definitions(
+            disruptor-imgui PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:NOMINMAX>")
+    endif()
+
+    list(APPEND DISRUPTOR_EXTRA_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_dev_menu.cpp")
+endif()
 
 file(GLOB GAME_GENERATED_FULL CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/generated/SLUS_002.24.code_full.c"
@@ -47,13 +94,16 @@ psxrecomp_add_runtime_target(psx-runtime
     GAME_GENERATED_DISPATCH_C "${GAME_GENERATED_DISPATCH}"
     GAME_OVERLAY_STATIC_C "${GAME_OVERLAY_STATIC}"
     EXTRAS_SOURCES
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_control_probe.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_mouse_aim.cpp"
+        ${DISRUPTOR_EXTRA_SOURCES}
     DEBUG_PORT 4624
     WINDOW_TITLE "Disruptor Recompiled"
     DEFAULT_GAME_CONFIG_PATH "game.toml"
     EXE_NAME "DisruptorRecompiled"
 )
+if(DISRUPTOR_DEV_MENU)
+    target_compile_definitions(psx-runtime PRIVATE DISRUPTOR_DEV_MENU=1)
+    target_link_libraries(psx-runtime PRIVATE disruptor-imgui)
+endif()
 if(WIN32)
     target_compile_definitions(
         psx-runtime PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:NOMINMAX>")
@@ -82,6 +132,10 @@ if(BUILD_TESTING)
     add_test(NAME disruptor_perspective_texture_contract
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_perspective_texture_contract.py")
+
+    add_test(NAME disruptor_dev_menu_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dev_menu_contract.py")
 
     add_test(NAME disruptor_framework_overlay_new_file
         COMMAND "${Python3_EXECUTABLE}" -B

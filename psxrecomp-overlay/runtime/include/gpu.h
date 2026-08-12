@@ -129,6 +129,7 @@ void gpu_geometry_correction_stats(uint64_t *world_triangles,
  * triangles on the presentation mirror. Canonical VRAM, sprites, rectangles,
  * UI, and any polygon without strict projective depth remain affine. */
 void gpu_texture_correction_set(int enabled);
+int  gpu_texture_correction_enabled(void);
 uint32_t gpu_texture_correction_hits(void);
 
 /* Versioned Test-13 diagnostics. Candidate/accepted primitive arrays count

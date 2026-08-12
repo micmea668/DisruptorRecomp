@@ -67,6 +67,7 @@
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
+#include "host_ui.h"
 #include "latency_ring.h"
 
 #include "psx_sdl.h"
@@ -321,6 +322,8 @@ static GLint         s_interp_uAlpha = -1, s_interp_uUvRect = -1;
 static GLint         s_interp_uBlendMode = -1;
 static int           s_interp_enabled = 0, s_interp_valid = 0;
 static int           s_interp_suspended = 0;
+static int           s_interp_content_suspended = 0;
+static int           s_interp_host_ui_suspended = 0;
 static int           s_interp_blend_mode = 0;
 static int           s_interp_prev = 0, s_interp_cur = 0;
 static int           s_interp_w = 0, s_interp_h = 0, s_interp_linear = 0;
@@ -336,6 +339,7 @@ static SDL_Thread   *s_interp_thread = NULL;
 static SDL_mutex    *s_interp_mutex = NULL;
 static SDL_atomic_t  s_interp_thread_run;
 static GLuint        s_interp_thread_vao = 0;
+static void interp_reset_history_unlocked(void);
 static void interp_reset_history(void);
 static int interp_thread_main(void *opaque);
 static int interp_present(void);
@@ -2751,17 +2755,24 @@ int gl_renderer_init_context(SDL_Window *win) {
     return 1;
 }
 
-/* Set the GL swap interval (vsync mode): 1=vsync, 0=immediate, -1=adaptive.
- * Safe to call before or after context creation; applies live when a context
- * exists. Adaptive falls back to vsync if unsupported. */
+static void apply_swap_interval(void) {
+    if (!s_ctx) return;
+    /* The interpolation thread owns host-refresh presentation and requires
+     * immediate swaps.  Preserve the user's requested interval separately so
+     * disabling interpolation can restore it without a renderer restart. */
+    int effective = s_interp_enabled ? 0 : s_swap_interval;
+    if (SDL_GL_SetSwapInterval(effective) != 0 && effective < 0) {
+        SDL_GL_SetSwapInterval(1);
+        s_swap_interval = 1;
+    }
+}
+
+/* Set the requested GL swap interval (1=vsync, 0=immediate, -1=adaptive).
+ * Safe before or after context creation.  While interpolation is active the
+ * request is remembered and physical swapping stays immediate. */
 void gl_renderer_set_swap_interval(int interval) {
     s_swap_interval = interval;
-    if (s_ctx) {
-        if (SDL_GL_SetSwapInterval(interval) != 0 && interval < 0) {
-            SDL_GL_SetSwapInterval(1);
-            s_swap_interval = 1;
-        }
-    }
+    apply_swap_interval();
 }
 
 void gl_renderer_shutdown(void) {
@@ -2793,6 +2804,11 @@ void gl_renderer_shutdown(void) {
         SDL_DestroyMutex(s_interp_mutex);
         s_interp_mutex = NULL;
     }
+    s_interp_enabled = 0;
+    s_interp_suspended = 0;
+    s_interp_content_suspended = 0;
+    s_interp_host_ui_suspended = 0;
+    interp_reset_history_unlocked();
     free(s_conv); s_conv = NULL;
     s_raster_ok = 0;
     /* New context regenerates s_present_tex empty; a stale size makes
@@ -2863,6 +2879,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0); p_glUseProgram(0);
     pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
+    if (psx_host_ui_gl_visible()) psx_host_ui_render_gl(ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -2877,6 +2894,7 @@ void gl_renderer_present_blank(void) {
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     pres_record(GL_PRES_BLANK, 0, 0, 0, 0, 0, 0, ww, wh);
+    if (psx_host_ui_gl_visible()) psx_host_ui_render_gl(ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -3546,6 +3564,9 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
     s_interp_target_hz = active ? effective_hz : 0.0;
     s_interp_blend_mode = blend_mode == 1 ? 1 : 0;
     if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
+    /* Enabling interpolation forces immediate swaps; disabling restores the
+     * last user-requested interval kept in s_swap_interval. */
+    apply_swap_interval();
     if (active && effective_hz < 0.0)
         fprintf(stdout, "psxrecomp: GL frame interpolation enabled: uncapped "
                 "target on %.1f Hz display (%s blend)\n", host_hz,
@@ -3558,12 +3579,26 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
         fprintf(stdout, "psxrecomp: GL frame interpolation disabled (host %.1f Hz)\n", host_hz);
 }
 
-void gl_renderer_set_interpolation_suspended(int suspended) {
+static void interp_set_suspended(int *reason, int suspended) {
     suspended = suspended ? 1 : 0;
     if (s_interp_mutex) SDL_LockMutex(s_interp_mutex);
-    if (suspended != s_interp_suspended) interp_reset_history_unlocked();
-    s_interp_suspended = suspended;
+    const int was_suspended = s_interp_suspended;
+    *reason = suspended;
+    s_interp_suspended =
+        s_interp_content_suspended || s_interp_host_ui_suspended;
+    if (was_suspended != s_interp_suspended) interp_reset_history_unlocked();
     if (s_interp_mutex) SDL_UnlockMutex(s_interp_mutex);
+}
+
+void gl_renderer_set_interpolation_suspended(int suspended) {
+    interp_set_suspended(&s_interp_content_suspended, suspended);
+}
+
+/* Host UI suspension is independent of content/FMV suspension.  Keeping two
+ * reasons prevents closing a menu during an FMV from briefly waking the
+ * interpolation thread on the shared window. */
+void gl_renderer_set_host_ui_suspended(int suspended) {
+    interp_set_suspended(&s_interp_host_ui_suspended, suspended);
 }
 
 void gl_renderer_interpolation_diag(int *enabled, int *suspended,
@@ -3808,7 +3843,8 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         s_last_present_path == GL_PRES_VRAM &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == w && s_last_dh == h &&
-        !present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1)) {
+        !present_dirty_test(disp_x, disp_y, disp_x + w - 1, disp_y + h - 1) &&
+        !psx_host_ui_gl_visible()) {
         gl_perf_present_enter();
         gl_perf_present_exit(0);
         return;
@@ -3843,6 +3879,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     present_target_quad(s_hr_tex, VRAM_W, VRAM_H,
                         disp_x, disp_y, w, h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
+    if (psx_host_ui_gl_visible()) psx_host_ui_render_gl(ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -3910,7 +3947,8 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         s_last_present_path == GL_PRES_WIDE &&
         s_last_dx == disp_x && s_last_dy == disp_y &&
         s_last_dw == g_wide_w && s_last_dh == disp_h &&
-        !present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1)) {
+        !present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1) &&
+        !psx_host_ui_gl_visible()) {
         gl_perf_present_enter();
         gl_perf_present_exit(1);
         return 1;
@@ -3941,6 +3979,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     present_target_quad(tex, g_wide_w, VRAM_H,
                         0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh);
     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
+    if (psx_host_ui_gl_visible()) psx_host_ui_render_gl(ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);

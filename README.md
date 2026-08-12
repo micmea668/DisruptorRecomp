@@ -179,6 +179,29 @@ Use `./run.sh --modern-controls --widescreen` for the combined opt-in test.
 Linux is primarily a compiler and diagnostic target; Windows remains the
 release target.
 
+## In-game settings and developer menu
+
+The OpenGL build includes a host-side settings and diagnostics menu. Press the
+backquote key (`` ` ``) to open or close it; Escape also closes it. The menu
+releases relative mouse capture while open, neutralises keyboard, mouse and
+controller input reaching the game, and restores the previous mouse-capture
+state when closed. Guest execution continues behind this first developer
+version of the menu.
+
+The Controls tab changes mouse aim, modern controls, horizontal sensitivity,
+horizontal inversion and the sub-byte camera presentation live. Enhancements
+contains exact geometry, perspective textures, VSync and the experimental
+presentation-only frame interpolator. Diagnostics reports exact-geometry
+coverage, provenance misses, perspective-texture use, interpolation state and
+widescreen state. System records which renderer/audio/allocation settings still
+require a restart.
+
+Settings are session-only in this first milestone. The overlay suspends the
+secondary interpolation presenter while visible so Dear ImGui always renders
+on the main OpenGL context; it never writes PlayStation RAM or VRAM. Configure
+with `-DDISRUPTOR_DEV_MENU=OFF` to omit the menu and its integrity-pinned Dear
+ImGui dependency.
+
 ## Mouse implementation
 
 Dynamic left/neutral/right correlation and static instruction tracing identify

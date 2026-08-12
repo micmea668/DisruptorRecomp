@@ -33,6 +33,7 @@ int g_ws_native_active = 0;
 int g_ws_extra = 0;
 double g_camera_yaw_residual = 0.0;
 int g_camera_yaw_residual_calls = 0;
+int g_host_ui_captured = 0;
 
 constexpr std::uint32_t kTestYawAddress = 0x80077624u;
 
@@ -44,6 +45,10 @@ SDL_Window *sdl_window = &g_window;
 
 void mod_register_frame_hook(void (*hook)(void)) {
     g_registered_hook = hook;
+}
+
+int psx_host_ui_game_input_captured(void) {
+    return g_host_ui_captured;
 }
 
 std::uint8_t psx_read_byte(std::uint32_t address) {
@@ -179,6 +184,7 @@ void reset_state() {
     g_ws_extra = 0;
     g_camera_yaw_residual = 0.0;
     g_camera_yaw_residual_calls = 0;
+    g_host_ui_captured = 0;
     sdl_window = &g_window;
 }
 
@@ -421,6 +427,106 @@ void test_modern_mouse_buttons_require_capture() {
     expect_pressed(kPadR1, "mouse X2 maps to psionic selection");
 }
 
+void test_live_settings_api() {
+    reset_state();
+    g_mouse.configured = true;
+
+    expect(!disruptor_mouse_aim_enabled(),
+           "mouse aim starts disabled in live settings test");
+    expect(!disruptor_modern_controls_enabled(),
+           "modern controls start disabled in live settings test");
+    expect(!disruptor_mouse_set_captured(1),
+           "capture is rejected while input features are disabled");
+
+    disruptor_mouse_aim_set_enabled(1);
+    expect(disruptor_mouse_aim_enabled() && g_mouse.enabled,
+           "live mouse-aim enable wakes the dormant frame hook");
+    expect(disruptor_mouse_set_captured(1) && g_relative_mode,
+           "live API captures after mouse aim is enabled");
+
+    expect_close(disruptor_mouse_set_horizontal_sensitivity(0.25), 0.25,
+                 "live sensitivity accepts an in-range value");
+    expect_close(disruptor_mouse_set_horizontal_sensitivity(99.0), 2.0,
+                 "live sensitivity clamps to its safe maximum");
+    expect_close(disruptor_mouse_set_horizontal_sensitivity(NAN), 2.0,
+                 "live sensitivity rejects non-finite values");
+
+    disruptor_mouse_set_invert_horizontal(1);
+    expect(disruptor_mouse_invert_horizontal(),
+           "live horizontal inversion is observable");
+    disruptor_high_precision_camera_set_enabled(1);
+    expect(disruptor_high_precision_camera_enabled(),
+           "live high-precision camera is observable");
+
+    g_mouse.fractional_yaw = 0.375;
+    g_camera_yaw_residual = 0.375;
+    disruptor_high_precision_camera_set_enabled(0);
+    expect_close(g_mouse.fractional_yaw, 0.0,
+                 "disabling high precision clears fractional yaw");
+    expect_close(g_camera_yaw_residual, 0.0,
+                 "disabling high precision clears presentation residual");
+
+    disruptor_modern_controls_set_enabled(1);
+    disruptor_mouse_aim_set_enabled(0);
+    expect(disruptor_mouse_captured(),
+           "modern controls keep an existing capture after mouse aim is disabled");
+    disruptor_modern_controls_set_enabled(0);
+    expect(!disruptor_mouse_captured() && !g_relative_mode,
+           "disabling the last input feature releases capture");
+}
+
+void test_host_ui_blocks_polled_mod_input() {
+    reset_state();
+    g_mouse.configured = true;
+    g_mouse.enabled = true;
+    g_mouse.mouse_aim_enabled = true;
+    g_mouse.modern_controls_enabled = true;
+    g_mouse.captured = true;
+    g_relative_mode = true;
+    g_mouse.fractional_yaw = 0.5;
+    g_camera_yaw_residual = 0.5;
+    psx_write_byte(kTestYawAddress, 77);
+    g_keys[SDL_SCANCODE_W] = 1;
+    g_buttons = SDL_BUTTON_LMASK;
+    g_relative_x = 12.0f;
+    g_host_ui_captured = 1;
+
+    mouse_aim_frame();
+
+    expect(psx_read_byte(kTestYawAddress) == 77,
+           "host UI blocks mouse yaw writes");
+    expect(g_pad_buttons == 0xFFFFu,
+           "host UI blocks modern-control button injection");
+    expect_close(g_relative_x, 0.0,
+                 "host UI drains relative motion while captured");
+    expect_close(g_camera_yaw_residual, 0.0,
+                 "host UI clears presentation residual while captured");
+}
+
+void test_host_ui_escape_close_restores_capture() {
+    reset_state();
+    g_mouse.configured = true;
+    g_mouse.enabled = true;
+    g_mouse.mouse_aim_enabled = true;
+    g_mouse.log = std::tmpfile();
+
+    /* Closing the host UI happens inside the Escape key event callback.  The
+     * key is still down when its frame hook next polls SDL state. */
+    g_keys[SDL_SCANCODE_ESCAPE] = 1;
+    expect(disruptor_mouse_set_captured(1) && g_relative_mode,
+           "host UI restores relative capture while Escape is held");
+    mouse_aim_frame();
+    expect(g_mouse.captured && g_relative_mode,
+           "held close key does not immediately release restored capture");
+
+    g_keys[SDL_SCANCODE_ESCAPE] = 0;
+    mouse_aim_frame();
+    g_keys[SDL_SCANCODE_ESCAPE] = 1;
+    mouse_aim_frame();
+    expect(!g_mouse.captured && !g_relative_mode,
+           "a later Escape press still releases capture normally");
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -428,8 +534,8 @@ int main(int argc, char **argv) {
         expect(g_registered_hook != nullptr,
                "environment opt-in registers the frame hook");
     } else {
-        expect(g_registered_hook == nullptr,
-               "normal launch leaves mouse hook unregistered");
+        expect(g_registered_hook != nullptr,
+               "normal launch installs a dormant hook for live settings");
         test_parsing();
         test_ini_configuration();
         test_direction_fraction_and_wrap();
@@ -438,6 +544,9 @@ int main(int argc, char **argv) {
         test_high_precision_camera_residual();
         test_modern_keyboard_mapping_and_merge();
         test_modern_mouse_buttons_require_capture();
+        test_live_settings_api();
+        test_host_ui_blocks_polled_mod_input();
+        test_host_ui_escape_close_restores_capture();
     }
 
     if (g_mouse.log) {

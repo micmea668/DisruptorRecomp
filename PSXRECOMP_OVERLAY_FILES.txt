@@ -13,6 +13,7 @@ runtime/include/dirty_ram_interp.h
 runtime/include/gpu.h
 runtime/include/gpu_render.h
 runtime/include/gpu_sw_renderer.h
++runtime/include/host_ui.h
 runtime/include/overlay_dispatch_preamble.c.inc
 runtime/include/ws_aspect_cone_math.h
 runtime/src/dirty_ram_interp.c

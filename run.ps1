@@ -61,6 +61,7 @@ if ($GeometryCorrection -or $PerspectiveTextures) {
 if ($PerspectiveTextures) {
     Write-Host 'Perspective textures enabled for exact world polygons; canonical VRAM and UI remain affine.'
 }
+Write-Host 'OpenGL dev-menu builds: press the backquote (`) key; Escape closes it.'
 
 Push-Location $Root
 try {

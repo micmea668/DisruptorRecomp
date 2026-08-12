@@ -42,6 +42,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
 #include "gpu_vk_renderer.h"
+#include "host_ui.h"
 #include "gte_precision.h"
 #include "frame_pacing.h"
 #include "latency_ring.h"
@@ -107,6 +108,10 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include <sstream>
 #include <string>
 #include <vector>
+
+/* Internal GL seam: host-menu suspension is a separate reason from FMV/
+ * content suspension, so either owner can release independently. */
+extern "C" void gl_renderer_set_host_ui_suspended(int suspended);
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -487,6 +492,102 @@ static void mod_call_frame_hooks() {
     auto& hooks = mod_frame_hooks();
     const size_t count = hooks.size();
     for (size_t i = 0; i < count; i++) hooks[i]();
+}
+
+/* Optional game-owned in-game UI.  Keep the registration state here rather
+ * than in a renderer so input routing and renderer lifetime remain coordinated
+ * and a build with no provider has no extra source or link dependency. */
+struct HostUiState {
+    PsxHostUiHooks hooks{};
+    bool registered = false;
+    bool session_live = false;
+    SDL_Window *window = nullptr;
+    int backend = PSX_HOST_UI_BACKEND_NONE;
+};
+
+static HostUiState& host_ui_state() {
+    static HostUiState state;
+    return state;
+}
+
+extern "C" int psx_host_ui_register(const PsxHostUiHooks *hooks) {
+    if (!hooks || hooks->abi_version != PSX_HOST_UI_ABI_VERSION ||
+        hooks->struct_size < sizeof(PsxHostUiHooks))
+        return 0;
+
+    HostUiState& state = host_ui_state();
+    if (state.registered) return 0;
+    state.hooks = *hooks;
+    state.registered = true;
+    if (state.session_live && state.hooks.on_runtime_ready)
+        state.hooks.on_runtime_ready(state.hooks.userdata, state.window,
+                                     state.backend);
+    return 1;
+}
+
+static void host_ui_runtime_ready(SDL_Window *window, int backend) {
+    HostUiState& state = host_ui_state();
+    /* A lobby soft-return may create another game session in the same process.
+     * Close the prior provider lifetime defensively before opening a new one. */
+    if (state.session_live && state.registered &&
+        state.hooks.on_runtime_shutdown)
+        state.hooks.on_runtime_shutdown(state.hooks.userdata);
+    state.window = window;
+    state.backend = backend;
+    state.session_live = true;
+    if (state.registered && state.hooks.on_runtime_ready)
+        state.hooks.on_runtime_ready(state.hooks.userdata, window, backend);
+}
+
+static void host_ui_runtime_shutdown() {
+    HostUiState& state = host_ui_state();
+    if (!state.session_live) return;
+    if (state.registered && state.hooks.on_runtime_shutdown)
+        state.hooks.on_runtime_shutdown(state.hooks.userdata);
+    state.session_live = false;
+    state.window = nullptr;
+    state.backend = PSX_HOST_UI_BACKEND_NONE;
+}
+
+extern "C" int psx_host_ui_handle_event(const SDL_Event *event) {
+    HostUiState& state = host_ui_state();
+    if (!event || !state.session_live || !state.registered ||
+        !state.hooks.on_sdl_event)
+        return 0;
+    return state.hooks.on_sdl_event(state.hooks.userdata, event) ? 1 : 0;
+}
+
+extern "C" uint32_t psx_host_ui_capture_flags(void) {
+    HostUiState& state = host_ui_state();
+    if (!state.session_live || !state.registered || !state.hooks.flags)
+        return 0;
+    return state.hooks.flags(state.hooks.userdata);
+}
+
+extern "C" int psx_host_ui_game_input_captured(void) {
+    const uint32_t input = PSX_HOST_UI_CAPTURE_KEYBOARD |
+                           PSX_HOST_UI_CAPTURE_MOUSE |
+                           PSX_HOST_UI_CAPTURE_GAMEPAD;
+    return (psx_host_ui_capture_flags() & input) != 0;
+}
+
+extern "C" int psx_host_ui_gl_visible(void) {
+    HostUiState& state = host_ui_state();
+    return state.session_live && state.registered &&
+           state.backend == PSX_HOST_UI_BACKEND_OPENGL &&
+           state.hooks.render_gl &&
+           (psx_host_ui_capture_flags() & PSX_HOST_UI_VISIBLE) != 0;
+}
+
+extern "C" void psx_host_ui_render_gl(int drawable_width,
+                                        int drawable_height) {
+    HostUiState& state = host_ui_state();
+    if (!state.session_live || !state.registered ||
+        state.backend != PSX_HOST_UI_BACKEND_OPENGL ||
+        !state.hooks.render_gl)
+        return;
+    state.hooks.render_gl(state.hooks.userdata, drawable_width,
+                          drawable_height);
 }
 
 /* Presentation-only interpolation for software-rendered content that repeats
@@ -1111,6 +1212,85 @@ extern "C" int psx_ws_get_native_wide(void) { return g_ws_native_wide; }
 
 static bool          g_gl_active = false;    /* GL context live -> GL present path */
 static bool          g_vk_active = false;    /* Vulkan context live -> VK present path */
+
+extern "C" int psx_host_video_get_vsync(void) {
+    return g_video_vsync;
+}
+
+extern "C" int psx_host_video_set_vsync(int mode) {
+    if (mode < -1 || mode > 1) return 0;
+    g_video_vsync = mode;
+#ifndef PSX_SDL_NO_RENDER
+    /* gl_renderer_set_swap_interval remembers this request but keeps the
+     * physical interval at zero while interpolation owns presentation. */
+    if (g_gl_active) gl_renderer_set_swap_interval(mode);
+    if (g_vk_active) vk_renderer_set_present_mode(mode);
+#endif
+    latency_ring_set_present_mode(mode);
+    return 1;
+}
+
+extern "C" void psx_host_video_get_interpolation(int *enabled,
+                                                   int *target_fps,
+                                                   int *blend_mode) {
+    int actual_enabled = g_frame_interpolation ? 1 : 0;
+    if (g_gl_active)
+        gl_renderer_interpolation_diag(&actual_enabled, nullptr, nullptr,
+                                       nullptr, nullptr, nullptr);
+    if (enabled) *enabled = actual_enabled;
+    if (target_fps) *target_fps = g_frame_interpolation_fps;
+    if (blend_mode) *blend_mode = g_frame_interpolation_blend;
+}
+
+extern "C" int psx_host_video_set_interpolation(int enabled,
+                                                  int target_fps,
+                                                  int blend_mode) {
+    enabled = enabled ? 1 : 0;
+    if (target_fps != -1 && target_fps != 0 &&
+        (target_fps < 60 || target_fps > 1000))
+        return 0;
+    if (blend_mode != PSX_MOD_FRAME_INTERPOLATION_LINEAR &&
+        blend_mode != PSX_MOD_FRAME_INTERPOLATION_MOTION_ADAPTIVE)
+        return 0;
+    /* Interpolation is implemented only by the GL backend and renderer changes
+     * are restart-owned.  Do not let an in-game control advertise success on a
+     * software/Vulkan session. */
+    if (enabled && !g_gl_active) return 0;
+
+    if (g_gl_active) {
+        int previous_actual = 0;
+        gl_renderer_interpolation_diag(&previous_actual, nullptr, nullptr,
+                                       nullptr, nullptr, nullptr);
+        gl_renderer_set_interpolation(enabled, g_host_refresh_hz,
+                                      (double)target_fps, blend_mode);
+        int actual = 0;
+        gl_renderer_interpolation_diag(&actual, nullptr, nullptr,
+                                       nullptr, nullptr, nullptr);
+        if (actual != enabled) {
+            /* Context/thread creation and display-rate validation live in the
+             * GL backend.  Do not advertise a requested state which the
+             * renderer could not actually enter.  Restore a previously-live
+             * interpolator when a target change was rejected. */
+            if (actual != previous_actual) {
+                gl_renderer_set_interpolation(
+                    previous_actual, g_host_refresh_hz,
+                    (double)g_frame_interpolation_fps,
+                    g_frame_interpolation_blend);
+            }
+            g_frame_interpolation = previous_actual;
+            gl_renderer_set_swap_interval(g_video_vsync);
+            return 0;
+        }
+        /* Re-assert the requested user interval.  The GL backend defers it
+         * while interpolation is enabled and restores it on disable. */
+        gl_renderer_set_swap_interval(g_video_vsync);
+    }
+    g_frame_interpolation = enabled;
+    g_frame_interpolation_fps = target_fps;
+    g_frame_interpolation_blend = blend_mode;
+    return 1;
+}
+
 /* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
  * to force the software readout path instead — a diagnostic/fallback that also
  * keeps CPU VRAM current every frame (so screenshots reflect the screen). */
@@ -1744,6 +1924,9 @@ static void netplay_soft_exit(const char *origin) {
 }
 
 static void shutdown_runtime(void) {
+    /* UI teardown may destroy GL resources; it must run while the game window
+     * and main renderer context are still alive.  The helper is idempotent. */
+    host_ui_runtime_shutdown();
     /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
      * off-thread JIT worker here; the worker no longer exists.) */
     psx_netplay_shutdown();
@@ -1769,6 +1952,7 @@ static void shutdown_runtime(void) {
 /* Tear down the game window/GL/audio after a lobby soft-return. Leaves SDL
  * subsystems and the lobby WebSocket intact for the next launcher session. */
 static void teardown_game_session_keep_lobby(void) {
+    host_ui_runtime_shutdown();
     netplay_host_present_restore();
     psx_netplay_shutdown();
     memcard_flush_all();
@@ -3322,6 +3506,16 @@ static void apply_pad_slot_to_sio(int s, const PsxNetPad& pad) {
  * onto local_slot (host→sim P1, guest→sim P2). Never writes SIO. Exclusive
  * capture — no keyboard-all / all-controllers merge — so peers hash-agree. */
 static void capture_local_human_pad(PsxNetPad* out) {
+    const uint32_t ui_flags = psx_host_ui_capture_flags();
+    if (ui_flags & (PSX_HOST_UI_CAPTURE_KEYBOARD |
+                    PSX_HOST_UI_CAPTURE_GAMEPAD)) {
+        out->buttons = 0xFFFFu;
+        out->lx = out->ly = out->rx = out->ry = 0x80u;
+        out->analog = 1;
+        out->connected = 1;
+        psx_netplay_normalize_pad(out);
+        return;
+    }
     int idx = psx_netplay_input_player();
     if (idx < 0 || idx > 1) idx = 0;
     if (!capture_pad_slot_exclusive(idx, out)) {
@@ -3455,11 +3649,12 @@ static void netplay_barrier_admit(int override) {
         if (!g_headless) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
+                const int ui_consumed = psx_host_ui_handle_event(&ev);
                 if (ev.type == SDL_QUIT) {
                     netplay_soft_exit("sdl_window_close");
                     if (psx_return_to_lobby_requested()) return;
                 }
-                if (ev.type == SDL_KEYDOWN &&
+                if (!ui_consumed && ev.type == SDL_KEYDOWN &&
 #if defined(PSX_SDL3)
                     ev.key.key == SDLK_ESCAPE) {
 #else
@@ -3488,6 +3683,24 @@ static void netplay_barrier_admit(int override) {
 static void sample_pad_into_sio(int override) {
     if (override >= 0) {
         apply_input_override_to_sio(override);
+        return;
+    }
+    const uint32_t ui_flags = psx_host_ui_capture_flags();
+    if (ui_flags & (PSX_HOST_UI_CAPTURE_KEYBOARD |
+                    PSX_HOST_UI_CAPTURE_GAMEPAD)) {
+        /* Poll-based input bypasses SDL event consumption.  Publish a fully
+         * neutral sample (buttons and sticks) while preserving each port's
+         * current digital/analog presentation mode. */
+        for (int s = 0; s < 2; s++) {
+            PsxNetPad pad{};
+            pad.buttons = 0xFFFFu;
+            pad.lx = pad.ly = pad.rx = pad.ry = 0x80u;
+            pad.analog = (g_players[s].mode == PSXRecompV4::PAD_MODE_ANALOG ||
+                          (g_players[s].mode == PSXRecompV4::PAD_MODE_HYBRID &&
+                           g_players[s].hybrid_analog)) ? 1u : 0u;
+            pad.connected = g_players[s].kind != 0 ? 1u : 0u;
+            apply_pad_slot_to_sio(s, pad);
+        }
         return;
     }
     for (int s = 0; s < 2; s++) {
@@ -3809,6 +4022,7 @@ static void sdl_vblank_present(void) {
         /* Pump SDL events to prevent window freeze. */
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            const int ui_consumed = psx_host_ui_handle_event(&ev);
             if (ev.type == SDL_QUIT) {
                 if (psx_netplay_active()) {
                     netplay_soft_exit("sdl_window_close");
@@ -3830,7 +4044,7 @@ static void sdl_vblank_present(void) {
                     close_controller();
                     refresh_player_devices();
                 }
-            } else if (ev.type == SDL_KEYDOWN) {
+            } else if (!ui_consumed && ev.type == SDL_KEYDOWN) {
 #if defined(PSX_SDL3)
                 const SDL_Keymod mod = ev.key.mod;
                 const SDL_Keycode key = ev.key.key;
@@ -3891,6 +4105,16 @@ static void sdl_vblank_present(void) {
                 }
             }
         }
+    }
+
+    if (g_gl_active) {
+        const uint32_t ui_flags = psx_host_ui_capture_flags();
+        /* Visible UI must stay on the main GL context even if a provider omits
+         * the explicit suspension flag.  The interpolation thread never calls
+         * the host render hook. */
+        gl_renderer_set_host_ui_suspended(
+            (ui_flags & (PSX_HOST_UI_VISIBLE |
+                         PSX_HOST_UI_SUSPEND_INTERPOLATION)) != 0);
     }
 
     /* Sample each player's device and feed the matching SIO pad slot.
@@ -4049,7 +4273,8 @@ static void sdl_vblank_present(void) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         static int turbo_skip = 0;
         const int TURBO_PRESENT_EVERY = 30;
-        if (keys[SDL_SCANCODE_TAB]) {
+        if (!(psx_host_ui_capture_flags() & PSX_HOST_UI_CAPTURE_KEYBOARD) &&
+            keys[SDL_SCANCODE_TAB]) {
             turbo_skip = (turbo_skip + 1) % TURBO_PRESENT_EVERY;
             if (turbo_skip != 0) {
                 netplay_tail.skip_pace();
@@ -4190,7 +4415,8 @@ static void sdl_vblank_present(void) {
             /* After savestate load, always restage once even if we blanked
              * earlier in the session — otherwise the window keeps a stale
              * pre-load frame while vblanks (and FPS) keep advancing. */
-            if (!s_disabled_frame_presented || s_force_present_after_load) {
+            if (!s_disabled_frame_presented || s_force_present_after_load ||
+                psx_host_ui_gl_visible()) {
                 s_disabled_frame_presented = true;
                 s_force_present_after_load = false;
                 if (g_gl_active) {
@@ -7184,6 +7410,12 @@ session_reboot:
     SDL_SetTextureScaleMode(sdl_texture,
                             g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
   }
+
+    host_ui_runtime_ready(
+        sdl_window,
+        g_gl_active ? PSX_HOST_UI_BACKEND_OPENGL :
+        g_vk_active ? PSX_HOST_UI_BACKEND_VULKAN :
+                      PSX_HOST_UI_BACKEND_SOFTWARE);
   }
 
     /* Register vblank presentation callback. */

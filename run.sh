@@ -50,5 +50,7 @@ if [ "$WIDESCREEN" -eq 1 ]; then
     echo "Experimental native-wide 16:9 enabled; menus and movies remain 4:3."
 fi
 
+echo 'OpenGL dev-menu builds: press the backquote (`) key; Escape closes it.'
+
 cd "$ROOT"
 exec "$RUNTIME" --game "$GAME_CONFIG" --disc "$DISC"

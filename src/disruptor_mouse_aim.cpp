@@ -10,11 +10,13 @@
  * This opt-in mod applies relative host mouse motion to the same yaw byte after
  * each guest input/update frame.  A second opt-in path merges a conventional
  * WASD/mouse layout into the emulated port-1 digital pad after the runtime's
- * low-latency input sample.  Normal play has no hook or overhead unless either
- * PSX_DISRUPTOR_MOUSE_AIM=1 or PSX_DISRUPTOR_MODERN_CONTROLS=1 is present.
+ * low-latency input sample.  The runtime keeps a dormant frame hook available
+ * for live menu changes; normal play pays only one immediate return unless one
+ * of the control features is enabled.
  */
 
 #include "psx_sdl.h"
+#include "disruptor_mouse_aim.h"
 #include "../psxrecomp-overlay/runtime/include/gpu.h"
 
 #include <algorithm>
@@ -37,6 +39,7 @@ extern "C" int ws_native_wide_active(void);
 extern "C" int ws_nw_extra(void);
 extern "C" void gpu_geometry_camera_yaw_residual_set(double yaw_units);
 extern "C" SDL_Window *sdl_window;
+extern "C" int psx_host_ui_game_input_captured(void);
 
 namespace {
 
@@ -252,6 +255,10 @@ double take_relative_x() {
 }
 
 void set_capture(bool captured, const char *reason) {
+    if (captured && !g_mouse.mouse_aim_enabled &&
+        !g_mouse.modern_controls_enabled) {
+        return;
+    }
     if (captured == g_mouse.captured) return;
     if (!set_relative_mouse_mode(captured)) {
         set_title("ERROR enabling relative mode; see log");
@@ -454,6 +461,20 @@ void mouse_aim_frame() {
     load_configuration();
     open_log();
 
+    /* The host menu consumes polled state as well as SDL events.  Keep the
+     * edge detectors current so a button held while closing cannot toggle
+     * capture or inject a guest action on the following frame. */
+    if (psx_host_ui_game_input_captured()) {
+        const Uint8 *keys = SDL_GetKeyboardState(nullptr);
+        const uint32_t buttons = get_mouse_buttons();
+        g_mouse.escape_was_down =
+            keys && keys[SDL_SCANCODE_ESCAPE] != 0;
+        g_mouse.middle_was_down = (buttons & SDL_BUTTON_MMASK) != 0;
+        discard_relative_motion();
+        gpu_geometry_camera_yaw_residual_set(0.0);
+        return;
+    }
+
     static bool announced = false;
     if (!announced) {
         announced = true;
@@ -550,10 +571,146 @@ struct MouseAimRegistration {
         g_mouse.enabled = g_mouse.mouse_aim_enabled ||
                           g_mouse.modern_controls_enabled ||
                           g_mouse.high_precision_camera;
-        if (g_mouse.enabled) mod_register_frame_hook(mouse_aim_frame);
+        /* Keep one dormant hook installed even when every launch-time option
+         * is off.  The in-game settings menu can then enable controls without
+         * restarting; mouse_aim_frame() immediately returns while dormant. */
+        mod_register_frame_hook(mouse_aim_frame);
     }
 };
 
 MouseAimRegistration g_registration;
 
 }  // namespace
+
+namespace {
+
+void reset_presentation_residual() {
+    g_mouse.fractional_yaw = 0.0;
+    gpu_geometry_camera_yaw_residual_set(0.0);
+}
+
+void refresh_live_control_state(const char *event) {
+    g_mouse.enabled = g_mouse.mouse_aim_enabled ||
+                      g_mouse.modern_controls_enabled ||
+                      g_mouse.high_precision_camera;
+
+    if ((!g_mouse.mouse_aim_enabled || !g_mouse.high_precision_camera) &&
+        g_mouse.fractional_yaw != 0.0) {
+        reset_presentation_residual();
+    } else if (!g_mouse.mouse_aim_enabled ||
+               !g_mouse.high_precision_camera) {
+        gpu_geometry_camera_yaw_residual_set(0.0);
+    }
+
+    /* Relative capture is only meaningful for the two input features.  Do
+     * not leave the desktop pointer trapped when both are disabled live. */
+    if (!g_mouse.mouse_aim_enabled &&
+        !g_mouse.modern_controls_enabled && g_mouse.captured) {
+        set_capture(false, "settings-disabled-release");
+    }
+
+    if (event) log_event(event);
+}
+
+}  // namespace
+
+extern "C" int disruptor_mouse_aim_enabled(void) {
+    return g_mouse.mouse_aim_enabled ? 1 : 0;
+}
+
+extern "C" void disruptor_mouse_aim_set_enabled(int enabled) {
+    load_configuration();
+    const bool next = enabled != 0;
+    if (g_mouse.mouse_aim_enabled == next) return;
+    g_mouse.mouse_aim_enabled = next;
+    reset_presentation_residual();
+    refresh_live_control_state(next ? "settings-mouse-aim-on"
+                                    : "settings-mouse-aim-off");
+}
+
+extern "C" int disruptor_modern_controls_enabled(void) {
+    return g_mouse.modern_controls_enabled ? 1 : 0;
+}
+
+extern "C" void disruptor_modern_controls_set_enabled(int enabled) {
+    load_configuration();
+    const bool next = enabled != 0;
+    if (g_mouse.modern_controls_enabled == next) return;
+    g_mouse.modern_controls_enabled = next;
+    refresh_live_control_state(next ? "settings-modern-controls-on"
+                                    : "settings-modern-controls-off");
+}
+
+extern "C" int disruptor_high_precision_camera_enabled(void) {
+    return g_mouse.high_precision_camera ? 1 : 0;
+}
+
+extern "C" void disruptor_high_precision_camera_set_enabled(int enabled) {
+    load_configuration();
+    const bool next = enabled != 0;
+    if (g_mouse.high_precision_camera == next) return;
+    g_mouse.high_precision_camera = next;
+    reset_presentation_residual();
+    refresh_live_control_state(next ? "settings-high-precision-on"
+                                    : "settings-high-precision-off");
+}
+
+extern "C" double disruptor_mouse_horizontal_sensitivity(void) {
+    load_configuration();
+    return g_mouse.horizontal_sensitivity;
+}
+
+extern "C" double disruptor_mouse_set_horizontal_sensitivity(
+        double sensitivity) {
+    load_configuration();
+    if (!std::isfinite(sensitivity)) return g_mouse.horizontal_sensitivity;
+    const double next = std::clamp(sensitivity,
+                                   kMinimumSensitivity,
+                                   kMaximumSensitivity);
+    if (g_mouse.horizontal_sensitivity == next)
+        return g_mouse.horizontal_sensitivity;
+    g_mouse.horizontal_sensitivity = next;
+    reset_presentation_residual();
+    log_event("settings-sensitivity");
+    return g_mouse.horizontal_sensitivity;
+}
+
+extern "C" int disruptor_mouse_invert_horizontal(void) {
+    load_configuration();
+    return g_mouse.invert_horizontal ? 1 : 0;
+}
+
+extern "C" void disruptor_mouse_set_invert_horizontal(int inverted) {
+    load_configuration();
+    const bool next = inverted != 0;
+    if (g_mouse.invert_horizontal == next) return;
+    g_mouse.invert_horizontal = next;
+    reset_presentation_residual();
+    log_event(next ? "settings-invert-x-on" : "settings-invert-x-off");
+}
+
+extern "C" int disruptor_mouse_captured(void) {
+    return g_mouse.captured ? 1 : 0;
+}
+
+extern "C" int disruptor_mouse_set_captured(int captured) {
+    load_configuration();
+    const bool next = captured != 0;
+    if (next && !g_mouse.mouse_aim_enabled &&
+        !g_mouse.modern_controls_enabled) {
+        return 0;
+    }
+    set_capture(next, next ? "settings-capture" : "settings-release");
+    if (next && g_mouse.captured) {
+        /* A host UI can restore capture from inside its SDL event callback.
+         * Synchronise the polled edge detectors with that same event so a
+         * still-held Escape or middle button cannot immediately release the
+         * newly restored capture in mouse_aim_frame(). */
+        const Uint8 *keys = SDL_GetKeyboardState(nullptr);
+        const uint32_t buttons = get_mouse_buttons();
+        g_mouse.escape_was_down =
+            keys && keys[SDL_SCANCODE_ESCAPE] != 0;
+        g_mouse.middle_was_down = (buttons & SDL_BUTTON_MMASK) != 0;
+    }
+    return g_mouse.captured == next ? 1 : 0;
+}
