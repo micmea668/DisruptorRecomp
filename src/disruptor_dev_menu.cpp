@@ -2,11 +2,12 @@
  * Host-side in-game settings and diagnostics menu for Disruptor.
  *
  * This overlay is deliberately outside the emulated PlayStation.  It draws
- * after the completed host presentation, never writes guest VRAM/RAM, and
- * calls only the narrow live-setting APIs exposed by the runtime and the
- * Disruptor input module.
+ * after the completed host presentation. Normal settings never write guest
+ * VRAM/RAM; the Cheats tab calls only the narrow, version-pinned Disruptor
+ * gameplay APIs whose save consequences are stated in the UI.
  */
 
+#include "disruptor_cheats.h"
 #include "disruptor_mouse_aim.h"
 #include "config_loader.h"
 #include "gpu.h"
@@ -40,6 +41,7 @@ struct DevMenuState {
     bool restore_mouse_capture = false;
     bool interpolation_apply_failed = false;
     bool base_keybinds_valid = false;
+    std::string cheat_status;
     std::array<SDL_Scancode, PSX_KB_COUNT> base_keybinds{};
 };
 
@@ -58,6 +60,9 @@ enum PreferenceDirty : uint32_t {
     PREF_VSYNC             = 1u << 7,
     PREF_INTERP_TARGET     = 1u << 8,
     PREF_INTERP_BLEND      = 1u << 9,
+    PREF_VERTICAL_LOOK     = 1u << 10,
+    PREF_VERTICAL_SENS     = 1u << 11,
+    PREF_INVERT_Y          = 1u << 12,
 };
 
 struct PreferenceState {
@@ -167,6 +172,24 @@ void mark_invert_x(bool value) {
     g_preferences.dirty |= PREF_INVERT_X;
 }
 
+void mark_vertical_look(bool value) {
+    g_preferences.pending.has_vertical_look = true;
+    g_preferences.pending.vertical_look = value;
+    g_preferences.dirty |= PREF_VERTICAL_LOOK;
+}
+
+void mark_vertical_sensitivity(double value) {
+    g_preferences.pending.has_vertical_sensitivity = true;
+    g_preferences.pending.vertical_sensitivity = value;
+    g_preferences.dirty |= PREF_VERTICAL_SENS;
+}
+
+void mark_invert_y(bool value) {
+    g_preferences.pending.has_invert_vertical = true;
+    g_preferences.pending.invert_vertical = value;
+    g_preferences.dirty |= PREF_INVERT_Y;
+}
+
 void mark_precise_camera(bool value) {
     g_preferences.pending.has_high_precision_camera = true;
     g_preferences.pending.high_precision_camera = value;
@@ -220,6 +243,18 @@ void merge_dirty_preferences(PSXRecompV4::UserSettings &settings) {
     if (g_preferences.dirty & PREF_INVERT_X) {
         settings.has_invert_horizontal = true;
         settings.invert_horizontal = pending.invert_horizontal;
+    }
+    if (g_preferences.dirty & PREF_VERTICAL_LOOK) {
+        settings.has_vertical_look = true;
+        settings.vertical_look = pending.vertical_look;
+    }
+    if (g_preferences.dirty & PREF_VERTICAL_SENS) {
+        settings.has_vertical_sensitivity = true;
+        settings.vertical_sensitivity = pending.vertical_sensitivity;
+    }
+    if (g_preferences.dirty & PREF_INVERT_Y) {
+        settings.has_invert_vertical = true;
+        settings.invert_vertical = pending.invert_vertical;
     }
     if (g_preferences.dirty & PREF_PRECISE_CAMERA) {
         settings.has_high_precision_camera = true;
@@ -300,6 +335,18 @@ void apply_saved_preferences(const PSXRecompV4::UserSettings &settings) {
         !env_override_present("PSX_DISRUPTOR_MOUSE_INVERT_X"))
         disruptor_mouse_set_invert_horizontal(
             settings.invert_horizontal ? 1 : 0);
+    if (settings.has_vertical_look &&
+        !env_override_present("PSX_DISRUPTOR_VERTICAL_LOOK"))
+        disruptor_mouse_set_vertical_look_enabled(
+            settings.vertical_look ? 1 : 0);
+    if (settings.has_vertical_sensitivity &&
+        !env_override_present("PSX_DISRUPTOR_MOUSE_SENSITIVITY_Y"))
+        (void)disruptor_mouse_set_vertical_sensitivity(
+            settings.vertical_sensitivity);
+    if (settings.has_invert_vertical &&
+        !env_override_present("PSX_DISRUPTOR_MOUSE_INVERT_Y"))
+        disruptor_mouse_set_invert_vertical(
+            settings.invert_vertical ? 1 : 0);
     if (settings.has_high_precision_camera &&
         !env_override_present("PSX_DISRUPTOR_HIGH_PRECISION_CAMERA"))
         disruptor_high_precision_camera_set_enabled(
@@ -338,6 +385,15 @@ void apply_pending_preferences() {
     if (g_preferences.dirty & PREF_INVERT_X)
         disruptor_mouse_set_invert_horizontal(
             pending.invert_horizontal ? 1 : 0);
+    if (g_preferences.dirty & PREF_VERTICAL_LOOK)
+        disruptor_mouse_set_vertical_look_enabled(
+            pending.vertical_look ? 1 : 0);
+    if (g_preferences.dirty & PREF_VERTICAL_SENS)
+        (void)disruptor_mouse_set_vertical_sensitivity(
+            pending.vertical_sensitivity);
+    if (g_preferences.dirty & PREF_INVERT_Y)
+        disruptor_mouse_set_invert_vertical(
+            pending.invert_vertical ? 1 : 0);
     if (g_preferences.dirty & PREF_PRECISE_CAMERA)
         disruptor_high_precision_camera_set_enabled(
             pending.high_precision_camera ? 1 : 0);
@@ -539,8 +595,42 @@ void draw_controls_tab() {
         mark_invert_x(invert_x);
     }
 
-    bool high_precision = disruptor_high_precision_camera_enabled() != 0;
     const bool exact_geometry = gpu_geometry_correction_enabled() != 0;
+    ImGui::SeparatorText("Vertical look");
+    bool vertical_look = disruptor_mouse_vertical_look_enabled() != 0;
+    if (ImGui::Checkbox("Vertical mouse look", &vertical_look)) {
+        disruptor_mouse_set_vertical_look_enabled(vertical_look ? 1 : 0);
+        mark_vertical_look(vertical_look);
+    }
+    draw_status_badge("EXPERIMENTAL", ImVec4(1.0f, 0.73f, 0.25f, 1.0f));
+
+    float vertical_sensitivity =
+        static_cast<float>(disruptor_mouse_vertical_sensitivity());
+    if (ImGui::SliderFloat("Vertical sensitivity", &vertical_sensitivity,
+                           0.005f, 2.0f, "%.3f",
+                           ImGuiSliderFlags_Logarithmic)) {
+        const double applied =
+            disruptor_mouse_set_vertical_sensitivity(vertical_sensitivity);
+        mark_vertical_sensitivity(applied);
+    }
+
+    bool invert_y = disruptor_mouse_invert_vertical() != 0;
+    if (ImGui::Checkbox("Invert vertical mouse", &invert_y)) {
+        disruptor_mouse_set_invert_vertical(invert_y ? 1 : 0);
+        mark_invert_y(invert_y);
+    }
+
+    const double pitch_units = disruptor_mouse_vertical_pitch();
+    if (pitch_units == 0.0) ImGui::BeginDisabled();
+    if (ImGui::Button("Recenter vertical view"))
+        disruptor_mouse_recenter_vertical();
+    if (pitch_units == 0.0) ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Text("Requested pitch: %+.2f deg", pitch_units * (360.0 / 256.0));
+    ImGui::TextDisabled(
+        "Range: +/-30.94 degrees. The original game has no pitch state.");
+    ImGui::SeparatorText("Camera presentation");
+    bool high_precision = disruptor_high_precision_camera_enabled() != 0;
     if (!exact_geometry) ImGui::BeginDisabled();
     if (ImGui::Checkbox("Sub-byte camera presentation", &high_precision)) {
         disruptor_high_precision_camera_set_enabled(high_precision ? 1 : 0);
@@ -652,6 +742,89 @@ void draw_enhancements_tab() {
         ImGui::TextDisabled("Interpolation owns presentation cadence and uses immediate swaps.");
 }
 
+const char *cheat_result_message(int result, const char *success) {
+    switch (result) {
+        case DISRUPTOR_CHEAT_OK:
+            return success;
+        case DISRUPTOR_CHEAT_GAME_NOT_READY:
+            return "Enter live gameplay before using this cheat.";
+        case DISRUPTOR_CHEAT_NETPLAY_BLOCKED:
+            return "Cheats are disabled during netplay.";
+        case DISRUPTOR_CHEAT_UNVERIFIED_STATE:
+            return "The game state did not match the verified USA executable; no changes were made.";
+        default:
+            return "The cheat request was rejected.";
+    }
+}
+
+void draw_cheats_tab() {
+    const bool netplay = disruptor_cheats_netplay_blocked() != 0;
+    const bool gameplay_ready = disruptor_cheats_gameplay_ready() != 0;
+
+    ImGui::TextWrapped(
+        "These are version-pinned gameplay cheats for testing and casual "
+        "play. They are never saved as port settings and start off on every "
+        "launch.");
+    if (netplay) {
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                           "Cheats are unavailable while netplay is active.");
+    } else if (!gameplay_ready) {
+        ImGui::TextDisabled("Enter live gameplay to enable cheats.");
+    }
+
+    ImGui::SeparatorText("Player");
+    bool god_mode = disruptor_cheats_god_mode_enabled() != 0;
+    const bool disable_god_control = !god_mode && (netplay || !gameplay_ready);
+    if (disable_god_control) ImGui::BeginDisabled();
+    if (ImGui::Checkbox("God mode", &god_mode)) {
+        const int result = disruptor_cheats_set_god_mode(god_mode ? 1 : 0);
+        g_menu.cheat_status = cheat_result_message(
+            result, god_mode ? "God mode enabled for this session."
+                             : "God mode disabled.");
+    }
+    if (disable_god_control) ImGui::EndDisabled();
+    draw_status_badge("SESSION", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
+    ImGui::TextDisabled(
+        "Neutralises player damage at the game's central damage routine. "
+        "A light hit cue remains, but saved health is not altered and the "
+        "game is not marked as cheated.");
+
+    ImGui::SeparatorText("Inventory");
+    if (netplay || !gameplay_ready) ImGui::BeginDisabled();
+    if (ImGui::Button("Grant all weapons + psionics"))
+        ImGui::OpenPopup("Confirm All Weapons");
+    if (netplay || !gameplay_ready) ImGui::EndDisabled();
+    ImGui::TextWrapped(
+        "This reproduces the retail All Weapons cheat: all weapons and "
+        "psionics are unlocked, ammunition and psionic energy are refilled, "
+        "and the current game is marked as cheated.");
+    ImGui::TextColored(ImVec4(1.0f, 0.73f, 0.25f, 1.0f),
+        "Important: the cheated marker affects the ending and is carried into "
+        "memory-card/password saves.");
+
+    bool popup_open = true;
+    if (ImGui::BeginPopupModal("Confirm All Weapons", &popup_open,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "Grant every weapon and psionic, refill their resources, and "
+            "mark this game (including later saves) as cheated?");
+        if (ImGui::Button("Grant and mark cheated")) {
+            const int result = disruptor_cheats_grant_all_weapons();
+            g_menu.cheat_status = cheat_result_message(
+                result, "All weapons, psionics and resources granted. Game marked as cheated.");
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    if (!g_menu.cheat_status.empty()) {
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", g_menu.cheat_status.c_str());
+    }
+}
+
 double coverage_percent(uint64_t accepted, uint64_t candidates) {
     return candidates ? (100.0 * static_cast<double>(accepted) /
                          static_cast<double>(candidates)) : 0.0;
@@ -712,7 +885,8 @@ void draw_diagnostics_tab() {
                 widescreen.present_native_43 ? "yes" : "no");
     ImGui::TextWrapped(
         "Diagnostics are read-only. Raw RAM, overlay and timing controls are "
-        "intentionally excluded from the normal in-game menu.");
+        "intentionally excluded; the separate Cheats tab exposes only audited "
+        "Disruptor-specific actions.");
 }
 
 void draw_system_tab() {
@@ -738,8 +912,9 @@ void draw_system_tab() {
     if (g_preferences.dirty && ImGui::Button("Save now"))
         (void)flush_preferences();
     ImGui::TextDisabled(
-        "Frame-interpolation activation, menu layout, mouse capture and "
-        "diagnostic counters are intentionally not persisted.");
+        "Frame-interpolation activation, current vertical pitch, menu layout, "
+        "mouse capture and diagnostic counters are intentionally not "
+        "persisted. Cheat controls also start off each launch.");
     ImGui::SeparatorText("Restart required");
     ImGui::BulletText("Renderer backend");
     ImGui::BulletText("Supersampling/internal framebuffer allocation");
@@ -771,6 +946,10 @@ void draw_menu() {
                 draw_enhancements_tab();
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Cheats")) {
+                draw_cheats_tab();
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("Diagnostics")) {
                 draw_diagnostics_tab();
                 ImGui::EndTabItem();
@@ -787,6 +966,8 @@ void draw_menu() {
 }
 
 void on_runtime_ready(void *, SDL_Window *window, int backend) {
+    disruptor_cheats_reset_session();
+    disruptor_mouse_recenter_vertical();
     g_menu.window = window;
     g_menu.backend = backend;
     load_preferences_for_session();
@@ -794,6 +975,8 @@ void on_runtime_ready(void *, SDL_Window *window, int backend) {
 }
 
 void on_runtime_shutdown(void *) {
+    disruptor_cheats_reset_session();
+    disruptor_mouse_recenter_vertical();
     (void)flush_preferences();
     if (disruptor_mouse_captured())
         (void)disruptor_mouse_set_captured(0);

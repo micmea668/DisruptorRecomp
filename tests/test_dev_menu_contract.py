@@ -59,6 +59,8 @@ main_cpp = read("psxrecomp-overlay/runtime/src/main.cpp")
 gl = read("psxrecomp-overlay/runtime/src/gpu_gl_renderer.c")
 menu = read("src/disruptor_dev_menu.cpp")
 mouse = read("src/disruptor_mouse_aim.cpp")
+cheats = read("src/disruptor_cheats.cpp")
+cheats_h = read("src/disruptor_cheats.h")
 config_h = read("psxrecomp-overlay/recompiler/src/config_loader.h")
 config_cpp = read("psxrecomp-overlay/recompiler/src/config_loader.cpp")
 run_ps1 = read("run.ps1")
@@ -73,6 +75,9 @@ require("v1.92.6.tar.gz" in cmake and
 require("src/disruptor_dev_menu.cpp" in cmake and
         "target_link_libraries(psx-runtime PRIVATE disruptor-imgui)" in cmake,
         "menu implementation must be linked only into the game runtime")
+require("src/disruptor_cheats.cpp" in cmake and
+        "tests/disruptor_cheats_test.cpp" in cmake,
+        "version-pinned cheats and their behavioral test must be built")
 require("+runtime/include/host_ui.h" in manifest,
         "new host UI ABI header must remain reviewed in the overlay manifest")
 
@@ -153,6 +158,7 @@ for token in (
     "SDL_SCANCODE_ESCAPE",
     'BeginTabItem("Controls")',
     'BeginTabItem("Enhancements")',
+    'BeginTabItem("Cheats")',
     'BeginTabItem("Diagnostics")',
     'BeginTabItem("System")',
     "gpu_geometry_correction_set",
@@ -187,11 +193,40 @@ require("psx_host_ui_game_input_captured()" in
         "mouse mod must cooperate with host menu input capture")
 
 for token in (
+    "disruptor_cheats_set_god_mode",
+    "disruptor_cheats_grant_all_weapons",
+    "Grant all weapons + psionics",
+    "marked as cheated",
+):
+    require(token in menu or token in cheats_h,
+            f"Cheats tab is missing {token}")
+require("psx_mod_register_function_entry_plugin" in cheats and
+        "0x80020DD8u" in cheats and "cpu->gpr[4] = 0u" in cheats,
+        "God mode must neutralise the audited central damage invocation")
+require("psx_netplay_active()" in cheats and
+        "psx_mod_game_started()" in cheats,
+        "cheats must fail closed outside gameplay and during netplay")
+require("SDL_" not in cheats and "sio_" not in cheats,
+        "cheat semantics must not synthesize host or guest input")
+for forbidden in ("has_god_mode", "has_all_weapons", "PREF_GOD", "PREF_CHEAT"):
+    require(forbidden not in config_h and forbidden not in config_cpp and
+            forbidden not in menu,
+            f"cheat setting must remain session-only: {forbidden}")
+require("disruptor_cheats_reset_session();" in
+        function_body(menu, "on_runtime_ready") and
+        "disruptor_cheats_reset_session();" in
+        function_body(menu, "on_runtime_shutdown"),
+        "cheat toggles must reset at both session boundaries")
+
+for token in (
     "has_frame_interpolation_blend",
     "has_mouse_aim",
     "has_modern_controls",
     "has_horizontal_sensitivity",
     "has_invert_horizontal",
+    "has_vertical_look",
+    "has_vertical_sensitivity",
+    "has_invert_vertical",
     "has_high_precision_camera",
     "has_geometry_correction",
     "has_perspective_textures",
@@ -214,6 +249,31 @@ require("load_preferences_for_session();" in
 require("apply_modern_keybinds(disruptor_modern_controls_enabled() != 0)" in
         function_body(menu, "apply_saved_preferences"),
         "saved or environment-enabled modern controls must install conflict-free binds")
+for token in (
+    "Vertical mouse look",
+    "Vertical sensitivity",
+    "Invert vertical mouse",
+    "Recenter vertical view",
+    "disruptor_mouse_set_vertical_look_enabled",
+    "disruptor_mouse_set_vertical_sensitivity",
+    "disruptor_mouse_set_invert_vertical",
+):
+    require(token in menu, f"vertical-look menu is missing {token}")
+for token in (
+    "PSX_DISRUPTOR_VERTICAL_LOOK",
+    "PSX_DISRUPTOR_MOUSE_SENSITIVITY_Y",
+    "PSX_DISRUPTOR_MOUSE_INVERT_Y",
+):
+    require(token in menu or token in mouse,
+            f"vertical settings precedence is missing {token}")
+require("take_relative_motion" in mouse and
+        mouse.count("take_relative_motion()") == 2,
+        "mouse X/Y must come from exactly one relative sample per frame")
+require("kMaximumPitchUnits = 22.0" in mouse and
+        "disruptor_vertical_camera_set_requested_pitch" in mouse and
+        "disruptor_vertical_camera_recenter" in mouse and
+        "disruptor_vertical_camera_input_allowed()" in mouse,
+        "vertical input must use the bounded camera/weapon-aim sink")
 shutdown_body = function_body(menu, "on_runtime_shutdown")
 require("flush_preferences();" in shutdown_body and
         shutdown_body.index("flush_preferences();") <
@@ -243,6 +303,14 @@ require("PSX_DISRUPTOR_MODERN_CONTROLS = if" not in run_ps1 and
         "PSX_TEXTURE_CORRECTION = if" not in run_ps1 and
         "$env:PSX_DISRUPTOR_MOUSE_AIM = '0'" not in run_ps1,
         "PowerShell must not synthesize disabling overrides for absent switches")
+require("[switch]$VerticalLook" in run_ps1 and
+        "PSX_DISRUPTOR_VERTICAL_LOOK" in run_ps1 and
+        "--vertical-look" in run_sh and
+        "PSX_DISRUPTOR_VERTICAL_LOOK=1" in run_sh,
+        "launchers must expose an explicit vertical-look opt-in")
+require("PSX_DISRUPTOR_VERTICAL_LOOK = if" not in run_ps1 and
+        "export PSX_DISRUPTOR_VERTICAL_LOOK=0" not in run_sh,
+        "launchers must not synthesize a disabling vertical override")
 require("export PSX_DISRUPTOR_MODERN_CONTROLS=$MODERN_CONTROLS" not in run_sh and
         "export PSX_DISRUPTOR_MOUSE_AIM=0" not in run_sh,
         "POSIX launcher must not synthesize disabling overrides")

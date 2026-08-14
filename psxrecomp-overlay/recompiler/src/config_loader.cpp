@@ -2408,6 +2408,27 @@ UserSettings load_user_settings(const fs::path& path) {
             s.invert_horizontal = toml::find<bool>(d, "invert_horizontal");
             s.has_invert_horizontal = true;
         });
+        if (d.contains("vertical_look")) try_get([&]{
+            s.vertical_look = toml::find<bool>(d, "vertical_look");
+            s.has_vertical_look = true;
+        });
+        if (d.contains("vertical_sensitivity")) try_get([&]{
+            double n = 0.0;
+            try {
+                n = toml::find<double>(d, "vertical_sensitivity");
+            } catch (const std::exception&) {
+                n = static_cast<double>(
+                    toml::find<int64_t>(d, "vertical_sensitivity"));
+            }
+            if (std::isfinite(n) && n >= 0.005 && n <= 2.0) {
+                s.vertical_sensitivity = n;
+                s.has_vertical_sensitivity = true;
+            }
+        });
+        if (d.contains("invert_vertical")) try_get([&]{
+            s.invert_vertical = toml::find<bool>(d, "invert_vertical");
+            s.has_invert_vertical = true;
+        });
         if (d.contains("high_precision_camera")) try_get([&]{
             s.high_precision_camera = toml::find<bool>(d, "high_precision_camera");
             s.has_high_precision_camera = true;
@@ -2586,6 +2607,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
 
     if (s.has_mouse_aim || s.has_modern_controls ||
         s.has_horizontal_sensitivity || s.has_invert_horizontal ||
+        s.has_vertical_look || s.has_vertical_sensitivity ||
+        s.has_invert_vertical ||
         s.has_high_precision_camera || s.has_geometry_correction ||
         s.has_perspective_textures) {
         f << "\n[disruptor]\n";
@@ -2603,6 +2626,18 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         }
         if (s.has_invert_horizontal)
             f << "invert_horizontal = " << (s.invert_horizontal ? "true" : "false") << "\n";
+        if (s.has_vertical_look)
+            f << "vertical_look = " << (s.vertical_look ? "true" : "false") << "\n";
+        if (s.has_vertical_sensitivity &&
+            std::isfinite(s.vertical_sensitivity) &&
+            s.vertical_sensitivity >= 0.005 &&
+            s.vertical_sensitivity <= 2.0) {
+            f << "vertical_sensitivity = "
+              << std::setprecision(std::numeric_limits<double>::max_digits10)
+              << s.vertical_sensitivity << "\n";
+        }
+        if (s.has_invert_vertical)
+            f << "invert_vertical = " << (s.invert_vertical ? "true" : "false") << "\n";
         if (s.has_high_precision_camera)
             f << "high_precision_camera = " << (s.high_precision_camera ? "true" : "false") << "\n";
         if (s.has_geometry_correction)

@@ -26,6 +26,7 @@
 #include "ws_cull_detect.h"
 #include "ws_aspect_cone_math.h"
 #include "ws_ui_group.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,6 +110,8 @@ static int      ws_geometry_correction = 0;
 static int      s_texture_correction_enabled = 0;
 static int      s_texture_correction_yaw_active = 0;
 static uint32_t s_texture_correction_triangles = 0;
+static double   s_geometry_camera_yaw_residual = 0.0;
+static int      s_geometry_camera_projection_center_y = 120;
 static uint64_t ws_geometry_world_triangles = 0;
 static uint64_t ws_geometry_precise_triangles = 0;
 static GpuGeometryCorrectionCounters s_geometry_diag_cumulative;
@@ -2386,10 +2389,8 @@ void gpu_geometry_correction_set(int enabled) {
     gte_precision_tracking_set(ws_geometry_correction ||
                                s_texture_correction_enabled);
     gr_set_geometry_correction(ws_geometry_correction);
-    if (!ws_geometry_correction) {
-        s_texture_correction_yaw_active = 0;
-        gr_set_presentation_yaw(0.0, 256.0, 160.0, 120.0, 160.0);
-    }
+    gpu_geometry_camera_yaw_residual_set(
+        s_geometry_camera_yaw_residual);
     ws_nw_sync_target();
 }
 
@@ -2446,12 +2447,13 @@ int gpu_geometry_correction_enabled(void) {
     return ws_geometry_correction;
 }
 
-void gpu_geometry_camera_yaw_residual_set(double yaw_units) {
+static void geometry_camera_presentation_update(void) {
     double center = (double)ws_disp_w() * 0.5;
     /* Keep Y relative to the drawing band. The GL backend adds its current
      * GP0(E5) draw offset after flushing the prior batch, so a framebuffer
      * switch after VBlank cannot leave the next frame on the old horizon. */
-    double center_y = (double)ws_disp_h() * 0.5;
+    const double center_y =
+        (double)s_geometry_camera_projection_center_y;
     double focal = center;
     if (ws_mode == 1 && ws_xden != 0)
         focal = focal * (double)ws_xnum / (double)ws_xden;
@@ -2460,9 +2462,36 @@ void gpu_geometry_camera_yaw_residual_set(double yaw_units) {
      * renderer-side denominator, keep the whole textured polygon affine. This
      * avoids a provoking-vertex decision mixing q=0 and q>0 at a screen edge. */
     s_texture_correction_yaw_active =
-        ws_geometry_correction && yaw_units != 0.0;
-    gr_set_presentation_yaw(ws_geometry_correction ? yaw_units : 0.0,
+        ws_geometry_correction &&
+        isfinite(s_geometry_camera_yaw_residual) &&
+        s_geometry_camera_yaw_residual != 0.0;
+    gr_set_presentation_yaw(ws_geometry_correction &&
+                                isfinite(s_geometry_camera_yaw_residual)
+                                ? s_geometry_camera_yaw_residual : 0.0,
                             256.0, center, center_y, focal);
+}
+
+void gpu_geometry_camera_yaw_residual_set(double yaw_units) {
+    s_geometry_camera_yaw_residual = yaw_units;
+    geometry_camera_presentation_update();
+}
+
+void gpu_geometry_camera_projection_center_y_set(double center_y) {
+    int next = 120;
+    if (isfinite(center_y) && center_y >= 24.0 && center_y <= 216.0)
+        next = (int)floor(center_y + 0.5);
+    if (next == s_geometry_camera_projection_center_y) return;
+
+    s_geometry_camera_projection_center_y = next;
+    /* Reissuing the current yaw lands renderer batches under the old horizon
+     * before the backend adopts the new one. This call is also intentional
+     * while correction is disabled: it stores the requested shared center but
+     * supplies an identity yaw to the presentation backend. */
+    geometry_camera_presentation_update();
+}
+
+int gpu_geometry_camera_projection_center_y_get(void) {
+    return s_geometry_camera_projection_center_y;
 }
 
 static void ws_clear_all_reveal_margins(void) {
@@ -2606,6 +2635,9 @@ static void gpu_reset_state(int clear_vram) {
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
     gr_set_draw_offset(draw_offset_x, draw_offset_y);
+    s_geometry_camera_yaw_residual = 0.0;
+    s_geometry_camera_projection_center_y = 120;
+    geometry_camera_presentation_update();
 }
 
 void gpu_init(void) {
@@ -5723,6 +5755,7 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
     gr_set_draw_offset(draw_offset_x, draw_offset_y);
+    geometry_camera_presentation_update();
     ws_nw_sync_target();
     return 1;
 }

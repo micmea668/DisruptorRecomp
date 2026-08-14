@@ -1513,6 +1513,43 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
 static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
                                   uint32_t *next_pc_out);
 
+#ifdef PSX_HAS_DISRUPTOR_VERTICAL_CAMERA
+extern void disruptor_vertical_camera_instruction_hook(
+    CPUState *cpu, uint32_t address, uint32_t instruction, int phase);
+
+static int disruptor_vertical_camera_site(uint32_t pc, uint32_t insn) {
+    switch (pc) {
+    case 0x8003AD54u: case 0x8003ADE4u: case 0x8003B140u:
+    case 0x8003B1ECu: case 0x8003B764u: case 0x8003B990u:
+    case 0x8003BDA4u: case 0x8003C4B4u: case 0x8003C99Cu:
+    case 0x8003D07Cu: case 0x8003F6B0u:
+        return insn == 0x34020078u;
+    case 0x8003D398u:
+        return insn == 0x34030078u;
+    case 0x8003B900u:
+        return insn == 0x0205102Au;
+    case 0x8003B90Cu:
+        return insn == 0x0202102Au;
+    case 0x8003BD14u:
+        return insn == 0x0206102Au;
+    case 0x8003BD20u:
+        return insn == 0x0202102Au;
+    case 0x8003CDB8u:
+        return insn == 0x0065102Au;
+    case 0x8003CDC4u:
+        return insn == 0x0062102Au;
+    case 0x8002E4B8u:
+        return insn == 0x92640022u;
+    case 0x8002EAF0u:
+        return insn == 0x92430020u;
+    case 0x8004279Cu:
+        return insn == 0x8FBF016Cu;
+    default:
+        return 0;
+    }
+}
+#endif
+
 static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
                             uint32_t *next_pc_out) {
     /* A load's writeback becomes visible to the instruction AFTER its delay
@@ -1567,6 +1604,12 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
     const uint32_t ld_before = is_ld ? cpu->gpr[ld_rt] : 0u;
 
     const int rv = exec_one_fetched_inner(cpu, pc, insn, next_pc_out);
+
+#ifdef PSX_HAS_DISRUPTOR_VERTICAL_CAMERA
+    if (disruptor_vertical_camera_site(pc, insn)) {
+        disruptor_vertical_camera_instruction_hook(cpu, pc, insn, 1);
+    }
+#endif
 
     if (is_ld) {
         const uint32_t loaded = cpu->gpr[ld_rt];

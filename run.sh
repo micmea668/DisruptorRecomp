@@ -9,6 +9,7 @@ DISC="$ROOT/input/Disruptor (USA).cue"
 [ -f "$DISC" ] || { echo "The full Disruptor BIN/CUE is required." >&2; exit 1; }
 
 MOUSE_AIM=0
+VERTICAL_LOOK=0
 MODERN_CONTROLS=0
 WIDESCREEN=0
 GEOMETRY_CORRECTION=0
@@ -16,26 +17,33 @@ PERSPECTIVE_TEXTURES=0
 for arg in "$@"; do
     case "$arg" in
         --mouse-aim)            MOUSE_AIM=1 ;;
+        --vertical-look)        VERTICAL_LOOK=1 ;;
         --modern-controls)      MODERN_CONTROLS=1; MOUSE_AIM=1 ;;
         --widescreen)           WIDESCREEN=1 ;;
         --geometry-correction)  GEOMETRY_CORRECTION=1 ;;
         --perspective-textures) PERSPECTIVE_TEXTURES=1; GEOMETRY_CORRECTION=1 ;;
         *)
-            echo "Usage: ./run.sh [--mouse-aim] [--modern-controls] [--widescreen] [--geometry-correction] [--perspective-textures]" >&2
+            echo "Usage: ./run.sh [--mouse-aim] [--vertical-look] [--modern-controls] [--widescreen] [--geometry-correction] [--perspective-textures]" >&2
             exit 2
             ;;
     esac
 done
 
 export PSX_DISRUPTOR_CONTROL_PROBE=0
-if [ "$MOUSE_AIM" -eq 1 ]; then
+if [ "$MOUSE_AIM" -eq 1 ] || [ "$VERTICAL_LOOK" -eq 1 ]; then
     [ -f "$ROOT/mouse-aim.ini" ] || {
         echo "mouse-aim.ini is missing." >&2
         exit 1
     }
-    export PSX_DISRUPTOR_MOUSE_AIM=1
     export PSX_FPS_TELEMETRY=0
-    echo "Mouse aim enabled: middle-click in gameplay to capture; middle-click or Esc releases."
+    echo "Mouse camera input enabled: middle-click in gameplay to capture; middle-click or Esc releases."
+fi
+if [ "$MOUSE_AIM" -eq 1 ]; then
+    export PSX_DISRUPTOR_MOUSE_AIM=1
+fi
+if [ "$VERTICAL_LOOK" -eq 1 ]; then
+    export PSX_DISRUPTOR_VERTICAL_LOOK=1
+    echo "Experimental vertical camera and weapon aim enabled."
 fi
 if [ "$MODERN_CONTROLS" -eq 1 ]; then
     export PSX_DISRUPTOR_MODERN_CONTROLS=1

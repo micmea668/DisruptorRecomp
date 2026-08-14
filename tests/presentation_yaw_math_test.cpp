@@ -53,6 +53,15 @@ int main() {
     expect(close(horizon.y, 120.0),
            "yaw reprojection preserves the projection horizon");
 
+    const ProjectedPoint shifted_horizon = project_xy(
+        300.0, 156.0, 0.75, true, 160.0, 156.0, 120.0);
+    expect(close(shifted_horizon.y, 156.0),
+           "yaw reprojection preserves a shifted projection horizon");
+    const ProjectedPoint above_shifted_horizon = project_xy(
+        300.0, 120.0, 0.75, true, 160.0, 156.0, 120.0);
+    expect(!close(above_shifted_horizon.y, 120.0),
+           "shifted horizon is consumed by the full-X/Y yaw transform");
+
     const ProjectedPoint edge = project_xy(300.0, 16.0, 0.75, true);
     expect(!close(edge.y, 16.0),
            "full yaw reprojection adjusts off-horizon Y at the screen edge");

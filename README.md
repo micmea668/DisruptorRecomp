@@ -26,6 +26,11 @@ No proprietary PlayStation BIOS is bundled or required.
   from 59.52 to 60.37 Hz, averaging 59.94 Hz.
 - Opt-in modern controls combine direct horizontal mouse turning with WASD,
   mouse fire/psionic buttons, and conventional keyboard action bindings.
+- Experimental vertical mouse look now shifts Disruptor's own projection
+  horizon through a version-pinned camera extension and applies the matching
+  slope to newly-created player projectiles. It is suspended during map,
+scripted-camera, inactive-player, replay, and netplay states; live gameplay
+validation is still pending.
 - An experimental projection-and-stretch 16:9 mode now widens Disruptor's
   upstream yaw frustum while preserving its original portal-coordinate domain.
   The HUD is corrected, and menus and movies remain pillarboxed.
@@ -162,6 +167,23 @@ For a texture-only A/B comparison that keeps corrected geometry enabled, omit
 affine automatically for HUD, sprites, invalid-depth vertices, and polygons
 without exact provenance.
 
+The first vertical-camera test should use:
+
+    .\run.ps1 -ModernControls -VerticalLook
+
+Mouse up looks up and mouse down looks down. The camera is deliberately limited
+to about +/-30.94 degrees. Native target-assisted aim remains authoritative;
+otherwise newly-created normal and psionic projectiles receive the same bounded
+vertical slope as the view. This is an experimental, game-specific extension:
+test room edges, actors near the top and bottom of the view, weapon fire, map,
+pause, death, scripted cameras, and a level transition before treating it as a
+finished control feature.
+
+Developer-only differential lockstep diagnostics temporarily freeze/suspend
+the extension so their compiled and interpreted halves compare the retail
+machine state symmetrically. The next ordinary render resumes the requested
+pitch.
+
 Enter gameplay, middle-click to capture, move left/right to turn, and
 middle-click or press Esc to release. Edit mouse-aim.ini to adjust sensitivity
 or invert the horizontal direction. The features can also be tested separately
@@ -189,29 +211,41 @@ controller input reaching the game, and restores the previous mouse-capture
 state when closed. Guest execution continues behind this first developer
 version of the menu.
 
-The Controls tab changes mouse aim, modern controls, horizontal sensitivity,
-horizontal inversion and the sub-byte camera presentation live. Enhancements
+The Controls tab changes horizontal mouse aim, modern controls, both axis
+sensitivities/inversion, experimental vertical look/recentering, and the
+sub-byte camera presentation live. Enhancements
 contains exact geometry, perspective textures, VSync and the experimental
 presentation-only frame interpolator. Diagnostics reports exact-geometry
 coverage, provenance misses, perspective-texture use, interpolation state and
-widescreen state. System records which renderer/audio/allocation settings still
-require a restart.
+widescreen state. Cheats provides a session-only God Mode and a confirmed
+one-shot retail All Weapons action. System records which
+renderer/audio/allocation settings still require a restart.
+
+God Mode intercepts the game's central player-damage routine without changing
+saved health; it starts off on every launch. **Grant all weapons + psionics**
+also refills their resources and deliberately reproduces the retail cheat
+consequence: the current game is marked as cheated, which changes the ending
+message and is carried into subsequent memory-card/password saves. The menu
+requires confirmation before applying that irreversible gameplay action.
 
 Reviewed live settings are persisted in the user-owned `settings.toml` beside
 the executable (the development build uses `build/settings.toml`). Saves merge
 only fields changed in the menu and publish through an atomic replacement, so
 an I/O failure leaves the previous file intact. Explicit launch switches or
 environment values override saved preferences for that run. Mouse aim, modern
-controls, sensitivity/inversion, sub-byte camera, exact geometry, perspective
-textures and VSync persist; the interpolator remembers target/blend but its
+controls, vertical-look enablement, both axis sensitivities/inversion,
+sub-byte camera, exact geometry, perspective textures and VSync persist; the
+current pitch does not. The interpolator remembers target/blend but its
 activation remains session-only because its current crossfade is too blurry
 for release. Menu layout/open state, mouse capture and diagnostics never
 persist.
 
 The overlay suspends the secondary interpolation presenter while visible so
-Dear ImGui always renders on the main OpenGL context; it never writes
-PlayStation RAM or VRAM. Configure with `-DDISRUPTOR_DEV_MENU=OFF` to omit the
-menu and its integrity-pinned Dear ImGui dependency.
+Dear ImGui always renders on the main OpenGL context. Normal settings do not
+write PlayStation RAM or VRAM; the Cheats tab is isolated behind narrow,
+version-pinned gameplay APIs with its save effects stated above. Configure with
+`-DDISRUPTOR_DEV_MENU=OFF` to omit the menu and its integrity-pinned Dear ImGui
+dependency.
 
 ## Mouse implementation
 
@@ -222,18 +256,26 @@ controller-derived turn delta directly to it.
 
 src/disruptor_mouse_aim.cpp converts relative host mouse X movement into that
 same yaw. It preserves fractional motion and lets the original camera,
-collision, movement, and renderer consume the result. The same opt-in hook can
-merge modern keyboard and mouse actions into the emulated digital pad after
-normal controller sampling, so a connected controller continues to work.
+collision, movement, and renderer consume the result. Mouse Y can independently
+drive a signed host pitch. Because the retail game has no pitch variable,
+src/disruptor_vertical_camera.cpp moves the shared 120-pixel projection horizon,
+patches only audited CPU screen-Y/culling results, and restores neutral GTE
+state after each world render. Exact PC and opcode guards cover the resident
+native and dirty-interpreter paths; zero pitch is an identity.
+
+The same quantised horizon supplies projectile slope, keeping unaided shots
+aligned with the centre of the view without changing horizontal speed. Native
+target-assisted aim is left untouched. New vertical input is ignored during
+scripted or non-gameplay views while the requested pitch is preserved, and the
+session starts centred. This remains experimental until its world-edge and
+full-campaign coverage has been exercised live.
 
 The modern layout is W/S forward/back, A/D strafe, Space jump, E use, F
 psionic, Q/R weapon/psionic selection, Tab map, P pause, left mouse fire, and
 right mouse psionic. Arrow keys and Enter remain menu fallbacks. Mouse actions
 only reach the game while the mouse is captured.
 
-The current module is horizontal only. Vertical look needs a separate
-game-specific camera and weapon-aim extension because the original game has no
-pitch state. Menu pointer support is also deferred.
+Menu pointer support is still deferred.
 
 ## Widescreen implementation
 
@@ -298,8 +340,8 @@ taint. Generated-code auditing, the focused fail-closed test, and all nine root
 CTests pass. The same-ramp retest almost eliminated the gaps; the user accepts
 the occasional tiny screen-edge sliver as a minor residual. The private
 five-mode comparison remains open.
-Later levels, save/load behavior, vertical look, and broader regression testing
-also remain open.
+Later levels, save/load behavior, live vertical-camera coverage, and broader
+regression testing also remain open.
 
 ## Development rules
 

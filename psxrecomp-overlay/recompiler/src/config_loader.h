@@ -1091,6 +1091,9 @@ struct UserSettings {
     bool has_modern_controls = false; bool modern_controls = false;
     bool has_horizontal_sensitivity = false; double horizontal_sensitivity = 0.1;
     bool has_invert_horizontal = false; bool invert_horizontal = false;
+    bool has_vertical_look = false; bool vertical_look = false;
+    bool has_vertical_sensitivity = false; double vertical_sensitivity = 0.08;
+    bool has_invert_vertical = false; bool invert_vertical = false;
     bool has_high_precision_camera = false; bool high_precision_camera = false;
     bool has_geometry_correction = false; bool geometry_correction = false;
     bool has_perspective_textures = false; bool perspective_textures = false;

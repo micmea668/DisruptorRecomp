@@ -114,6 +114,58 @@ static const DisruptorPrecisionCopySite *disruptor_precision_copy_site(
     return nullptr;
 }
 
+/* Disruptor has no architectural pitch state.  The project implements its
+ * opt-in vertical camera at a deliberately finite set of resident instruction
+ * sites: CPU-projected screen-Y centres, proven vertical participation tests,
+ * the two projectile-construction convergence points, and the common renderer
+ * epilogue.  Every complete instruction word is pinned so a different retail
+ * revision fails generation instead of silently modifying unrelated code.
+ *
+ * The generated callback is appended after the vanilla instruction.  At zero
+ * pitch it is an exact no-op; the runtime callback decodes the pinned word to
+ * identify the destination register or the required post-instruction action. */
+struct DisruptorVerticalCameraSite {
+    uint32_t pc;
+    uint32_t instruction;
+};
+
+static const DisruptorVerticalCameraSite kDisruptorVerticalCameraSites[] = {
+    /* CPU world projection centres (ORI rt,zero,120). */
+    {0x8003AD54u, 0x34020078u},
+    {0x8003ADE4u, 0x34020078u},
+    {0x8003B140u, 0x34020078u},
+    {0x8003B1ECu, 0x34020078u},
+    {0x8003B764u, 0x34020078u},
+    {0x8003B990u, 0x34020078u},
+    {0x8003BDA4u, 0x34020078u},
+    {0x8003C4B4u, 0x34020078u},
+    {0x8003C99Cu, 0x34020078u},
+    {0x8003D07Cu, 0x34020078u},
+    {0x8003D398u, 0x34030078u},
+    {0x8003F6B0u, 0x34020078u},
+    /* Proven camera-vertical object participation pairs. */
+    {0x8003B900u, 0x0205102Au},
+    {0x8003B90Cu, 0x0202102Au},
+    {0x8003BD14u, 0x0206102Au},
+    {0x8003BD20u, 0x0202102Au},
+    {0x8003CDB8u, 0x0065102Au},
+    {0x8003CDC4u, 0x0062102Au},
+    /* Normal-weapon and psionic construction convergence loads. */
+    {0x8002E4B8u, 0x92640022u},
+    {0x8002EAF0u, 0x92430020u},
+    /* Common renderer epilogue: restore the neutral projection horizon. */
+    {0x8004279Cu, 0x8FBF016Cu},
+};
+
+static const DisruptorVerticalCameraSite *disruptor_vertical_camera_site(
+        uint32_t address) {
+    for (const DisruptorVerticalCameraSite &site :
+         kDisruptorVerticalCameraSites) {
+        if (site.pc == address) return &site;
+    }
+    return nullptr;
+}
+
 static bool codegen_cycle_per_insn() {
     // DEFAULT ON for the faithful-timing (cycle-audit) branch: each instruction
     // charges its cost at its own site, so the running cycle count is correct
@@ -909,6 +961,19 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     }
 
     std::string code;
+
+    const DisruptorVerticalCameraSite *vertical_camera_site =
+        disruptor_vertical_camera_site(addr);
+    if (vertical_camera_site &&
+        instr != vertical_camera_site->instruction) {
+        if (!config_.overlay_mode) {
+            throw std::runtime_error(fmt::format(
+                "Disruptor vertical-camera site 0x{:08X} expected word "
+                "0x{:08X}, found 0x{:08X}",
+                addr, vertical_camera_site->instruction, instr));
+        }
+        vertical_camera_site = nullptr;
+    }
 
     // Full-word-guarded terrain-frustum half-angle constants. Scaling the
     // tangent is the geometric counterpart of widening the horizontal
@@ -1963,6 +2028,13 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             default:
                 code = fmt::format("/* TODO: opcode=0x{:02X} */", opcode);
         }
+    }
+
+    if (vertical_camera_site) {
+        code += fmt::format(
+            " disruptor_vertical_camera_instruction_hook(cpu, "
+            "0x{:08X}u, 0x{:08X}u, 1);",
+            addr, instr);
     }
 
     return config_.indent + code + comment;
@@ -3357,6 +3429,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "#endif\n";
     ss << "extern int  psx_datashard_enter(CPUState* cpu, uint32_t key);  /* data-shard replay/capture (data_shards.c) */\n";
     ss << "extern void psx_mod_function_entry(CPUState* cpu, uint32_t address);  /* trusted opt-in game-mod hook */\n";
+    ss << "extern void disruptor_vertical_camera_instruction_hook(CPUState* cpu, uint32_t address, uint32_t instruction, int phase);  /* version-pinned vertical-camera seam */\n";
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
     ss << "extern int  psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func, uint32_t counter_addr, uint32_t gpustat_ptr_addr, uint32_t timer1_ptr_addr, uint32_t timer1_cache_addr);  /* load_accel.c */\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";

@@ -122,6 +122,11 @@ void gpu_set_screen_kind(int kind);
 void gpu_geometry_correction_set(int enabled);
 int  gpu_geometry_correction_enabled(void);
 void gpu_geometry_camera_yaw_residual_set(double yaw_units);
+/* Display-relative projection horizon shared with the optional presentation
+ * yaw homography. Values are rounded to an integer pixel; non-finite or
+ * out-of-range values reset the horizon to the 240-line default of 120. */
+void gpu_geometry_camera_projection_center_y_set(double center_y);
+int  gpu_geometry_camera_projection_center_y_get(void);
 void gpu_geometry_correction_stats(uint64_t *world_triangles,
                                    uint64_t *precise_triangles);
 

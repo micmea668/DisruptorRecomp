@@ -1,5 +1,6 @@
 param(
     [switch]$MouseAim,
+    [switch]$VerticalLook,
     [switch]$ModernControls,
     [switch]$Widescreen,
     [switch]$GeometryCorrection,
@@ -21,11 +22,11 @@ if (!(Test-Path $Disc)) {
     throw "The full Disruptor BIN/CUE is required. Expected: input/Disruptor (USA).cue"
 }
 
-if ($MouseAim -or $ModernControls) {
+if ($MouseAim -or $VerticalLook -or $ModernControls) {
     if (!(Test-Path (Join-Path $Root 'mouse-aim.ini'))) {
         throw 'mouse-aim.ini is missing.'
     }
-    Write-Host 'Mouse aim enabled: middle-click in gameplay to capture; middle-click or Esc releases.'
+    Write-Host 'Mouse camera input enabled: middle-click in gameplay to capture; middle-click or Esc releases.'
 }
 
 $RuntimeDirectory = Split-Path -Parent $Runtime
@@ -44,6 +45,9 @@ if ($Widescreen) {
 if ($ModernControls) {
     Write-Host 'Modern controls enabled: WASD, LMB fire, RMB psionic, Space jump, E use.'
 }
+if ($VerticalLook) {
+    Write-Host 'Experimental vertical camera and weapon aim enabled.'
+}
 if ($GeometryCorrection -or $PerspectiveTextures) {
     Write-Host 'Exact-provenance presentation geometry enabled.'
 }
@@ -58,8 +62,13 @@ $EnvironmentOverrides = @{
 if ($ModernControls) {
     $EnvironmentOverrides['PSX_DISRUPTOR_MODERN_CONTROLS'] = '1'
 }
+if ($VerticalLook) {
+    $EnvironmentOverrides['PSX_DISRUPTOR_VERTICAL_LOOK'] = '1'
+}
 if ($MouseAim -or $ModernControls) {
     $EnvironmentOverrides['PSX_DISRUPTOR_MOUSE_AIM'] = '1'
+}
+if ($MouseAim -or $VerticalLook -or $ModernControls) {
     $EnvironmentOverrides['PSX_FPS_TELEMETRY'] = '0'
 }
 if ($GeometryCorrection -or $PerspectiveTextures) {

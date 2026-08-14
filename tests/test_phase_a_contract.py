@@ -115,8 +115,25 @@ def main() -> int:
     require("PSX_GEOMETRY_COVERAGE_TINT" in gl,
             "coverage tint must have an independent opt-in")
     yaw_set = function_body(gpu, "gpu_geometry_camera_yaw_residual_set")
-    require("ws_disp_h()" in yaw_set and "draw_offset_y" not in yaw_set,
-            "the yaw API must retain a display-relative Y center")
+    require("s_geometry_camera_yaw_residual = yaw_units" in yaw_set and
+            "geometry_camera_presentation_update()" in yaw_set,
+            "the yaw API must retain residual state for horizon changes")
+    horizon_set = function_body(
+        gpu, "gpu_geometry_camera_projection_center_y_set")
+    require("isfinite(center_y)" in horizon_set and
+            "center_y >= 24.0" in horizon_set and
+            "center_y <= 216.0" in horizon_set and
+            "next = 120" in horizon_set,
+            "the projection horizon must fail closed to the 240-line default")
+    require("floor(center_y + 0.5)" in horizon_set and
+            "geometry_camera_presentation_update()" in horizon_set,
+            "horizon changes must be integer-exact and flush through yaw state")
+    presentation_update = function_body(
+        gpu, "geometry_camera_presentation_update")
+    require("s_geometry_camera_projection_center_y" in presentation_update and
+            "gr_set_presentation_yaw" in presentation_update and
+            "draw_offset_y" not in presentation_update,
+            "yaw must share the display-relative effective projection horizon")
     uniforms = function_body(gl, "geometry_visual_uniforms")
     require("s_off_y + s_yaw_center_y_relative" in uniforms,
             "each flushed GL batch must use its active framebuffer horizon")
@@ -128,7 +145,9 @@ def main() -> int:
     require("gr_set_draw_offset(draw_offset_x, draw_offset_y)" in snapshot,
             "savestate restore must resynchronize the renderer's Y horizon")
     reset = function_body(gpu, "gpu_reset_state")
-    require("gr_set_draw_offset(draw_offset_x, draw_offset_y)" in reset,
+    require("gr_set_draw_offset(draw_offset_x, draw_offset_y)" in reset and
+            "s_geometry_camera_projection_center_y = 120" in reset and
+            "geometry_camera_presentation_update()" in reset,
             "GPU reset must resynchronize the renderer's Y horizon")
 
     # Diagnostics must be versioned, presentation-scoped, and sufficiently

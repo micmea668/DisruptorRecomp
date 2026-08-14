@@ -135,6 +135,30 @@ PRECISION_SCRATCH_STORE_SITES = {
     0x80047A0C: 0xACAA0004,
 }
 
+VERTICAL_CAMERA_SITES = {
+    0x8003AD54: 0x34020078,
+    0x8003ADE4: 0x34020078,
+    0x8003B140: 0x34020078,
+    0x8003B1EC: 0x34020078,
+    0x8003B764: 0x34020078,
+    0x8003B990: 0x34020078,
+    0x8003BDA4: 0x34020078,
+    0x8003C4B4: 0x34020078,
+    0x8003C99C: 0x34020078,
+    0x8003D07C: 0x34020078,
+    0x8003D398: 0x34030078,
+    0x8003F6B0: 0x34020078,
+    0x8003B900: 0x0205102A,
+    0x8003B90C: 0x0202102A,
+    0x8003BD14: 0x0206102A,
+    0x8003BD20: 0x0202102A,
+    0x8003CDB8: 0x0065102A,
+    0x8003CDC4: 0x0062102A,
+    0x8002E4B8: 0x92640022,
+    0x8002EAF0: 0x92430020,
+    0x8004279C: 0x8FBF016C,
+}
+
 # Tests 4-6 widened Disruptor's portal spans into negative X.  Its static-world
 # renderer was authored around unsigned 0..320 spans, and yaw-dependent portal
 # selection became unstable.  Test 7 instead keeps every portal/outcode bound
@@ -316,6 +340,31 @@ def main() -> int:
         HORIZONTAL_SIDE_PLANE_SITES
     ):
         failures.append("unexpected horizontal side-plane helper call count")
+
+    vertical_camera_matches = re.findall(
+        r"disruptor_vertical_camera_instruction_hook\(cpu, "
+        r"0x([0-9A-F]{8})u, 0x([0-9A-F]{8})u, 1\)",
+        shard_text,
+    )
+    generated_vertical_camera_sites = {
+        int(address, 16): int(word, 16)
+        for address, word in vertical_camera_matches
+    }
+    if (generated_vertical_camera_sites != VERTICAL_CAMERA_SITES or
+            len(vertical_camera_matches) != len(VERTICAL_CAMERA_SITES)):
+        failures.append(
+            "reviewed vertical-camera hooks differ: expected "
+            + str(VERTICAL_CAMERA_SITES)
+            + ", found "
+            + str(generated_vertical_camera_sites)
+        )
+    renderer_entry_hook = (
+        "psx_mod_function_entry(cpu, 0x80040E68u)"
+    )
+    if shard_text.count(renderer_entry_hook) != 1:
+        failures.append(
+            "expected exactly one vertical-camera renderer entry hook"
+        )
 
     precision_mfc2_matches = re.findall(
         r"gte_precision_mfc2_pc_read\(0x([0-9A-F]{8})u, "

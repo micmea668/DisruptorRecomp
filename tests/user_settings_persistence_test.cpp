@@ -51,6 +51,12 @@ int main() {
         written.horizontal_sensitivity = 0.125;
         written.has_invert_horizontal = true;
         written.invert_horizontal = true;
+        written.has_vertical_look = true;
+        written.vertical_look = true;
+        written.has_vertical_sensitivity = true;
+        written.vertical_sensitivity = 0.2;
+        written.has_invert_vertical = true;
+        written.invert_vertical = true;
         written.has_high_precision_camera = true;
         written.high_precision_camera = true;
         written.has_geometry_correction = true;
@@ -79,6 +85,10 @@ int main() {
                     loaded.has_horizontal_sensitivity &&
                     loaded.horizontal_sensitivity == 0.125 &&
                     loaded.has_invert_horizontal && loaded.invert_horizontal &&
+                    loaded.has_vertical_look && loaded.vertical_look &&
+                    loaded.has_vertical_sensitivity &&
+                    loaded.vertical_sensitivity == 0.2 &&
+                    loaded.has_invert_vertical && loaded.invert_vertical &&
                     loaded.has_high_precision_camera &&
                     loaded.high_precision_camera &&
                     loaded.has_geometry_correction &&
@@ -112,6 +122,9 @@ int main() {
             out << "[disruptor]\n"
                    "mouse_aim = false\n"
                    "horizontal_sensitivity = 99.0\n"
+                   "vertical_look = true\n"
+                   "vertical_sensitivity = -1.0\n"
+                   "invert_vertical = true\n"
                    "geometry_correction = false\n"
                    "perspective_textures = true\n";
         }
@@ -119,6 +132,9 @@ int main() {
         require(!tolerant.parse_error && tolerant.has_mouse_aim &&
                     !tolerant.mouse_aim &&
                     !tolerant.has_horizontal_sensitivity &&
+                    tolerant.has_vertical_look && tolerant.vertical_look &&
+                    !tolerant.has_vertical_sensitivity &&
+                    tolerant.has_invert_vertical && tolerant.invert_vertical &&
                     tolerant.has_geometry_correction &&
                     !tolerant.geometry_correction &&
                     tolerant.has_perspective_textures &&

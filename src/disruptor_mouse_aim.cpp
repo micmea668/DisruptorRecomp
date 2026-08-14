@@ -7,8 +7,10 @@
  * adds a signed controller-derived step to this byte; renderer, collision and
  * camera code then consume it through the game's own sine/cosine tables.
  *
- * This opt-in mod applies relative host mouse motion to the same yaw byte after
- * each guest input/update frame.  A second opt-in path merges a conventional
+ * This opt-in mod applies relative host mouse X motion to the same yaw byte
+ * after each guest input/update frame.  Disruptor has no retail pitch state,
+ * so independently enabled mouse Y motion drives a bounded host-side camera
+ * and weapon-aim extension.  A third opt-in path merges a conventional
  * WASD/mouse layout into the emulated port-1 digital pad after the runtime's
  * low-latency input sample.  The runtime keeps a dormant frame hook available
  * for live menu changes; normal play pays only one immediate return unless one
@@ -17,6 +19,7 @@
 
 #include "psx_sdl.h"
 #include "disruptor_mouse_aim.h"
+#include "disruptor_vertical_camera.h"
 #include "../psxrecomp-overlay/runtime/include/gpu.h"
 
 #include <algorithm>
@@ -40,14 +43,20 @@ extern "C" int ws_nw_extra(void);
 extern "C" void gpu_geometry_camera_yaw_residual_set(double yaw_units);
 extern "C" SDL_Window *sdl_window;
 extern "C" int psx_host_ui_game_input_captured(void);
+extern "C" int psx_netplay_active(void);
 
 namespace {
 
 constexpr uint32_t kPlayerYawAddress = 0x80077624u;
 constexpr double kDefaultHorizontalSensitivity = 0.080;
+constexpr double kDefaultVerticalSensitivity = 0.080;
 constexpr double kMinimumSensitivity = 0.005;
 constexpr double kMaximumSensitivity = 2.000;
 constexpr double kMaximumMotionPerFrame = 1024.0;
+/* The native projectile vertical component is bounded to a slope of 160/256.
+ * Twenty-two angular units (30.94 degrees) remain just inside that envelope
+ * and keep the initial presentation horizon on-screen. */
+constexpr double kMaximumPitchUnits = 22.0;
 
 /* PS1 digital-pad bits are active-low: clearing a bit presses it. */
 constexpr uint16_t kPadSelect   = 1u << 0;
@@ -68,6 +77,7 @@ constexpr uint16_t kPadSquare   = 1u << 15;
 struct MouseAimState {
     bool enabled = false;
     bool mouse_aim_enabled = false;
+    bool vertical_look_enabled = false;
     bool modern_controls_enabled = false;
     bool high_precision_camera = false;
     bool configured = false;
@@ -75,12 +85,17 @@ struct MouseAimState {
     bool middle_was_down = false;
     bool escape_was_down = false;
     bool invert_horizontal = false;
+    bool invert_vertical = false;
     double horizontal_sensitivity = kDefaultHorizontalSensitivity;
+    double vertical_sensitivity = kDefaultVerticalSensitivity;
     double fractional_yaw = 0.0;
+    double vertical_pitch = 0.0;
     uint64_t frame = 0;
     uint64_t motion_samples = 0;
     double interval_mouse_x = 0.0;
+    double interval_mouse_y = 0.0;
     int64_t interval_yaw_steps = 0;
+    double interval_pitch_delta = 0.0;
     uint16_t interval_modern_press_mask = 0;
     std::FILE *log = nullptr;
 };
@@ -153,6 +168,11 @@ void load_configuration() {
                 parse_sensitivity(value, g_mouse.horizontal_sensitivity);
         } else if (key == "invert_horizontal") {
             g_mouse.invert_horizontal = parse_bool(value, g_mouse.invert_horizontal);
+        } else if (key == "vertical_sensitivity") {
+            g_mouse.vertical_sensitivity =
+                parse_sensitivity(value, g_mouse.vertical_sensitivity);
+        } else if (key == "invert_vertical") {
+            g_mouse.invert_vertical = parse_bool(value, g_mouse.invert_vertical);
         }
     }
 
@@ -162,6 +182,13 @@ void load_configuration() {
     }
     if (const char *value = std::getenv("PSX_DISRUPTOR_MOUSE_INVERT_X")) {
         g_mouse.invert_horizontal = parse_bool(value, g_mouse.invert_horizontal);
+    }
+    if (const char *value = std::getenv("PSX_DISRUPTOR_MOUSE_SENSITIVITY_Y")) {
+        g_mouse.vertical_sensitivity =
+            parse_sensitivity(value, g_mouse.vertical_sensitivity);
+    }
+    if (const char *value = std::getenv("PSX_DISRUPTOR_MOUSE_INVERT_Y")) {
+        g_mouse.invert_vertical = parse_bool(value, g_mouse.invert_vertical);
     }
 }
 
@@ -179,23 +206,31 @@ void open_log() {
     g_mouse.log = std::fopen("disruptor-mouse-aim.log", "wb");
     if (!g_mouse.log) return;
     std::fprintf(g_mouse.log,
-                 "DISRUPTOR MODERN CONTROLS AND HORIZONTAL MOUSE AIM v2\n"
+                 "DISRUPTOR MODERN CONTROLS AND MOUSE CAMERA v3\n"
                  "yaw_address=0x%08X\n"
                  "mouse_aim=%s\n"
+                 "vertical_look=%s\n"
                  "modern_controls=%s\n"
                  "high_precision_camera=%s\n"
                  "horizontal_sensitivity=%.6f\n"
                  "invert_horizontal=%s\n"
+                 "vertical_sensitivity=%.6f\n"
+                 "invert_vertical=%s\n"
+                 "vertical_pitch_limit=%.6f\n"
                  "capture=middle-click release=middle-click-or-escape\n"
                  "keyboard=W/S:forward/back A/D:strafe Space:jump E:use "
                  "F:psionic Q:weapon R:psionic-select Tab:map P:pause\n"
                  "mouse=left:fire right:psionic X1:weapon X2:psionic-select\n",
                  kPlayerYawAddress,
                  g_mouse.mouse_aim_enabled ? "true" : "false",
+                 g_mouse.vertical_look_enabled ? "true" : "false",
                  g_mouse.modern_controls_enabled ? "true" : "false",
                  g_mouse.high_precision_camera ? "true" : "false",
                  g_mouse.horizontal_sensitivity,
-                 g_mouse.invert_horizontal ? "true" : "false");
+                 g_mouse.invert_horizontal ? "true" : "false",
+                 g_mouse.vertical_sensitivity,
+                 g_mouse.invert_vertical ? "true" : "false",
+                 kMaximumPitchUnits);
     std::fflush(g_mouse.log);
 }
 
@@ -240,22 +275,28 @@ void discard_relative_motion() {
 #endif
 }
 
-double take_relative_x() {
+struct RelativeMotion {
+    double x = 0.0;
+    double y = 0.0;
+};
+
+RelativeMotion take_relative_motion() {
 #if defined(PSX_SDL3)
     float x = 0.0f;
     float y = 0.0f;
     (void)SDL_GetRelativeMouseState(&x, &y);
-    return static_cast<double>(x);
+    return {static_cast<double>(x), static_cast<double>(y)};
 #else
     int x = 0;
     int y = 0;
     (void)SDL_GetRelativeMouseState(&x, &y);
-    return static_cast<double>(x);
+    return {static_cast<double>(x), static_cast<double>(y)};
 #endif
 }
 
 void set_capture(bool captured, const char *reason) {
     if (captured && !g_mouse.mouse_aim_enabled &&
+        !g_mouse.vertical_look_enabled &&
         !g_mouse.modern_controls_enabled) {
         return;
     }
@@ -278,7 +319,7 @@ void set_capture(bool captured, const char *reason) {
     if (captured) {
         set_title(g_mouse.modern_controls_enabled
             ? "CAPTURED - LMB fire, RMB psionic; middle-click or Esc releases"
-            : "CAPTURED - move to turn; middle-click or Esc releases");
+            : "CAPTURED - move to aim; middle-click or Esc releases");
     } else {
         set_title("released - middle-click in live gameplay to capture");
     }
@@ -349,6 +390,29 @@ void apply_mouse_x(double raw_x) {
     ++g_mouse.motion_samples;
     g_mouse.interval_mouse_x += raw_x;
     g_mouse.interval_yaw_steps += yaw_steps;
+}
+
+void reset_vertical_pitch(const char *event) {
+    g_mouse.vertical_pitch = 0.0;
+    disruptor_vertical_camera_recenter();
+    if (event) log_event(event);
+}
+
+void apply_mouse_y(double raw_y) {
+    if (raw_y == 0.0) return;
+    raw_y = std::clamp(raw_y, -kMaximumMotionPerFrame,
+                       kMaximumMotionPerFrame);
+    const double direction = g_mouse.invert_vertical ? 1.0 : -1.0;
+    const double old_pitch = g_mouse.vertical_pitch;
+    const double new_pitch = std::clamp(
+        old_pitch + raw_y * g_mouse.vertical_sensitivity * direction,
+        -kMaximumPitchUnits, kMaximumPitchUnits);
+
+    g_mouse.interval_mouse_y += raw_y;
+    g_mouse.interval_pitch_delta += new_pitch - old_pitch;
+    if (new_pitch == old_pitch) return;
+    g_mouse.vertical_pitch = new_pitch;
+    disruptor_vertical_camera_set_requested_pitch(new_pitch);
 }
 
 void log_u64_array(std::FILE *log, const char *key,
@@ -461,6 +525,10 @@ void mouse_aim_frame() {
     load_configuration();
     open_log();
 
+    const bool vertical_netplay_blocked = psx_netplay_active() != 0;
+    if (vertical_netplay_blocked && g_mouse.vertical_pitch != 0.0)
+        reset_vertical_pitch("netplay-vertical-recenter");
+
     /* The host menu consumes polled state as well as SDL events.  Keep the
      * edge detectors current so a button held while closing cannot toggle
      * capture or inject a guest action on the following frame. */
@@ -501,10 +569,18 @@ void mouse_aim_frame() {
     g_mouse.escape_was_down = escape_down;
 
     apply_modern_controls(keys, buttons);
-    if (g_mouse.captured && g_mouse.mouse_aim_enabled)
-        apply_mouse_x(take_relative_x());
-    else if (g_mouse.captured)
+    if (g_mouse.captured &&
+        (g_mouse.mouse_aim_enabled || g_mouse.vertical_look_enabled)) {
+        /* SDL drains both relative axes in one call.  Keep this a single
+         * coherent sample so enabling one axis can never consume the other. */
+        const RelativeMotion motion = take_relative_motion();
+        if (g_mouse.mouse_aim_enabled) apply_mouse_x(motion.x);
+        if (g_mouse.vertical_look_enabled && !vertical_netplay_blocked &&
+            disruptor_vertical_camera_input_allowed())
+            apply_mouse_y(motion.y);
+    } else if (g_mouse.captured) {
         discard_relative_motion();
+    }
 
     /* The retail yaw byte remains authoritative for gameplay.  The sub-byte
      * remainder is presentation metadata only, consumed by the independent
@@ -526,7 +602,8 @@ void mouse_aim_frame() {
             &geometry_diagnostics,
             static_cast<uint32_t>(sizeof(geometry_diagnostics)));
         std::fprintf(g_mouse.log,
-                     "sample frame=%llu captured=%s mouse_x=%.3f yaw_steps=%lld "
+                     "sample frame=%llu captured=%s mouse_x=%.3f mouse_y=%.3f "
+                     "yaw_steps=%lld pitch_delta=%.6f pitch=%.6f "
                      "yaw=0x%02X yaw_residual=%.6f motion_samples=%llu "
                       "modern_press_mask=0x%04X geometry_world=%llu "
                       "geometry_precise=%llu "
@@ -536,7 +613,10 @@ void mouse_aim_frame() {
                      static_cast<unsigned long long>(g_mouse.frame),
                      g_mouse.captured ? "true" : "false",
                      g_mouse.interval_mouse_x,
+                     g_mouse.interval_mouse_y,
                      static_cast<long long>(g_mouse.interval_yaw_steps),
+                     g_mouse.interval_pitch_delta,
+                     g_mouse.vertical_pitch,
                      static_cast<unsigned>(psx_read_byte(kPlayerYawAddress)),
                      g_mouse.fractional_yaw,
                      static_cast<unsigned long long>(g_mouse.motion_samples),
@@ -555,7 +635,9 @@ void mouse_aim_frame() {
             geometry_diagnostics.latest_live);
         std::fflush(g_mouse.log);
         g_mouse.interval_mouse_x = 0.0;
+        g_mouse.interval_mouse_y = 0.0;
         g_mouse.interval_yaw_steps = 0;
+        g_mouse.interval_pitch_delta = 0.0;
         g_mouse.interval_modern_press_mask = 0;
     }
 }
@@ -564,11 +646,14 @@ struct MouseAimRegistration {
     MouseAimRegistration() {
         g_mouse.mouse_aim_enabled =
             env_enabled("PSX_DISRUPTOR_MOUSE_AIM");
+        g_mouse.vertical_look_enabled =
+            env_enabled("PSX_DISRUPTOR_VERTICAL_LOOK");
         g_mouse.modern_controls_enabled =
             env_enabled("PSX_DISRUPTOR_MODERN_CONTROLS");
         g_mouse.high_precision_camera =
             env_enabled("PSX_DISRUPTOR_HIGH_PRECISION_CAMERA");
         g_mouse.enabled = g_mouse.mouse_aim_enabled ||
+                          g_mouse.vertical_look_enabled ||
                           g_mouse.modern_controls_enabled ||
                           g_mouse.high_precision_camera;
         /* Keep one dormant hook installed even when every launch-time option
@@ -591,6 +676,7 @@ void reset_presentation_residual() {
 
 void refresh_live_control_state(const char *event) {
     g_mouse.enabled = g_mouse.mouse_aim_enabled ||
+                      g_mouse.vertical_look_enabled ||
                       g_mouse.modern_controls_enabled ||
                       g_mouse.high_precision_camera;
 
@@ -605,6 +691,7 @@ void refresh_live_control_state(const char *event) {
     /* Relative capture is only meaningful for the two input features.  Do
      * not leave the desktop pointer trapped when both are disabled live. */
     if (!g_mouse.mouse_aim_enabled &&
+        !g_mouse.vertical_look_enabled &&
         !g_mouse.modern_controls_enabled && g_mouse.captured) {
         set_capture(false, "settings-disabled-release");
     }
@@ -689,6 +776,67 @@ extern "C" void disruptor_mouse_set_invert_horizontal(int inverted) {
     log_event(next ? "settings-invert-x-on" : "settings-invert-x-off");
 }
 
+extern "C" int disruptor_mouse_vertical_look_enabled(void) {
+    return g_mouse.vertical_look_enabled ? 1 : 0;
+}
+
+extern "C" void disruptor_mouse_set_vertical_look_enabled(int enabled) {
+    load_configuration();
+    const bool next = enabled != 0;
+    if (g_mouse.vertical_look_enabled == next) return;
+    g_mouse.vertical_look_enabled = next;
+    if (next) {
+        if (!psx_netplay_active())
+            disruptor_vertical_camera_set_requested_pitch(
+                g_mouse.vertical_pitch);
+    } else {
+        reset_vertical_pitch("settings-vertical-look-recenter");
+    }
+    refresh_live_control_state(next ? "settings-vertical-look-on"
+                                    : "settings-vertical-look-off");
+}
+
+extern "C" double disruptor_mouse_vertical_sensitivity(void) {
+    load_configuration();
+    return g_mouse.vertical_sensitivity;
+}
+
+extern "C" double disruptor_mouse_set_vertical_sensitivity(
+        double sensitivity) {
+    load_configuration();
+    if (!std::isfinite(sensitivity)) return g_mouse.vertical_sensitivity;
+    const double next = std::clamp(sensitivity,
+                                   kMinimumSensitivity,
+                                   kMaximumSensitivity);
+    if (g_mouse.vertical_sensitivity == next)
+        return g_mouse.vertical_sensitivity;
+    g_mouse.vertical_sensitivity = next;
+    log_event("settings-vertical-sensitivity");
+    return g_mouse.vertical_sensitivity;
+}
+
+extern "C" int disruptor_mouse_invert_vertical(void) {
+    load_configuration();
+    return g_mouse.invert_vertical ? 1 : 0;
+}
+
+extern "C" void disruptor_mouse_set_invert_vertical(int inverted) {
+    load_configuration();
+    const bool next = inverted != 0;
+    if (g_mouse.invert_vertical == next) return;
+    g_mouse.invert_vertical = next;
+    log_event(next ? "settings-invert-y-on" : "settings-invert-y-off");
+}
+
+extern "C" double disruptor_mouse_vertical_pitch(void) {
+    return g_mouse.vertical_pitch;
+}
+
+extern "C" void disruptor_mouse_recenter_vertical(void) {
+    load_configuration();
+    reset_vertical_pitch("settings-vertical-recenter");
+}
+
 extern "C" int disruptor_mouse_captured(void) {
     return g_mouse.captured ? 1 : 0;
 }
@@ -697,6 +845,7 @@ extern "C" int disruptor_mouse_set_captured(int captured) {
     load_configuration();
     const bool next = captured != 0;
     if (next && !g_mouse.mouse_aim_enabled &&
+        !g_mouse.vertical_look_enabled &&
         !g_mouse.modern_controls_enabled) {
         return 0;
     }

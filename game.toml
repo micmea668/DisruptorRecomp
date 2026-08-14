@@ -15,6 +15,7 @@ out_dir = "generated"
 out_stem = "SLUS_002.24.code"
 strict = true
 discovery = "whole-image"
+mod_function_entry_funcs = ["0x80020DD8", "0x80040E68"]
 
 [runtime]
 debug_port = 4624
