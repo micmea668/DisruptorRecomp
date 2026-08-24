@@ -8,14 +8,16 @@
 | Capture and execute runtime overlays | Complete for tested path | Private captured overlay set covers the validated first-level route |
 | Menus, intro, and FMV | Complete for tested path | Native Windows user tests reach gameplay reliably |
 | First mission | Complete | User played through the first level |
-| Stable frame pacing and audio | Complete for tested path | Performance Test 7 held 60 FPS throughout and audio was clean |
+| Host presentation pacing and audio | Complete for tested path | Performance Test 7 held 60 presented FPS throughout and audio was clean; this does not raise Disruptor's guest gameplay/camera update cadence |
+| Gameplay/render cadence | Root cause traced; guarded 60 Hz prototype next | The host and substantive gameplay tick are very likely already about 59.94 Hz, but the retail outer loop batches two elapsed-VBlank ticks before one world render, yielding about 29.97 unique camera/world images. A one-VBlank de-batching experiment now has an exact guarded site and needs counters plus state-delta validation |
 | 4x geometry rendering | Complete for tested path | 120 steady samples: 59.52–60.37 Hz, mean 59.94 Hz |
-| Horizontal mouse integration | Complete for tested path | User reports generally smooth mouse aim; native one-byte yaw quantization remains visible on the smallest motions |
+| Horizontal mouse integration | Improved; live retest pending | User reports generally smooth mouse aim. Nearest-step error diffusion now bounds the carried byte-quantisation error to half a yaw unit without temporal averaging, reducing small-motion threshold delay while preserving exact cumulative input; visible camera/world images remain limited by the retail two-tick/one-render batching |
 | Presentation-only precise geometry | Accepted for the tested path; minor edge residual | The scratchpad continuation almost completely removed the ramp gaps. The ongoing retest reached 4,416,280/4,775,680 accepted candidates (92.474%), with 96.045% in a stable interval. An occasional one-pixel screen-edge sliver remains and is accepted for now; canonical VRAM remains unchanged |
 | Presentation-only perspective textures | Accepted for the tested path; mild localized residual | User reports textures are definitely better. The run applied perspective correction to 3,509,462 triangles (92.496% of world triangles); remaining provenance fallbacks stay affine. Canonical VRAM, HUD and sprites remain unchanged |
 | Modern keyboard/mouse actions | Complete for tested path | Test 4 confirmed the first-launch keybind-order fix; modern keys no longer overlap the legacy preset |
-| In-game settings/dev menu | Implemented and live-validated with persistence | User testing passed menu input blocking, mouse-capture release/restore, live geometry/texture toggles, sensitivity, interpolation activation and settings restoration across launches. Reviewed preferences merge into executable-adjacent `settings.toml` through atomic replacement; explicit launch flags retain precedence and interpolation activation remains session-only. The 4:3 exact-geometry surface provisioning and framebuffer-clear regressions are fixed and live-validated. Session-only God Mode was live-validated toggling on/off and preventing damage; the confirmed retail All Weapons + psionics action was also live-validated. Windows x64 build and all 17 CTests pass. Exact-geometry 0%/live-coverage alternation is deferred as [GitHub issue #1](https://github.com/micmea668/DisruptorRecomp/issues/1) |
-| Vertical mouse look | Implemented experimentally; live validation pending | A bounded +/-30.94-degree host pitch shifts the game's GTE and audited CPU projection horizon, widens six reviewed vertical participation tests, and applies the same slope to unaided normal/psionic projectiles. Map, scripted-camera, inactive-player, replay and netplay states fail closed to retail presentation. The clean Windows x64 build, exact generated-hook audit and standalone camera/input/persistence tests pass; world-edge, actor, firing and transition behavior still require live testing |
+| In-game settings/dev menu | Implemented and live-validated with persistence; aspect retest pending | User testing passed menu input blocking, mouse-capture release/restore, live geometry/texture toggles, sensitivity, interpolation activation and settings restoration across launches. The menu now also queues coherent live 4:3, 16:9, 21:9 and 32:9 changes at a presentation boundary and persists the fixed aspect; its live visual retest is pending. Reviewed preferences merge into executable-adjacent `settings.toml` through atomic replacement; explicit launch flags retain precedence and interpolation activation remains session-only. The 4:3 exact-geometry surface provisioning and framebuffer-clear regressions are fixed and live-validated. Session-only God Mode was live-validated toggling on/off and preventing damage; the confirmed retail All Weapons + psionics action was also live-validated. Exact-geometry 0%/live-coverage alternation is deferred as [GitHub issue #1](https://github.com/micmea668/DisruptorRecomp/issues/1) |
+| Vertical mouse look | Implemented experimentally; initial live validation passed | A bounded +/-30.94-degree host pitch shifts the game's GTE and audited CPU projection horizon, widens six reviewed vertical participation tests, and applies the same slope to unaided normal/psionic projectiles. Map, scripted-camera, inactive-player, replay and netplay states fail closed to retail presentation. User camera/aim checks and the clean Windows x64 build passed; the exact generated-hook audit and standalone camera/input/persistence tests also pass. Broader world-edge, actor and full-campaign coverage remains pending |
+| Experimental far rendering | Distance extension live-validated; yellow distance transition unresolved | The session-only Retail/1.25x/1.5x control substitutes thirteen exact renderer-only far/fade loads while leaving guest globals and saves unchanged. A fixed-view 1.5x A/B doubled visible-room spans from 4 to 8, raised traversal depth from 2 to 3 without hitting the cap, changed 1,450/2,610 final portal decisions and 1,156/4,335 object decisions from retail rejection to acceptance, and exposed a distant pickup that Retail culled. The user's later 25x test still left terrain/structures merging into the mustard distance field, so the remaining limitation is not explained by the known far tests alone; a separate terrain palette/visibility path or the interaction with the level-authored PSYQ DRAWENV clear remains to be traced. A missed live billboard CLUT pass is included alongside the reviewed world paths. Conditional room marks and unique visible-room spans are labelled separately. Two store-feeding setup loads and three unrelated loads remain excluded; guards fail closed and savestate loads abandon only host metrics. |
 | 16:9 projection and protected HUD | Complete for tested path | Test 9 user result confirms stable rotation and correct geometry at both widescreen edges |
 | Saves and later-level coverage | In progress | Memory-card behavior and full campaign regression remain unverified |
 | Source repository checkpoint | Complete | Initial source-only Git checkpoint excludes disc data, generated retail translations, captures, binaries, and captured overlays |
@@ -153,8 +155,28 @@ turn routine's signed controller delta.
 The first mouse checkpoint therefore writes relative horizontal mouse motion
 directly to this 8-bit wrapping yaw instead of pulsing digital turn buttons.
 The user found it generally smooth, especially across larger motions. The
-smallest turn remains visibly stepped because one yaw unit is 1.40625 degrees;
-interpolated rendering is a later, separate improvement.
+smallest turn remains constrained by one yaw unit being 1.40625 degrees and by
+the guest camera's update cadence. The converter now rounds to the nearest byte
+and diffuses the exact signed remainder, bounding quantisation error to +/-0.5
+unit instead of allowing a nearly complete unit to wait for a later frame. It
+does not average across frames or add a reversal tail; focused conservation and
+registration tests pass. Live feel validation of that refinement is pending.
+
+The frame-feel audit separates host presentation, gameplay ticks and world
+renders. The runtime VBlank, input, pacer and window presentation paths run at
+about 59.94 Hz, while Disruptor's top-level live loop in `func_80043404`
+explicitly waits for two VBlanks. It reads the VSync counter at `0x80043E84`,
+tests `current - baseline < 2` at `0x80043E90`, and performs the second wait at
+`0x80043E9C`; the direct world-render call is at `0x80043B70`. Crucially, the
+elapsed count is retained in `$s5`, and `0x80043A90`-`0x80043ABC` calls the
+substantive gameplay tick once per elapsed VBlank (normally twice) before that
+single render. This proves roughly 29.97 unique camera/world images but strongly
+indicates existing 59.94 Hz fixed-step simulation batched two ticks at a time.
+It explains the felt frame rate and alternating exact-geometry coverage. The
+exact one-VBlank threshold is now a viable de-batching prototype rather than a
+wholesale simulation-rate conversion, but render-side and special-mode
+assumptions still require a 600-VBlank counter trace and identical timed-state
+comparisons before it can be considered safe.
 
 The next control pass maps Disruptor's real digital-pad actions to WASD,
 keyboard actions, and captured mouse buttons while preserving a connected

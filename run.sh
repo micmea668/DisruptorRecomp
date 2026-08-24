@@ -65,6 +65,7 @@ fi
 GAME_CONFIG=game.toml
 if [ "$WIDESCREEN" -eq 1 ]; then
     GAME_CONFIG=game-widescreen.toml
+    export PSX_VIDEO_ASPECT=16:9
     echo "Experimental native-wide 16:9 enabled; menus and movies remain 4:3."
 fi
 

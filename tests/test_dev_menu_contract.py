@@ -61,10 +61,13 @@ menu = read("src/disruptor_dev_menu.cpp")
 mouse = read("src/disruptor_mouse_aim.cpp")
 cheats = read("src/disruptor_cheats.cpp")
 cheats_h = read("src/disruptor_cheats.h")
+far_rendering_h = read("src/disruptor_far_rendering.h")
 config_h = read("psxrecomp-overlay/recompiler/src/config_loader.h")
 config_cpp = read("psxrecomp-overlay/recompiler/src/config_loader.cpp")
 run_ps1 = read("run.ps1")
 run_sh = read("run.sh")
+game_toml = read("game.toml")
+game_wide_toml = read("game-widescreen.toml")
 
 require("option(DISRUPTOR_DEV_MENU" in cmake,
         "developer menu must remain independently build-selectable")
@@ -90,6 +93,8 @@ for token in (
     "PSX_HOST_UI_VISIBLE",
     "psx_host_video_set_vsync",
     "psx_host_video_set_interpolation",
+    "psx_host_video_get_display_aspect",
+    "psx_host_video_set_display_aspect",
     "psx_host_user_settings_path",
 ):
     require(token in host_ui, f"host UI ABI is missing {token}")
@@ -153,6 +158,47 @@ require(interpolation_setter.count("gl_renderer_interpolation_diag") >= 2 and
         "return 0" in interpolation_setter,
         "live interpolation must report renderer setup failure")
 
+aspect_setter = function_body(main_cpp,
+                              "psx_host_video_set_display_aspect")
+for token in (
+    "is_host_fixed_display_aspect",
+    "g_pending_video_aspect.store",
+    "std::memory_order_release",
+):
+    require(token in aspect_setter,
+            f"live aspect setter is missing {token}")
+fixed_aspects = function_body(main_cpp, "is_host_fixed_display_aspect")
+for token in ("numerator == 4", "numerator == 16", "numerator == 21",
+              "numerator == 32"):
+    require(token in fixed_aspects,
+            f"fixed aspect validation is missing {token}")
+aspect_apply = function_body(main_cpp, "apply_live_display_aspect")
+for token in (
+    "gl_renderer_set_display_aspect",
+    "SDL_RenderSetLogicalSize",
+    "reshape_window_for_fixed_aspect",
+    "gte_set_display_aspect",
+    "gpu_ws_configure",
+    "gl_renderer_invalidate_present",
+):
+    require(token in aspect_apply,
+            f"live aspect transition is missing {token}")
+vblank_aspect_start = main_cpp.index("static void sdl_vblank_present")
+vblank_aspect_prefix = main_cpp[
+    vblank_aspect_start:
+    main_cpp.index("#ifndef PSX_NO_DEBUG_TOOLS", vblank_aspect_start)
+]
+require("PendingAspectBoundary" in vblank_aspect_prefix and
+        "~PendingAspectBoundary()" in vblank_aspect_prefix and
+        "apply_pending_fixed_display_aspect" in vblank_aspect_prefix,
+        "fixed aspect requests must apply on vblank-present scope exit")
+for config_name, config in (
+    ("game.toml", game_toml),
+    ("game-widescreen.toml", game_wide_toml),
+):
+    require("offer_ultrawide = true" in config,
+            f"{config_name} would clamp a saved 21:9 aspect on restart")
+
 for token in (
     "SDL_SCANCODE_GRAVE",
     "SDL_SCANCODE_ESCAPE",
@@ -165,6 +211,7 @@ for token in (
     "gpu_texture_correction_set",
     "psx_host_video_set_interpolation",
     "psx_host_video_set_vsync",
+    "psx_host_video_set_display_aspect",
     "gpu_geometry_correction_stats_detailed",
 ):
     require(token in menu, f"developer menu is missing {token}")
@@ -217,6 +264,111 @@ require("disruptor_cheats_reset_session();" in
         "disruptor_cheats_reset_session();" in
         function_body(menu, "on_runtime_shutdown"),
         "cheat toggles must reset at both session boundaries")
+
+for token in (
+    "DISRUPTOR_FAR_RENDERING_RETAIL",
+    "DISRUPTOR_FAR_RENDERING_EXTENDED",
+    "DISRUPTOR_FAR_RENDERING_FAR",
+    "DISRUPTOR_FAR_RENDERING_DEPTH_FADE_RETAIL",
+    "DISRUPTOR_FAR_RENDERING_DEPTH_FADE_DISABLED",
+    "DisruptorFarRenderingDiagnostics",
+    "disruptor_far_rendering_set_preset",
+    "disruptor_far_rendering_set_depth_fade_mode",
+    "disruptor_far_rendering_get_depth_fade_mode",
+    "disruptor_far_rendering_get_diagnostics",
+    "disruptor_far_rendering_reset_session",
+):
+    require(token in far_rendering_h,
+            f"far-rendering session ABI is missing {token}")
+
+far_controls = function_body(menu, "draw_far_rendering_controls")
+for token in (
+    'SeparatorText("Experimental: Draw distance")',
+    '"Retail", "1.25x", "1.5x"',
+    '"Retail palette ramp", "Nearest CLUT row (diagnostic)"',
+    'ImGui::Combo("Distance shading"',
+    "diagnostics.netplay_blocked",
+    "diagnostics.gameplay_ready",
+    "ImGui::BeginDisabled()",
+    "disruptor_far_rendering_set_preset",
+    "Restore Retail distance and fade",
+    "disruptor_far_rendering_set_depth_fade_mode",
+    "reveal the void",
+    "portal or ",
+    "culling errors",
+    "distant actors frozen",
+    "primitive ",
+    "pressure or frame time",
+    "selects the nearest palette row",
+    "world and billboard paths",
+    "level-authored DRAWENV background",
+    "add geometry, or bypass portal/content culling",
+    "Applied far / shading hooks",
+    "Session-only",
+):
+    require(token in far_controls,
+            f"far-rendering menu control is missing {token}")
+
+diagnostics_body = function_body(menu, "draw_diagnostics_tab")
+for token in (
+    "source_far_distance",
+    "effective_far_distance",
+    "effective_fade_start",
+    "depth_fade_mode",
+    "substituted_loads",
+    "far_load_substitutions",
+    "fade_load_substitutions",
+    "completed_frames",
+    "primitive_samples",
+    "primitive_high_water",
+    "render_wall_us_p50",
+    "render_wall_us_p95",
+    "render_wall_us_max",
+    "portal_final_decision_flips",
+    "portal_final_decisions",
+    "object_decision_flips",
+    "object_far_decisions",
+    "traversal_rooms_last",
+    "traversal_rooms_high_water",
+    "submitted_spans_last",
+    "submitted_spans_high_water",
+    "traversal_max_depth_last",
+    "traversal_max_depth_high_water",
+    "traversal_cap_hits",
+    "portal_shortcut_relaxations",
+    "packet_entry_to_traversal_end_last",
+    "packet_traversal_to_visible_start_last",
+    "packet_visible_loop_last",
+    "packet_post_visible_loop_last",
+    "observer_sequence_errors",
+    "New valid-room marks last / high",
+    "Visible room spans last / high",
+):
+    require(token in diagnostics_body,
+            f"far-rendering diagnostics are missing {token}")
+
+require("disruptor_far_rendering_reset_session();" in
+        function_body(menu, "on_runtime_ready") and
+        "disruptor_far_rendering_reset_session();" in
+        function_body(menu, "on_runtime_shutdown"),
+        "far-rendering presets must reset at both session boundaries")
+for forbidden in (
+    "has_draw_distance",
+    "has_far_rendering",
+    "has_depth_fade",
+    "draw_distance_preset",
+    "far_rendering_preset",
+    "depth_fade_mode",
+):
+    require(forbidden not in config_h and forbidden not in config_cpp,
+            f"experimental draw distance must remain outside persistence: {forbidden}")
+require("mark_draw_distance" not in menu and
+        "mark_far_rendering" not in menu and
+        "mark_depth_fade" not in menu and
+        "PREF_DRAW_DISTANCE" not in menu and
+        "PREF_FAR_RENDERING" not in menu and
+        "PREF_DEPTH_FADE" not in menu,
+        "experimental draw distance must not enter the menu preference layer")
 
 for token in (
     "has_frame_interpolation_blend",
@@ -285,6 +437,31 @@ require("mark_interpolation_target" in menu and
         "mark_interpolation_blend" in menu and
         "mark_interpolation_enabled" not in menu,
         "blurry interpolation activation must remain session-only")
+
+aspect_controls = function_body(menu, "draw_aspect_controls")
+for token in (
+    'Checkbox("Widescreen"',
+    'Combo("Aspect ratio"',
+    '"16:9", "21:9", "32:9"',
+    "psx_host_video_get_display_aspect",
+    "psx_host_video_set_display_aspect",
+    "mark_aspect",
+    'draw_status_badge("LIVE"',
+):
+    require(token in aspect_controls,
+            f"live aspect controls are missing {token}")
+require("PREF_ASPECT" in function_body(menu, "merge_dirty_preferences") and
+        "settings.has_aspect_ratio = true" in
+        function_body(menu, "merge_dirty_preferences") and
+        "settings.has_adaptive_view = true" in
+        function_body(menu, "merge_dirty_preferences") and
+        "settings.adaptive_view = false" in
+        function_body(menu, "merge_dirty_preferences"),
+        "fixed live aspect choices must atomically persist and disable adaptive view")
+require("PREF_ASPECT" in function_body(menu, "apply_pending_preferences") and
+        "psx_host_video_set_display_aspect" in
+        function_body(menu, "apply_pending_preferences"),
+        "a pending aspect choice must survive a soft runtime session")
 require("g_frame_interpolation = 0;" in main_cpp and
         "does not auto-restore it" in main_cpp,
         "legacy settings.toml must not auto-restore blurry interpolation")
@@ -294,6 +471,10 @@ main_env = main_cpp.index('std::getenv("PSX_GEOMETRY_CORRECTION")')
 require(main_settings < main_cpp.index("us.has_geometry_correction") < main_env and
         main_settings < main_cpp.index("us.has_perspective_textures") < main_env,
         "saved enhancements must load before explicit environment overrides")
+aspect_env = main_cpp.index('std::getenv("PSX_VIDEO_ASPECT")')
+require(main_settings < main_cpp.index("us.has_aspect_ratio") < aspect_env and
+        "is_host_fixed_display_aspect" in main_cpp[aspect_env:main_env],
+        "explicit aspect override must be validated after saved settings load")
 require("UserSettings seed =" in main_cpp and
         "load_user_settings(" in
         main_cpp[main_cpp.index("UserSettings seed ="):main_cpp.index("seed.renderer =")],
@@ -317,5 +498,8 @@ require("export PSX_DISRUPTOR_MODERN_CONTROLS=$MODERN_CONTROLS" not in run_sh an
 require("--perspective-textures" in run_sh and
         "PERSPECTIVE_TEXTURES=1; GEOMETRY_CORRECTION=1" in run_sh,
         "POSIX perspective-texture launch must explicitly imply geometry")
+require("PSX_VIDEO_ASPECT'] = '16:9'" in run_ps1 and
+        "export PSX_VIDEO_ASPECT=16:9" in run_sh,
+        "explicit widescreen launch switches must override a saved aspect")
 
 print("developer menu contract: PASS")

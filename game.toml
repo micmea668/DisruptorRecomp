@@ -46,7 +46,7 @@ native_wide = false
 hud_sprt_squash = true
 nw_hud_corners = false
 offer = true
-offer_ultrawide = false
+offer_ultrawide = true
 adaptive_view = false
 
 # Disruptor seeds portal traversal with two eight-bit yaw rays at +/-32 units

@@ -68,6 +68,9 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "game_options.h"
 #include "mod_plugins.h"
 #include "mod_runtime.h"
+#ifdef PSX_HAS_DISRUPTOR_FAR_RENDERING
+extern "C" void disruptor_far_rendering_abandon_metrics(void);
+#endif
 #include "dirty_ram_interp.h"
 #include "crc32.h"
 #include "disc_identity.h"
@@ -666,6 +669,9 @@ static void present_session_reset(void) {
  * longjmp). Clears present latches and forces the next vblank to show the
  * restored VRAM — including a blank if display was disabled in the snapshot. */
 extern "C" void psx_frontend_on_savestate_loaded(void) {
+#ifdef PSX_HAS_DISRUPTOR_FAR_RENDERING
+    disruptor_far_rendering_abandon_metrics();
+#endif
     s_disabled_frame_presented = false;
     s_force_present_after_load = true;
     smooth_60_reset();
@@ -917,12 +923,48 @@ extern "C" void debug_get_fmv_config(int *auto_skip, uint32_t *total_table,
  * in config_loader.h). */
 static int           g_video_aspect_num = 4;
 static int           g_video_aspect_den = 3;
+/* Host-UI fixed-aspect requests may arrive while the current frame is being
+ * composed.  Keep the renderer/GTE/GPU transition at the next presentation
+ * boundary instead of changing projection state halfway through a frame.
+ * Packed as numerator:denominator; zero means no pending request. */
+static std::atomic<uint32_t> g_pending_video_aspect{0};
 /* Resize-driven widescreen. The user's fixed aspect is still used to shape the
  * initial window; after the game window exists these values follow its live
  * aspect, clamped to 4:3..the widest mode offered by the title. */
 static bool          g_ws_adaptive_view = false;
 static int           g_ws_adaptive_max_num = 16;
 static int           g_ws_adaptive_max_den = 9;
+
+static uint32_t pack_display_aspect(int numerator, int denominator) {
+    return ((uint32_t)numerator << 16) | (uint32_t)denominator;
+}
+
+static bool is_host_fixed_display_aspect(int numerator, int denominator) {
+    return (numerator == 4  && denominator == 3) ||
+           (numerator == 16 && denominator == 9) ||
+           (numerator == 21 && denominator == 9) ||
+           (numerator == 32 && denominator == 9);
+}
+
+extern "C" void psx_host_video_get_display_aspect(
+    int *numerator, int *denominator) {
+    /* Report an accepted pending selection immediately so a host UI does not
+     * visibly snap back during the one-frame handoff to the present thread. */
+    uint32_t packed = g_pending_video_aspect.load(std::memory_order_acquire);
+    int num = packed ? (int)(packed >> 16) : g_video_aspect_num;
+    int den = packed ? (int)(packed & 0xFFFFu) : g_video_aspect_den;
+    if (numerator) *numerator = num;
+    if (denominator) *denominator = den;
+}
+
+extern "C" int psx_host_video_set_display_aspect(
+    int numerator, int denominator) {
+    if (!is_host_fixed_display_aspect(numerator, denominator)) return 0;
+    g_pending_video_aspect.store(
+        pack_display_aspect(numerator, denominator),
+        std::memory_order_release);
+    return 1;
+}
 
 extern "C" int psx_mod_set_fixed_display_aspect(
     uint32_t numerator, uint32_t denominator) {
@@ -1129,6 +1171,8 @@ static int           g_ws_native_wide = 1;
  * 4:3, wider for wide aspects. Height is always 480*scale. Set at window
  * creation alongside SDL_RenderSetLogicalSize. */
 static int           g_logical_w = 640;
+static bool          g_gl_active = false;    /* GL context live -> GL present path */
+static bool          g_vk_active = false;    /* Vulkan context live -> VK present path */
 
 /* Clamp a requested window width to the primary display's usable area so an
  * oversized choice (e.g. 1920 on a 1080p panel) still fits on screen. Keeps
@@ -1148,6 +1192,79 @@ static void clamp_window_aspect(int* w, int* h, int num, int den) {
 static int aspect_gcd(int a, int b) {
     while (b) { int t = a % b; a = b; b = t; }
     return a > 0 ? a : 1;
+}
+
+/* Resize only an ordinary window. Fullscreen owns the display mode/desktop
+ * extent; its compositor instead follows the logical/present aspect below. */
+static void reshape_window_for_fixed_aspect(int num, int den) {
+    if (!sdl_window ||
+        (SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_FULLSCREEN) != 0)
+        return;
+
+    int width = 0, height = 0;
+    SDL_GetWindowSize(sdl_window, &width, &height);
+    if (width <= 0) return;
+    height = width * den / num;
+    clamp_window_aspect(&width, &height, num, den);
+    SDL_SetWindowSize(sdl_window, width, height);
+}
+
+/* One transition funnel for adaptive resizing and explicit host-UI choices.
+ * It runs only from sdl_vblank_present, after game hooks have completed, so a
+ * frame cannot mix old projection state with a new presentation shape. */
+static void apply_live_display_aspect(int num, int den,
+                                      bool reshape_fixed_window) {
+    const bool changed =
+        num != g_video_aspect_num || den != g_video_aspect_den;
+    g_video_aspect_num = num;
+    g_video_aspect_den = den;
+
+    gl_renderer_set_display_aspect(num, den);
+    if (sdl_renderer) {
+        g_logical_w = 480 * num * g_video_scale / den;
+        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w,
+                                 480 * g_video_scale);
+    }
+    if (reshape_fixed_window) reshape_window_for_fixed_aspect(num, den);
+
+    const bool wide = num * 3 != den * 4;
+    const bool game_started = fntrace_is_game_started() != 0;
+    if (game_started) {
+        g_ws_engaged = true;
+        const int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
+        gte_set_display_aspect(mode == 1 ? num : 4,
+                               mode == 1 ? den : 3);
+        gpu_ws_configure(num, den, g_ws_anchor_addr,
+                         g_ws_hud_sprt ? 1 : 0, mode);
+    } else {
+        /* Preserve authentic 4:3 boot rendering even when a host UI selects a
+         * wide output before game entry. The normal engagement path will pick
+         * up the already-updated num:den once gameplay begins. */
+        g_ws_engaged = !wide;
+        gte_set_display_aspect(4, 3);
+        gpu_ws_configure(4, 3, g_ws_anchor_addr,
+                         g_ws_hud_sprt ? 1 : 0, 0);
+    }
+
+    if (changed && g_gl_active) {
+        /* Do not crossfade or reuse a stale destination rectangle across an
+         * aspect transition. This also forces an otherwise-identical next
+         * frame through the GL present path. */
+        gl_renderer_invalidate_present();
+    }
+}
+
+static void apply_pending_fixed_display_aspect() {
+    uint32_t packed =
+        g_pending_video_aspect.exchange(0, std::memory_order_acq_rel);
+    if (!packed) return;
+    int num = (int)(packed >> 16);
+    int den = (int)(packed & 0xFFFFu);
+    g_ws_adaptive_view = false;
+    apply_live_display_aspect(num, den, true);
+    std::fprintf(stdout,
+        "psxrecomp: live fixed display aspect = %d:%d (adaptive view off)\n",
+        num, den);
 }
 
 /* Follow the host window without feeding its absolute pixel size into guest
@@ -1173,23 +1290,7 @@ static void update_adaptive_widescreen() {
         den /= divisor;
     }
     if (num == g_video_aspect_num && den == g_video_aspect_den) return;
-
-    g_video_aspect_num = num;
-    g_video_aspect_den = den;
-    gl_renderer_set_display_aspect(num, den);
-    if (sdl_renderer) {
-        g_logical_w = 480 * num * g_video_scale / den;
-        SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
-    }
-
-    if (g_ws_engaged) {
-        const bool wide = num * 3 != den * 4;
-        const int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
-        gte_set_display_aspect(mode == 1 ? num : 4,
-                               mode == 1 ? den : 3);
-        gpu_ws_configure(num, den, g_ws_anchor_addr,
-                         g_ws_hud_sprt ? 1 : 0, mode);
-    }
+    apply_live_display_aspect(num, den, false);
 }
 
 /* SDL GL attributes are global inputs to the next context creation.  Set the
@@ -1216,9 +1317,6 @@ extern "C" void psx_ws_set_native_wide(int on) {
     }
 }
 extern "C" int psx_ws_get_native_wide(void) { return g_ws_native_wide; }
-
-static bool          g_gl_active = false;    /* GL context live -> GL present path */
-static bool          g_vk_active = false;    /* Vulkan context live -> VK present path */
 
 extern "C" int psx_host_video_get_vsync(void) {
     return g_video_vsync;
@@ -3931,6 +4029,14 @@ static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
 
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
+    /* A host UI normally submits its request from the GL render callback near
+     * the end of this function. Apply on scope exit, after the old-aspect frame
+     * has been presented, so the next guest frame and its eventual present use
+     * one coherent aspect. The scope also covers every skipped/early-return
+     * vblank path. */
+    struct PendingAspectBoundary {
+        ~PendingAspectBoundary() { apply_pending_fixed_display_aspect(); }
+    } pending_aspect_boundary;
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_set_fmv_quiet(mdec_recently_active(2));
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
@@ -6293,10 +6399,38 @@ int main(int argc, char** argv) {
     g_ws_adaptive_max_num = ws_ultrawide_offered ? 21 : 16;
     g_ws_adaptive_max_den = 9;
 
-    /* Latency knobs: env overrides win over config (for A/B measurement).
+    /* Explicit process overrides win over saved/configured presentation.
+     * PSX_VIDEO_ASPECT=4:3|16:9|21:9|32:9;
      * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive);
      * PSX_FRAME_INTERPOLATION=0/1; PSX_FRAME_INTERPOLATION_FPS=0|60+;
      * PSX_FRAME_INTERPOLATION_BLEND=linear|adaptive. */
+    if (const char *e = std::getenv("PSX_VIDEO_ASPECT")) {
+        int numerator = 0;
+        int denominator = 0;
+        if (std::strcmp(e, "4:3") == 0) {
+            numerator = 4; denominator = 3;
+        } else if (std::strcmp(e, "16:9") == 0) {
+            numerator = 16; denominator = 9;
+        } else if (std::strcmp(e, "21:9") == 0) {
+            numerator = 21; denominator = 9;
+        } else if (std::strcmp(e, "32:9") == 0) {
+            numerator = 32; denominator = 9;
+        }
+        const bool parsed = numerator != 0;
+        const bool wide = numerator * 3 != denominator * 4;
+        const bool ultrawide = numerator * 9 > denominator * 16;
+        const bool offered =
+            !wide || (ws_offered && (!ultrawide || ws_ultrawide_offered));
+        if (parsed && is_host_fixed_display_aspect(numerator, denominator) &&
+            offered) {
+            g_video_aspect_num = numerator;
+            g_video_aspect_den = denominator;
+            g_ws_adaptive_view = false;
+        } else {
+            std::fprintf(stderr,
+                "psxrecomp: ignoring unsupported PSX_VIDEO_ASPECT=%s\n", e);
+        }
+    }
     if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
     if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
     if (const char *e = std::getenv("PSX_SMOOTH_60FPS"))

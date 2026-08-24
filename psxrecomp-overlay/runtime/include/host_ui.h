@@ -92,9 +92,13 @@ int psx_host_ui_game_input_captured(void);
 const char *psx_host_user_settings_path(void);
 
 /* Live, session-only video controls.  Persistence belongs to the game UI.
- * Vsync accepts -1 (adaptive), 0 (immediate), or 1 (synchronised).
- * Interpolation target accepts -1 (uncapped), 0 (display refresh), or 60..1000
- * FPS; blend accepts 0 (linear) or 1 (motion-adaptive). */
+ * Display aspect changes are queued for the next presentation boundary; the
+ * fixed choices are 4:3, 16:9, 21:9, and 32:9.  Vsync accepts -1 (adaptive),
+ * 0 (immediate), or 1 (synchronised).  Interpolation target accepts -1
+ * (uncapped), 0 (display refresh), or 60..1000 FPS; blend accepts 0 (linear)
+ * or 1 (motion-adaptive). */
+void psx_host_video_get_display_aspect(int *numerator, int *denominator);
+int psx_host_video_set_display_aspect(int numerator, int denominator);
 int psx_host_video_get_vsync(void);
 int psx_host_video_set_vsync(int mode);
 void psx_host_video_get_interpolation(int *enabled, int *target_fps,

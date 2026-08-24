@@ -166,6 +166,65 @@ static const DisruptorVerticalCameraSite *disruptor_vertical_camera_site(
     return nullptr;
 }
 
+/* Disruptor's experimental far-rendering override is host-only: reviewed
+ * loads of the retail far/fade globals are substituted after the original LW,
+ * leaving guest RAM untouched.  Additional reviewed portal, object-decision,
+ * and packet-boundary instructions feed read-only diagnostics through the same
+ * callback.  The renderer entry starts a measurement span and the reviewed
+ * common epilogue closes it.  Keep this callback independent from the
+ * vertical-camera dispatcher so either enhancement can be built and tested in
+ * isolation. */
+struct DisruptorFarRenderingSite {
+    uint32_t pc;
+    uint32_t instruction;
+};
+
+static const DisruptorFarRenderingSite kDisruptorFarRenderingSites[] = {
+    /* Portal traversal diagnostics: recursion depth, unique-room completion,
+     * and the three candidate-distance values before their branch tests. */
+    {0x8003A0F8u, 0x93B300C0u},
+    {0x8003A390u, 0xA082001Fu},
+    {0x8003A92Cu, 0x00005812u},
+    {0x8003A964u, 0x00681021u},
+    {0x8003AA74u, 0x00AC1021u},
+    /* Far-distance loads from $gp + 0x4A0. */
+    {0x8003A914u, 0x8F8C04A0u},
+    {0x8003B8C8u, 0x8F8304A0u},
+    {0x8003BCE0u, 0x8F8204A0u},
+    {0x8003C168u, 0x8F8304A0u},
+    {0x8003CD64u, 0x8F8304A0u},
+    /* Object distance-decision results. */
+    {0x8003B8D8u, 0x0072182Au},
+    {0x8003BCECu, 0x0053102Au},
+    {0x8003C178u, 0x0077182Au},
+    {0x8003CD70u, 0x0077182Au},
+    /* Fade-start loads from $gp + 0x494. */
+    {0x8003B2CCu, 0x8F820494u},
+    {0x8003BA30u, 0x8F820494u},
+    {0x8003BE40u, 0x8F820494u},
+    {0x8003C628u, 0x8F820494u},
+    {0x8003C878u, 0x8F820494u},
+    {0x8003D28Cu, 0x8F820494u},
+    {0x8003FB0Cu, 0x8F840494u},
+    /* Billboard post-pass CLUT-row selection. */
+    {0x80043184u, 0x8F820494u},
+    /* Main-renderer visible-list and packet boundaries. */
+    {0x800410E0u, 0x93830310u},
+    {0x800410F8u, 0x8F820680u},
+    {0x800411D8u, 0x8F8301D4u},
+    /* Common renderer epilogue. */
+    {0x8004279Cu, 0x8FBF016Cu},
+};
+
+static const DisruptorFarRenderingSite *disruptor_far_rendering_site(
+        uint32_t address) {
+    for (const DisruptorFarRenderingSite &site :
+         kDisruptorFarRenderingSites) {
+        if (site.pc == address) return &site;
+    }
+    return nullptr;
+}
+
 static bool codegen_cycle_per_insn() {
     // DEFAULT ON for the faithful-timing (cycle-audit) branch: each instruction
     // charges its cost at its own site, so the running cycle count is correct
@@ -973,6 +1032,18 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                 addr, vertical_camera_site->instruction, instr));
         }
         vertical_camera_site = nullptr;
+    }
+
+    const DisruptorFarRenderingSite *far_rendering_site =
+        disruptor_far_rendering_site(addr);
+    if (far_rendering_site && instr != far_rendering_site->instruction) {
+        if (!config_.overlay_mode) {
+            throw std::runtime_error(fmt::format(
+                "Disruptor far-rendering site 0x{:08X} expected word "
+                "0x{:08X}, found 0x{:08X}",
+                addr, far_rendering_site->instruction, instr));
+        }
+        far_rendering_site = nullptr;
     }
 
     // Full-word-guarded terrain-frustum half-angle constants. Scaling the
@@ -2035,6 +2106,12 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             " disruptor_vertical_camera_instruction_hook(cpu, "
             "0x{:08X}u, 0x{:08X}u, 1);",
             addr, instr);
+    }
+    if (far_rendering_site) {
+        code += fmt::format(
+            "\n{}disruptor_far_rendering_instruction_hook(cpu, "
+            "0x{:08X}u, 0x{:08X}u, 1);",
+            config_.indent, addr, instr);
     }
 
     return config_.indent + code + comment;
@@ -3430,6 +3507,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern int  psx_datashard_enter(CPUState* cpu, uint32_t key);  /* data-shard replay/capture (data_shards.c) */\n";
     ss << "extern void psx_mod_function_entry(CPUState* cpu, uint32_t address);  /* trusted opt-in game-mod hook */\n";
     ss << "extern void disruptor_vertical_camera_instruction_hook(CPUState* cpu, uint32_t address, uint32_t instruction, int phase);  /* version-pinned vertical-camera seam */\n";
+    ss << "extern void disruptor_far_rendering_instruction_hook(CPUState* cpu, uint32_t address, uint32_t instruction, int phase);  /* version-pinned far-rendering seam */\n";
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
     ss << "extern int  psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func, uint32_t counter_addr, uint32_t gpustat_ptr_addr, uint32_t timer1_ptr_addr, uint32_t timer1_cache_addr);  /* load_accel.c */\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";

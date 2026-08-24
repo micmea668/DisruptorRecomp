@@ -44,7 +44,7 @@ native_wide = false
 hud_sprt_squash = true
 nw_hud_corners = false
 offer = true
-offer_ultrawide = false
+offer_ultrawide = true
 adaptive_view = false
 
 [[widescreen.cull.yaw_cone]]

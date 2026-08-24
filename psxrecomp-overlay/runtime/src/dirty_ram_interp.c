@@ -1550,6 +1550,54 @@ static int disruptor_vertical_camera_site(uint32_t pc, uint32_t insn) {
 }
 #endif
 
+#ifdef PSX_HAS_DISRUPTOR_FAR_RENDERING
+extern void disruptor_far_rendering_instruction_hook(
+    CPUState *cpu, uint32_t address, uint32_t instruction, int phase);
+
+static int disruptor_far_rendering_site(uint32_t pc, uint32_t insn) {
+    switch (pc) {
+    case 0x8003A0F8u:
+        return insn == 0x93B300C0u;
+    case 0x8003A390u:
+        return insn == 0xA082001Fu;
+    case 0x8003A92Cu:
+        return insn == 0x00005812u;
+    case 0x8003A964u:
+        return insn == 0x00681021u;
+    case 0x8003AA74u:
+        return insn == 0x00AC1021u;
+    case 0x8003A914u:
+        return insn == 0x8F8C04A0u;
+    case 0x8003B8C8u: case 0x8003C168u: case 0x8003CD64u:
+        return insn == 0x8F8304A0u;
+    case 0x8003BCE0u:
+        return insn == 0x8F8204A0u;
+    case 0x8003B8D8u:
+        return insn == 0x0072182Au;
+    case 0x8003BCECu:
+        return insn == 0x0053102Au;
+    case 0x8003C178u: case 0x8003CD70u:
+        return insn == 0x0077182Au;
+    case 0x8003B2CCu: case 0x8003BA30u: case 0x8003BE40u:
+    case 0x8003C628u: case 0x8003C878u: case 0x8003D28Cu:
+    case 0x80043184u:
+        return insn == 0x8F820494u;
+    case 0x8003FB0Cu:
+        return insn == 0x8F840494u;
+    case 0x800410E0u:
+        return insn == 0x93830310u;
+    case 0x800410F8u:
+        return insn == 0x8F820680u;
+    case 0x800411D8u:
+        return insn == 0x8F8301D4u;
+    case 0x8004279Cu:
+        return insn == 0x8FBF016Cu;
+    default:
+        return 0;
+    }
+}
+#endif
+
 static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
                             uint32_t *next_pc_out) {
     /* A load's writeback becomes visible to the instruction AFTER its delay
@@ -1608,6 +1656,12 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
 #ifdef PSX_HAS_DISRUPTOR_VERTICAL_CAMERA
     if (disruptor_vertical_camera_site(pc, insn)) {
         disruptor_vertical_camera_instruction_hook(cpu, pc, insn, 1);
+    }
+#endif
+
+#ifdef PSX_HAS_DISRUPTOR_FAR_RENDERING
+    if (disruptor_far_rendering_site(pc, insn)) {
+        disruptor_far_rendering_instruction_hook(cpu, pc, insn, 1);
     }
 #endif
 

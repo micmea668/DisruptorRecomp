@@ -308,6 +308,46 @@ void test_direction_fraction_and_wrap() {
            "horizontal inversion reverses direction");
 }
 
+void test_nearest_step_diffusion_and_conservation() {
+    reset_state();
+    g_mouse.horizontal_sensitivity = 0.20;
+    psx_write_byte(kTestYawAddress, 100);
+
+    /* Three rightward counts are -0.6 yaw units.  Nearest-step diffusion
+     * responds immediately, but carries +0.4 so the combined guest byte and
+     * presentation remainder still equal the exact requested movement. */
+    apply_mouse_x(3.0);
+    expect(psx_read_byte(kTestYawAddress) == 99,
+           "more than half a yaw unit advances without truncation delay");
+    expect_close(g_mouse.fractional_yaw, 0.4,
+                 "nearest-step extraction carries the opposite signed error");
+
+    /* A direct reversal consumes that carried error first.  It must not leave
+     * a one-frame smoothing tail or manufacture a compensating yaw step. */
+    apply_mouse_x(-3.0);
+    expect(psx_read_byte(kTestYawAddress) == 100,
+           "equal reversal restores guest yaw immediately");
+    expect_close(g_mouse.fractional_yaw, 0.0,
+                 "equal reversal leaves no delayed correction backlog");
+
+    /* Error diffusion must conserve long-run distance in both directions.
+     * Seven counts at 0.2 are exactly 1.4 units: one byte plus -0.4 residual
+     * rightward, then precisely zero after the mirrored input. */
+    for (int i = 0; i < 7; ++i) apply_mouse_x(1.0);
+    expect(psx_read_byte(kTestYawAddress) == 99,
+           "repeated sub-byte samples diffuse to the nearest guest yaw");
+    expect_close(g_mouse.fractional_yaw, -0.4,
+                 "repeated samples retain only the exact bounded remainder");
+    expect(std::abs(g_mouse.fractional_yaw) <= 0.5,
+           "nearest-step remainder never approaches a full yaw byte");
+
+    for (int i = 0; i < 7; ++i) apply_mouse_x(-1.0);
+    expect(psx_read_byte(kTestYawAddress) == 100,
+           "mirrored sub-byte samples conserve cumulative guest yaw");
+    expect_close(g_mouse.fractional_yaw, 0.0,
+                 "mirrored sub-byte samples conserve exact total motion");
+}
+
 void test_motion_safety_clamp() {
     reset_state();
     g_mouse.horizontal_sensitivity = 2.0;
@@ -754,6 +794,7 @@ int main(int argc, char **argv) {
         test_parsing();
         test_ini_configuration();
         test_direction_fraction_and_wrap();
+        test_nearest_step_diffusion_and_conservation();
         test_motion_safety_clamp();
         test_vertical_direction_inversion_and_clamp();
         test_simultaneous_relative_axes_sample();

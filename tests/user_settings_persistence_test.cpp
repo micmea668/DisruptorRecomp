@@ -43,6 +43,11 @@ int main() {
         written.frame_interpolation_fps = 144;
         written.has_frame_interpolation_blend = true;
         written.frame_interpolation_blend = 1;
+        written.has_aspect_ratio = true;
+        written.aspect_num = 32;
+        written.aspect_den = 9;
+        written.has_adaptive_view = true;
+        written.adaptive_view = false;
         written.has_mouse_aim = true;
         written.mouse_aim = true;
         written.has_modern_controls = true;
@@ -80,6 +85,10 @@ int main() {
                     loaded.has_frame_interpolation_blend &&
                     loaded.frame_interpolation_blend == 1,
                 "interpolation preferences did not round-trip");
+        require(loaded.has_aspect_ratio && loaded.aspect_num == 32 &&
+                    loaded.aspect_den == 9 && loaded.has_adaptive_view &&
+                    !loaded.adaptive_view,
+                "fixed display aspect did not round-trip");
         require(loaded.has_mouse_aim && loaded.mouse_aim &&
                     loaded.has_modern_controls && loaded.modern_controls &&
                     loaded.has_horizontal_sensitivity &&
@@ -104,7 +113,9 @@ int main() {
                 "atomic replacement of an existing file failed");
         UserSettings replaced = PSXRecompV4::load_user_settings(path);
         require(replaced.has_mouse_aim && !replaced.mouse_aim &&
-                    replaced.has_language,
+                    replaced.has_language && replaced.has_aspect_ratio &&
+                    replaced.aspect_num == 32 && replaced.aspect_den == 9 &&
+                    replaced.has_adaptive_view && !replaced.adaptive_view,
                 "replacement did not preserve the merged settings");
         require(!has_temp_sibling(root), "replacement leaked a temp file");
 

@@ -159,6 +159,35 @@ VERTICAL_CAMERA_SITES = {
     0x8004279C: 0x8FBF016C,
 }
 
+FAR_RENDERING_SITES = {
+    0x8003A0F8: 0x93B300C0,
+    0x8003A390: 0xA082001F,
+    0x8003A92C: 0x00005812,
+    0x8003A964: 0x00681021,
+    0x8003AA74: 0x00AC1021,
+    0x8003A914: 0x8F8C04A0,
+    0x8003B8C8: 0x8F8304A0,
+    0x8003BCE0: 0x8F8204A0,
+    0x8003C168: 0x8F8304A0,
+    0x8003CD64: 0x8F8304A0,
+    0x8003B8D8: 0x0072182A,
+    0x8003BCEC: 0x0053102A,
+    0x8003C178: 0x0077182A,
+    0x8003CD70: 0x0077182A,
+    0x8003B2CC: 0x8F820494,
+    0x8003BA30: 0x8F820494,
+    0x8003BE40: 0x8F820494,
+    0x8003C628: 0x8F820494,
+    0x8003C878: 0x8F820494,
+    0x8003D28C: 0x8F820494,
+    0x8003FB0C: 0x8F840494,
+    0x80043184: 0x8F820494,
+    0x800410E0: 0x93830310,
+    0x800410F8: 0x8F820680,
+    0x800411D8: 0x8F8301D4,
+    0x8004279C: 0x8FBF016C,
+}
+
 # Tests 4-6 widened Disruptor's portal spans into negative X.  Its static-world
 # renderer was authored around unsigned 0..320 spans, and yaw-dependent portal
 # selection became unstable.  Test 7 instead keeps every portal/outcode bound
@@ -363,7 +392,44 @@ def main() -> int:
     )
     if shard_text.count(renderer_entry_hook) != 1:
         failures.append(
-            "expected exactly one vertical-camera renderer entry hook"
+            "expected exactly one reviewed renderer function-entry hook"
+        )
+
+    far_rendering_raw_matches = re.findall(
+        r"disruptor_far_rendering_instruction_hook\(cpu, "
+        r"0x([0-9A-F]{8})u, 0x([0-9A-F]{8})u, 1\)",
+        shard_text,
+    )
+    far_rendering_matches = re.findall(
+        r"(?m)^[ \t]+disruptor_far_rendering_instruction_hook\(cpu, "
+        r"0x([0-9A-F]{8})u, 0x([0-9A-F]{8})u, 1\);"
+        r"(?:[ \t]+/\*[^\r\n]*\*/)?[ \t]*$",
+        shard_text,
+    )
+    far_rendering_directive_lines = re.findall(
+        r"(?m)^[ \t]*#[^\r\n]*"
+        r"disruptor_far_rendering_instruction_hook\(",
+        shard_text,
+    )
+    generated_far_rendering_sites = {
+        int(address, 16): int(word, 16)
+        for address, word in far_rendering_matches
+    }
+    if far_rendering_directive_lines:
+        failures.append(
+            "far-rendering hook shares a preprocessor-directive line"
+        )
+    if len(far_rendering_raw_matches) != len(far_rendering_matches):
+        failures.append(
+            "far-rendering hooks must be separate generated statements"
+        )
+    if (generated_far_rendering_sites != FAR_RENDERING_SITES or
+            len(far_rendering_matches) != len(FAR_RENDERING_SITES)):
+        failures.append(
+            "reviewed far-rendering hooks differ: expected "
+            + str(FAR_RENDERING_SITES)
+            + ", found "
+            + str(generated_far_rendering_sites)
         )
 
     precision_mfc2_matches = re.findall(

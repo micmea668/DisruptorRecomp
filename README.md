@@ -213,13 +213,53 @@ version of the menu.
 
 The Controls tab changes horizontal mouse aim, modern controls, both axis
 sensitivities/inversion, experimental vertical look/recentering, and the
-sub-byte camera presentation live. Enhancements
-contains exact geometry, perspective textures, VSync and the experimental
-presentation-only frame interpolator. Diagnostics reports exact-geometry
-coverage, provenance misses, perspective-texture use, interpolation state and
-widescreen state. Cheats provides a session-only God Mode and a confirmed
+sub-byte camera presentation live. Enhancements contains a live widescreen
+toggle with fixed 16:9, 21:9 and 32:9 choices (4:3 disables widescreen), exact
+geometry, perspective textures, VSync and the experimental presentation-only
+frame interpolator. It also contains a session-only
+experimental draw-distance control with Retail, 1.25x and 1.5x presets.
+Its separate Distance shading control offers the retail palette ramp and a
+session-only Row 0 diagnostic. Disruptor implements this ramp by selecting one
+of twelve asset-authored CLUT rows; the diagnostic keeps reviewed world paths
+and the downstream world-billboard pass on the nearest row. It does not add
+geometry or bypass portal/content culling. The flat level-authored background
+clear and any tint already present in the nearest asset palette remain
+separate from this distance shading.
+Diagnostics reports exact-geometry coverage, provenance misses,
+perspective-texture use, interpolation state, widescreen state, the source and
+effective draw/fade distances, separate far/fade load substitutions, actual
+portal/object far-decision flips, conditional room marks and visible-room
+spans, recursion-cap hits, primitive-packet stage use, and renderer wall-span
+percentiles. Cheats
+provides a session-only God Mode and a confirmed
 one-shot retail All Weapons action. System records which
 renderer/audio/allocation settings still require a restart.
+
+The draw-distance experiment substitutes the values returned by thirteen exact,
+version-pinned renderer loads. It never changes the game's authoritative
+draw/fade globals, so memory-card data and savestates retain the retail values;
+loading a savestate only abandons the in-progress diagnostic sample. The two
+setup loads that feed guest stores, and unrelated gameplay loads of the same
+globals, are deliberately excluded. This remains a live-validation feature:
+larger presets can expose level voids, portal/culling omissions, inactive
+distant actors, primitive-packet pressure, or increased frame time. Start with
+1.25x on a repeatable view and use 1.5x only after the lower preset is clean.
+The first live 1.5x diagnostic captured source/effective far `1024 / 1536`,
+source/effective fade start `256 / 768`, and 39,421 substitutions over 679
+completed frames. A later fixed-view A/B proved that the extension changed
+renderer decisions: four visible-room spans became eight, traversal depth rose
+from two to three without hitting the recursion cap, 1,450 of 2,610 final
+portal tests and 1,156 of 4,335 object tests changed from retail rejection to
+acceptance. Packet output in that view grew by only 120 bytes, explaining why
+the terrain captures remained nearly identical, while a distant pickup became
+visible only at the extended distance. The flat mustard field includes a
+level-authored PSYQ `DRAWENV` clear (observed RGB `181,156,49`), and the
+executable uses no GTE depth-cue commands. However, a later 25x test still left
+distant terrain and structures merging into that yellow field. The remaining
+terrain palette/visibility path is therefore unresolved and is intentionally
+parked while camera feel and gameplay cadence are addressed. A missed live
+billboard CLUT-row pass was subsequently added to the distance-shading
+override.
 
 God Mode intercepts the game's central player-damage routine without changing
 saved health; it starts off on every launch. **Grant all weapons + psionics**
@@ -234,11 +274,12 @@ only fields changed in the menu and publish through an atomic replacement, so
 an I/O failure leaves the previous file intact. Explicit launch switches or
 environment values override saved preferences for that run. Mouse aim, modern
 controls, vertical-look enablement, both axis sensitivities/inversion,
-sub-byte camera, exact geometry, perspective textures and VSync persist; the
-current pitch does not. The interpolator remembers target/blend but its
+sub-byte camera, display aspect, exact geometry, perspective textures and
+VSync persist; the current pitch does not. The interpolator remembers target/blend but its
 activation remains session-only because its current crossfade is too blurry
 for release. Menu layout/open state, mouse capture and diagnostics never
-persist.
+persist. Experimental draw distance and distance shading also return to retail
+settings on every launch.
 
 The overlay suspends the secondary interpolation presenter while visible so
 Dear ImGui always renders on the main OpenGL context. Normal settings do not
@@ -255,8 +296,13 @@ with player coordinates, indexes sine/cosine tables from it, and adds its normal
 controller-derived turn delta directly to it.
 
 src/disruptor_mouse_aim.cpp converts relative host mouse X movement into that
-same yaw. It preserves fractional motion and lets the original camera,
-collision, movement, and renderer consume the result. Mouse Y can independently
+same yaw. It uses nearest-step error diffusion: each authoritative byte update
+keeps at most half a yaw unit of signed error for the next sample, rather than
+letting a nearly complete unit accumulate and arrive as a larger-feeling
+threshold jump. This is not a temporal average, so it adds no smoothing tail;
+total mouse distance and the sub-byte presentation residual remain exact. The
+original camera, collision, movement, and renderer consume the byte result.
+Mouse Y can independently
 drive a signed host pitch. Because the retail game has no pitch variable,
 src/disruptor_vertical_camera.cpp moves the shared 120-pixel projection horizon,
 patches only audited CPU screen-Y/culling results, and restores neutral GTE
@@ -267,8 +313,9 @@ The same quantised horizon supplies projectile slope, keeping unaided shots
 aligned with the centre of the view without changing horizontal speed. Native
 target-assisted aim is left untouched. New vertical input is ignored during
 scripted or non-gameplay views while the requested pitch is preserved, and the
-session starts centred. This remains experimental until its world-edge and
-full-campaign coverage has been exercised live.
+session starts centred. Initial live camera, aim and transition checks passed.
+It remains experimental until world-edge and full-campaign coverage has been
+exercised.
 
 The modern layout is W/S forward/back, A/D strafe, Space jump, E use, F
 psionic, Q/R weapon/psionic selection, Tab map, P pause, left mouse fire, and
@@ -277,9 +324,37 @@ only reach the game while the mouse is captured.
 
 Menu pointer support is still deferred.
 
+## Gameplay frame cadence
+
+The host VBlank, input sample, pacer and presentation path already run at about
+59.94 Hz. Disruptor deliberately limits the outer live loop to one completed
+render for every two VBlanks: `func_80043404` reads the VSync counter at
+`0x80043E84`, tests `current - baseline < 2` at `0x80043E90`, and waits for a
+second VBlank at `0x80043E9C` when necessary. Unique camera/world images
+therefore advance at about 29.97 Hz even though diagnostics and the window
+report about 60 presented FPS.
+
+The simulation side is subtler and more promising than a simple 30 Hz game.
+The measured VBlank delta is retained in `$s5`; on the next outer iteration,
+`0x80043A90`-`0x80043ABC` calls the substantive gameplay tick once per elapsed
+VBlank (normally twice) before the single world render at `0x80043B70`.
+Disruptor is therefore very likely batching two existing 60 Hz fixed-step
+updates behind each 30 Hz render. A guarded experiment that changes only the
+minimum elapsed-VBlank test from two to one should de-batch this into one tick
+plus one render per VBlank rather than double gameplay speed. It still needs
+instrumentation and state-delta validation because render-side effects,
+double-buffering, scripted modes, CD/audio scheduling and special branches may
+assume the retail batching. The next phase will count VBlanks, gameplay ticks,
+yaw stores, renderer entries, display-base flips and dirty presents over a
+fixed 600-VBlank window before enabling that experimental patch.
+
 ## Widescreen implementation
 
-game-widescreen.toml selects the classic projection-and-stretch 16:9 path.
+game-widescreen.toml selects the classic projection-and-stretch 16:9 path at
+launch. The in-game Enhancements tab can now switch the same runtime live
+between 4:3, 16:9, 21:9 and 32:9. A fixed selection is applied only after the
+current frame has presented, updates the window/compositor and projection as
+one transition, disables adaptive aspect, and is saved to `settings.toml`.
 Disruptor's static world uses a yaw-dependent CPU portal projection in addition
 to ordinary GTE geometry. The corrected private Test 8B capture identified the
 upstream visibility seeds at 0x80040FE8 and 0x80040FF0: wrapping eight-bit

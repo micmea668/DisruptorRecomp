@@ -8,6 +8,7 @@
  */
 
 #include "disruptor_cheats.h"
+#include "disruptor_far_rendering.h"
 #include "disruptor_mouse_aim.h"
 #include "config_loader.h"
 #include "gpu.h"
@@ -40,7 +41,10 @@ struct DevMenuState {
     bool open = false;
     bool restore_mouse_capture = false;
     bool interpolation_apply_failed = false;
+    bool aspect_apply_failed = false;
+    bool far_rendering_apply_failed = false;
     bool base_keybinds_valid = false;
+    int selected_wide_aspect = 0;
     std::string cheat_status;
     std::array<SDL_Scancode, PSX_KB_COUNT> base_keybinds{};
 };
@@ -63,6 +67,7 @@ enum PreferenceDirty : uint32_t {
     PREF_VERTICAL_LOOK     = 1u << 10,
     PREF_VERTICAL_SENS     = 1u << 11,
     PREF_INVERT_Y          = 1u << 12,
+    PREF_ASPECT            = 1u << 13,
 };
 
 struct PreferenceState {
@@ -226,6 +231,17 @@ void mark_interpolation_blend(int value) {
     g_preferences.dirty |= PREF_INTERP_BLEND;
 }
 
+void mark_aspect(int numerator, int denominator) {
+    g_preferences.pending.has_aspect_ratio = true;
+    g_preferences.pending.aspect_num = numerator;
+    g_preferences.pending.aspect_den = denominator;
+    /* Every menu entry is a fixed aspect. Clear a launcher-era adaptive
+     * preference as part of the same atomic settings update. */
+    g_preferences.pending.has_adaptive_view = true;
+    g_preferences.pending.adaptive_view = false;
+    g_preferences.dirty |= PREF_ASPECT;
+}
+
 void merge_dirty_preferences(PSXRecompV4::UserSettings &settings) {
     const auto &pending = g_preferences.pending;
     if (g_preferences.dirty & PREF_MOUSE_AIM) {
@@ -279,6 +295,13 @@ void merge_dirty_preferences(PSXRecompV4::UserSettings &settings) {
     if (g_preferences.dirty & PREF_INTERP_BLEND) {
         settings.has_frame_interpolation_blend = true;
         settings.frame_interpolation_blend = pending.frame_interpolation_blend;
+    }
+    if (g_preferences.dirty & PREF_ASPECT) {
+        settings.has_aspect_ratio = true;
+        settings.aspect_num = pending.aspect_num;
+        settings.aspect_den = pending.aspect_den;
+        settings.has_adaptive_view = true;
+        settings.adaptive_view = false;
     }
 }
 
@@ -417,6 +440,9 @@ void apply_pending_preferences() {
             blend = pending.frame_interpolation_blend;
         (void)psx_host_video_set_interpolation(enabled, target, blend);
     }
+    if (g_preferences.dirty & PREF_ASPECT)
+        (void)psx_host_video_set_display_aspect(
+            pending.aspect_num, pending.aspect_den);
 }
 
 void load_preferences_for_session() {
@@ -659,7 +685,188 @@ void apply_geometry_enabled(bool enabled) {
     mark_geometry(enabled);
 }
 
+const char *far_rendering_preset_label(int preset) {
+    switch (preset) {
+        case DISRUPTOR_FAR_RENDERING_EXTENDED:
+            return "1.25x";
+        case DISRUPTOR_FAR_RENDERING_FAR:
+            return "1.5x";
+        case DISRUPTOR_FAR_RENDERING_RETAIL:
+        default:
+            return "Retail";
+    }
+}
+
+const char *far_rendering_depth_fade_label(int mode) {
+    switch (mode) {
+        case DISRUPTOR_FAR_RENDERING_DEPTH_FADE_DISABLED:
+            return "Nearest CLUT row (diagnostic)";
+        case DISRUPTOR_FAR_RENDERING_DEPTH_FADE_RETAIL:
+        default:
+            return "Retail palette ramp";
+    }
+}
+
+void draw_far_rendering_controls() {
+    DisruptorFarRenderingDiagnostics diagnostics{};
+    const bool diagnostics_available =
+        disruptor_far_rendering_get_diagnostics(
+            &diagnostics,
+            static_cast<uint32_t>(sizeof(diagnostics))) != 0;
+    const bool netplay = diagnostics_available
+        ? diagnostics.netplay_blocked != 0
+        : disruptor_far_rendering_netplay_blocked() != 0;
+    const bool gameplay_ready = diagnostics_available
+        ? diagnostics.gameplay_ready != 0
+        : disruptor_far_rendering_gameplay_ready() != 0;
+
+    ImGui::SeparatorText("Experimental: Draw distance");
+    int preset = disruptor_far_rendering_get_preset();
+    preset = std::clamp(
+        preset, static_cast<int>(DISRUPTOR_FAR_RENDERING_RETAIL),
+        static_cast<int>(DISRUPTOR_FAR_RENDERING_PRESET_COUNT) - 1);
+    static const char *kPresetLabels[] = {"Retail", "1.25x", "1.5x"};
+    const bool extension_controls_blocked = netplay || !gameplay_ready;
+    if (extension_controls_blocked) ImGui::BeginDisabled();
+    if (ImGui::Combo("Draw distance preset", &preset, kPresetLabels,
+                     DISRUPTOR_FAR_RENDERING_PRESET_COUNT)) {
+        const int result = disruptor_far_rendering_set_preset(preset);
+        g_menu.far_rendering_apply_failed =
+            result != DISRUPTOR_FAR_RENDERING_OK;
+    }
+    int depth_fade_mode = disruptor_far_rendering_get_depth_fade_mode();
+    depth_fade_mode = std::clamp(
+        depth_fade_mode,
+        static_cast<int>(DISRUPTOR_FAR_RENDERING_DEPTH_FADE_RETAIL),
+        static_cast<int>(DISRUPTOR_FAR_RENDERING_DEPTH_FADE_MODE_COUNT) - 1);
+    static const char *kDepthFadeLabels[] = {
+        "Retail palette ramp", "Nearest CLUT row (diagnostic)"};
+    if (ImGui::Combo("Distance shading", &depth_fade_mode, kDepthFadeLabels,
+                     DISRUPTOR_FAR_RENDERING_DEPTH_FADE_MODE_COUNT)) {
+        const int result =
+            disruptor_far_rendering_set_depth_fade_mode(depth_fade_mode);
+        g_menu.far_rendering_apply_failed =
+            result != DISRUPTOR_FAR_RENDERING_OK;
+    }
+    if (extension_controls_blocked) ImGui::EndDisabled();
+    draw_status_badge("SESSION", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
+    if (extension_controls_blocked &&
+        (preset != DISRUPTOR_FAR_RENDERING_RETAIL ||
+         depth_fade_mode != DISRUPTOR_FAR_RENDERING_DEPTH_FADE_RETAIL) &&
+        ImGui::Button("Restore Retail distance and fade")) {
+        const int preset_result = disruptor_far_rendering_set_preset(
+            DISRUPTOR_FAR_RENDERING_RETAIL);
+        const int fade_result = disruptor_far_rendering_set_depth_fade_mode(
+            DISRUPTOR_FAR_RENDERING_DEPTH_FADE_RETAIL);
+        g_menu.far_rendering_apply_failed =
+            preset_result != DISRUPTOR_FAR_RENDERING_OK ||
+            fade_result != DISRUPTOR_FAR_RENDERING_OK;
+    }
+
+    if (netplay) {
+        ImGui::TextDisabled(
+            "Distance/fade experiments are unavailable during netplay.");
+    } else if (!gameplay_ready) {
+        ImGui::TextDisabled(
+            "Enter verified live gameplay to change distance or fade.");
+    }
+    if (g_menu.far_rendering_apply_failed) {
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+            "The runtime rejected the requested distance/fade setting.");
+    }
+
+    if (diagnostics_available && diagnostics.source_far_distance != 0) {
+        ImGui::Text("Source / effective far: %u / %u",
+                    static_cast<unsigned>(diagnostics.source_far_distance),
+                    static_cast<unsigned>(diagnostics.effective_far_distance));
+        ImGui::Text("Source / effective fade start: %d / %d",
+                    static_cast<int>(diagnostics.source_fade_start),
+                    static_cast<int>(diagnostics.effective_fade_start));
+        ImGui::Text("Applied far / shading hooks: %llu / %llu",
+                    static_cast<unsigned long long>(
+                        diagnostics.far_load_substitutions),
+                    static_cast<unsigned long long>(
+                        diagnostics.fade_load_substitutions));
+    } else {
+        ImGui::TextDisabled(
+            "Distance diagnostics become available after a verified render.");
+    }
+    ImGui::TextWrapped(
+        "Warning: extending distance can reveal the void, expose portal or "
+        "culling errors, leave distant actors frozen, and increase primitive "
+        "pressure or frame time.");
+    ImGui::TextWrapped(
+        "The shading diagnostic selects the nearest palette row in reviewed "
+        "world and billboard paths. It does not alter the "
+        "level-authored DRAWENV background, add geometry, or bypass portal/content culling.");
+    ImGui::TextDisabled(
+        "Session-only: every runtime start and shutdown restores Retail "
+        "distance and shading.");
+}
+
+void draw_aspect_controls() {
+    static constexpr int kAspectNumerators[] = {16, 21, 32};
+    static constexpr int kAspectDenominators[] = {9, 9, 9};
+    static const char *kAspectLabels[] = {"16:9", "21:9", "32:9"};
+    static constexpr int kAspectCount = 3;
+
+    int numerator = 4;
+    int denominator = 3;
+    psx_host_video_get_display_aspect(&numerator, &denominator);
+    bool widescreen = numerator * 3 != denominator * 4;
+    if (widescreen) {
+        for (int index = 0; index < kAspectCount; ++index) {
+            if (numerator * kAspectDenominators[index] ==
+                denominator * kAspectNumerators[index]) {
+                g_menu.selected_wide_aspect = index;
+                break;
+            }
+        }
+    }
+    g_menu.selected_wide_aspect = std::clamp(
+        g_menu.selected_wide_aspect, 0, kAspectCount - 1);
+
+    ImGui::SeparatorText("Display aspect");
+    if (ImGui::Checkbox("Widescreen", &widescreen)) {
+        const int requested_num = widescreen
+            ? kAspectNumerators[g_menu.selected_wide_aspect] : 4;
+        const int requested_den = widescreen
+            ? kAspectDenominators[g_menu.selected_wide_aspect] : 3;
+        g_menu.aspect_apply_failed =
+            psx_host_video_set_display_aspect(requested_num, requested_den) == 0;
+        if (!g_menu.aspect_apply_failed)
+            mark_aspect(requested_num, requested_den);
+    }
+    draw_status_badge("LIVE", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
+
+    int selected = g_menu.selected_wide_aspect;
+    if (ImGui::Combo("Aspect ratio", &selected, kAspectLabels,
+                     kAspectCount)) {
+        g_menu.selected_wide_aspect = selected;
+        if (widescreen) {
+            const int requested_num = kAspectNumerators[selected];
+            const int requested_den = kAspectDenominators[selected];
+            g_menu.aspect_apply_failed =
+                psx_host_video_set_display_aspect(
+                    requested_num, requested_den) == 0;
+            if (!g_menu.aspect_apply_failed)
+                mark_aspect(requested_num, requested_den);
+        }
+    }
+    if (g_menu.aspect_apply_failed) {
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+            "The runtime rejected the requested display aspect.");
+    }
+    ImGui::TextDisabled(
+        "4:3 disables widescreen. Fixed 16:9, 21:9 and 32:9 choices "
+        "apply after the current frame and are saved.");
+}
+
 void draw_enhancements_tab() {
+    draw_aspect_controls();
+
     bool geometry = gpu_geometry_correction_enabled() != 0;
     if (ImGui::Checkbox("Exact-provenance geometry", &geometry))
         apply_geometry_enabled(geometry);
@@ -675,6 +882,8 @@ void draw_enhancements_tab() {
     draw_status_badge("LIVE", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
     if (!geometry)
         ImGui::TextDisabled("Enable exact geometry before perspective textures.");
+
+    draw_far_rendering_controls();
 
     ImGui::SeparatorText("High-refresh presentation");
     int interpolation = 0;
@@ -875,6 +1084,89 @@ void draw_diagnostics_tab() {
     ImGui::Text("Interpolated swaps: %llu",
                 static_cast<unsigned long long>(swaps));
 
+    DisruptorFarRenderingDiagnostics far{};
+    const bool far_diagnostics = disruptor_far_rendering_get_diagnostics(
+        &far, static_cast<uint32_t>(sizeof(far))) != 0;
+    ImGui::SeparatorText("Experimental draw distance");
+    if (far_diagnostics) {
+        ImGui::Text("Preset: %s", far_rendering_preset_label(far.preset));
+        ImGui::Text("Distance shading: %s",
+                    far_rendering_depth_fade_label(far.depth_fade_mode));
+        ImGui::Text("Status: %s",
+                    far.netplay_blocked
+                        ? "blocked by netplay"
+                        : (far.gameplay_ready
+                               ? "verified live gameplay"
+                               : "waiting for verified gameplay"));
+        ImGui::Text("Source / effective far: %u / %u",
+                    static_cast<unsigned>(far.source_far_distance),
+                    static_cast<unsigned>(far.effective_far_distance));
+        ImGui::Text("Source / effective fade start: %d / %d",
+                    static_cast<int>(far.source_fade_start),
+                    static_cast<int>(far.effective_fade_start));
+        ImGui::Text("Far / fade load substitutions: %llu / %llu",
+                    static_cast<unsigned long long>(
+                        far.far_load_substitutions),
+                    static_cast<unsigned long long>(
+                        far.fade_load_substitutions));
+        ImGui::Text("Total substitutions / completed frames: %llu / %llu",
+                    static_cast<unsigned long long>(far.substituted_loads),
+                    static_cast<unsigned long long>(far.completed_frames));
+        ImGui::Text("Portal final flips / decisions: %llu / %llu",
+                    static_cast<unsigned long long>(
+                        far.portal_final_decision_flips),
+                    static_cast<unsigned long long>(
+                        far.portal_final_decisions));
+        ImGui::Text("Object far flips / decisions: %llu / %llu",
+                    static_cast<unsigned long long>(
+                        far.object_decision_flips),
+                    static_cast<unsigned long long>(far.object_far_decisions));
+        ImGui::Text("New valid-room marks last / high: %u / %u",
+                    static_cast<unsigned>(far.traversal_rooms_last),
+                    static_cast<unsigned>(far.traversal_rooms_high_water));
+        ImGui::Text("Visible room spans last / high: %u / %u",
+                    static_cast<unsigned>(far.submitted_spans_last),
+                    static_cast<unsigned>(far.submitted_spans_high_water));
+        ImGui::Text("Traversal depth last / high, cap hits: %u / %u, %llu",
+                    static_cast<unsigned>(far.traversal_max_depth_last),
+                    static_cast<unsigned>(far.traversal_max_depth_high_water),
+                    static_cast<unsigned long long>(far.traversal_cap_hits));
+        ImGui::Text("Portal shortcut relaxations: %llu",
+                    static_cast<unsigned long long>(
+                        far.portal_shortcut_relaxations));
+        ImGui::Text("Packet bytes by stage: %u + %u + %u + %u",
+                    static_cast<unsigned>(
+                        far.packet_entry_to_traversal_end_last),
+                    static_cast<unsigned>(
+                        far.packet_traversal_to_visible_start_last),
+                    static_cast<unsigned>(far.packet_visible_loop_last),
+                    static_cast<unsigned>(far.packet_post_visible_loop_last));
+        ImGui::Text("Renderer entries / rejected: %llu / %llu",
+                    static_cast<unsigned long long>(far.renderer_entries),
+                    static_cast<unsigned long long>(far.rejected_entries));
+        ImGui::Text("Packet bytes/frame high-water: %u (%llu samples)",
+                    static_cast<unsigned>(far.primitive_high_water),
+                    static_cast<unsigned long long>(far.primitive_samples));
+        ImGui::Text("Renderer wall span: p50 %.3f ms, p95 %.3f ms, max %.3f ms",
+                    far.render_wall_us_p50 / 1000.0,
+                    far.render_wall_us_p95 / 1000.0,
+                    far.render_wall_us_max / 1000.0);
+        if (far.nested_entries || far.missed_epilogues ||
+            far.invalid_globals || far.observer_sequence_errors) {
+            ImGui::TextColored(
+                ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                "Guard events: nested %llu, missed epilogues %llu, "
+                "invalid globals %llu, observer sequence %llu",
+                static_cast<unsigned long long>(far.nested_entries),
+                static_cast<unsigned long long>(far.missed_epilogues),
+                static_cast<unsigned long long>(far.invalid_globals),
+                static_cast<unsigned long long>(
+                    far.observer_sequence_errors));
+        }
+    } else {
+        ImGui::TextDisabled("Far-rendering diagnostics are unavailable.");
+    }
+
     GpuWsDebug widescreen{};
     gpu_ws_get_debug(&widescreen);
     ImGui::SeparatorText("Presentation state");
@@ -913,8 +1205,9 @@ void draw_system_tab() {
         (void)flush_preferences();
     ImGui::TextDisabled(
         "Frame-interpolation activation, current vertical pitch, menu layout, "
-        "mouse capture and diagnostic counters are intentionally not "
-        "persisted. Cheat controls also start off each launch.");
+        "mouse capture, experimental draw distance/depth fade and diagnostic "
+        "counters are intentionally not persisted. Cheat controls also start "
+        "off each launch.");
     ImGui::SeparatorText("Restart required");
     ImGui::BulletText("Renderer backend");
     ImGui::BulletText("Supersampling/internal framebuffer allocation");
@@ -967,6 +1260,7 @@ void draw_menu() {
 
 void on_runtime_ready(void *, SDL_Window *window, int backend) {
     disruptor_cheats_reset_session();
+    disruptor_far_rendering_reset_session();
     disruptor_mouse_recenter_vertical();
     g_menu.window = window;
     g_menu.backend = backend;
@@ -976,6 +1270,7 @@ void on_runtime_ready(void *, SDL_Window *window, int backend) {
 
 void on_runtime_shutdown(void *) {
     disruptor_cheats_reset_session();
+    disruptor_far_rendering_reset_session();
     disruptor_mouse_recenter_vertical();
     (void)flush_preferences();
     if (disruptor_mouse_captured())

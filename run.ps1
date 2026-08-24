@@ -59,6 +59,9 @@ Write-Host 'OpenGL dev-menu builds: press the backquote (`) key; Escape closes i
 $EnvironmentOverrides = @{
     PSX_DISRUPTOR_CONTROL_PROBE = '0'
 }
+if ($Widescreen) {
+    $EnvironmentOverrides['PSX_VIDEO_ASPECT'] = '16:9'
+}
 if ($ModernControls) {
     $EnvironmentOverrides['PSX_DISRUPTOR_MODERN_CONTROLS'] = '1'
 }

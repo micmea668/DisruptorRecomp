@@ -376,7 +376,14 @@ void apply_mouse_x(double raw_x) {
     g_mouse.fractional_yaw +=
         raw_x * g_mouse.horizontal_sensitivity * direction;
 
-    const double whole = std::trunc(g_mouse.fractional_yaw);
+    /* Quantize to the nearest retail yaw byte and carry the signed error into
+     * the next sample.  The previous toward-zero extraction could retain
+     * almost one whole angular unit, making very small movements wait longer
+     * and then arrive as a visible byte-sized jump.  Nearest-step error
+     * diffusion bounds that discrepancy to half a unit without averaging,
+     * predicting future input, or changing the cumulative mouse distance.
+     * The carried error remains the exact sub-byte presentation correction. */
+    const double whole = std::round(g_mouse.fractional_yaw);
     if (whole == 0.0) return;
     int yaw_steps = static_cast<int>(whole);
     yaw_steps = std::clamp(yaw_steps, -64, 64);

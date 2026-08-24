@@ -49,7 +49,7 @@ expected_sites = {
 }
 codegen_table = codegen[
     codegen.index("kDisruptorVerticalCameraSites"):
-    codegen.index("static bool codegen_cycle_per_insn")
+    codegen.index("struct DisruptorFarRenderingSite")
 ]
 found_sites = {
     int(pc, 16): int(word, 16)

@@ -20,6 +20,7 @@ option(DISRUPTOR_DEV_MENU
 set(DISRUPTOR_EXTRA_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_cheats.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_control_probe.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_far_rendering.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_mouse_aim.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_vertical_camera.cpp")
 
@@ -103,6 +104,7 @@ psxrecomp_add_runtime_target(psx-runtime
     EXE_NAME "DisruptorRecompiled"
 )
 target_compile_definitions(psx-runtime PRIVATE
+    PSX_HAS_DISRUPTOR_FAR_RENDERING=1
     PSX_HAS_DISRUPTOR_VERTICAL_CAMERA=1)
 if(DISRUPTOR_DEV_MENU)
     target_compile_definitions(psx-runtime PRIVATE DISRUPTOR_DEV_MENU=1)
@@ -149,6 +151,10 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_vertical_camera_contract.py")
 
+    add_test(NAME disruptor_far_rendering_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_far_rendering_contract.py")
+
     add_test(NAME disruptor_framework_overlay_new_file
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_framework_overlay_new_file.py")
@@ -191,6 +197,12 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
         "${PSXRECOMP_ROOT}/runtime/include")
     target_compile_features(disruptor-vertical-camera-test PRIVATE cxx_std_17)
 
+    add_executable(disruptor-far-rendering-test
+        tests/disruptor_far_rendering_test.cpp)
+    target_include_directories(disruptor-far-rendering-test PRIVATE
+        "${PSXRECOMP_ROOT}/runtime/include")
+    target_compile_features(disruptor-far-rendering-test PRIVATE cxx_std_17)
+
     add_executable(disruptor-presentation-yaw-math-test
         tests/presentation_yaw_math_test.cpp)
     target_compile_features(disruptor-presentation-yaw-math-test PRIVATE cxx_std_17)
@@ -213,6 +225,8 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
         COMMAND disruptor-cheats-test)
     add_test(NAME disruptor_vertical_camera
         COMMAND disruptor-vertical-camera-test)
+    add_test(NAME disruptor_far_rendering
+        COMMAND disruptor-far-rendering-test)
     set_tests_properties(disruptor_mouse_aim PROPERTIES
         ENVIRONMENT "PSX_DISRUPTOR_MOUSE_AIM=;PSX_DISRUPTOR_VERTICAL_LOOK=;PSX_DISRUPTOR_MODERN_CONTROLS=;PSX_DISRUPTOR_HIGH_PRECISION_CAMERA=")
 
