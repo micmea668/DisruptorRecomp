@@ -235,8 +235,10 @@ portal/object far-decision flips, conditional room marks and visible-room
 spans, recursion-cap hits, primitive-packet stage use, and renderer wall-span
 percentiles. Cheats
 provides a session-only God Mode and a confirmed
-one-shot retail All Weapons action. System records which
-renderer/audio/allocation settings still require a restart.
+one-shot retail All Weapons action. System exposes live Windowed, Borderless
+fullscreen, and Exclusive fullscreen choices, while also recording which
+renderer/audio/allocation settings still require a restart. Explicit menu
+choices are saved; Alt+Enter remains a transient toggle.
 
 The draw-distance experiment substitutes the values returned by thirteen exact,
 version-pinned renderer loads. It never changes the game's authoritative
@@ -277,8 +279,9 @@ only fields changed in the menu and publish through an atomic replacement, so
 an I/O failure leaves the previous file intact. Explicit launch switches or
 environment values override saved preferences for that run. Mouse aim, modern
 controls, vertical-look enablement, both axis sensitivities/inversion,
-sub-byte camera, display aspect, internal resolution, exact geometry, perspective textures and
-VSync persist; the current pitch does not. The interpolator remembers target/blend but its
+sub-byte camera, display aspect, internal resolution, window mode, exact
+geometry, perspective textures and VSync persist; the current pitch does not.
+The interpolator remembers target/blend but its
 activation remains session-only because its current crossfade is too blurry
 for release. Menu layout/open state, mouse capture and diagnostics never
 persist. Experimental draw distance and distance shading also return to retail

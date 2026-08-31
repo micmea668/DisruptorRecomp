@@ -51,6 +51,7 @@ struct DevMenuState {
     bool interpolation_apply_failed = false;
     bool aspect_apply_failed = false;
     bool internal_scale_apply_failed = false;
+    bool fullscreen_apply_failed = false;
     bool far_rendering_apply_failed = false;
     bool base_keybinds_valid = false;
     int selected_wide_aspect = 0;
@@ -82,6 +83,7 @@ enum PreferenceDirty : uint32_t {
     PREF_INVERT_Y          = 1u << 12,
     PREF_ASPECT            = 1u << 13,
     PREF_SUPERSAMPLING     = 1u << 14,
+    PREF_FULLSCREEN        = 1u << 15,
 };
 
 struct PreferenceState {
@@ -262,6 +264,12 @@ void mark_supersampling(int value) {
     g_preferences.dirty |= PREF_SUPERSAMPLING;
 }
 
+void mark_fullscreen(int value) {
+    g_preferences.pending.has_fullscreen = true;
+    g_preferences.pending.fullscreen = value;
+    g_preferences.dirty |= PREF_FULLSCREEN;
+}
+
 void merge_dirty_preferences(PSXRecompV4::UserSettings &settings) {
     const auto &pending = g_preferences.pending;
     if (g_preferences.dirty & PREF_MOUSE_AIM) {
@@ -326,6 +334,10 @@ void merge_dirty_preferences(PSXRecompV4::UserSettings &settings) {
     if (g_preferences.dirty & PREF_SUPERSAMPLING) {
         settings.has_supersampling = true;
         settings.supersampling = pending.supersampling;
+    }
+    if (g_preferences.dirty & PREF_FULLSCREEN) {
+        settings.has_fullscreen = true;
+        settings.fullscreen = pending.fullscreen;
     }
 }
 
@@ -420,6 +432,9 @@ void apply_saved_preferences(const PSXRecompV4::UserSettings &settings) {
     }
     if (settings.has_supersampling)
         (void)psx_host_video_set_internal_scale(settings.supersampling);
+    if (settings.has_fullscreen)
+        g_menu.fullscreen_apply_failed =
+            psx_host_video_set_fullscreen_mode(settings.fullscreen) == 0;
 }
 
 void apply_pending_preferences() {
@@ -475,6 +490,9 @@ void apply_pending_preferences() {
     }
     if (g_preferences.dirty & PREF_SUPERSAMPLING)
         (void)psx_host_video_set_internal_scale(pending.supersampling);
+    if (g_preferences.dirty & PREF_FULLSCREEN)
+        g_menu.fullscreen_apply_failed =
+            psx_host_video_set_fullscreen_mode(pending.fullscreen) == 0;
 }
 
 void load_preferences_for_session() {
@@ -1369,7 +1387,32 @@ void draw_diagnostics_tab() {
         "Disruptor-specific actions.");
 }
 
+void draw_fullscreen_controls() {
+    static const char *kFullscreenLabels[] = {
+        "Windowed", "Borderless fullscreen", "Exclusive fullscreen"};
+    int mode = std::clamp(psx_host_video_get_fullscreen_mode(), 0, 2);
+
+    ImGui::SeparatorText("Window presentation");
+    if (ImGui::Combo("Display mode", &mode, kFullscreenLabels, 3)) {
+        g_menu.fullscreen_apply_failed =
+            psx_host_video_set_fullscreen_mode(mode) == 0;
+        if (!g_menu.fullscreen_apply_failed)
+            mark_fullscreen(mode);
+    }
+    draw_status_badge("LIVE", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
+    if (g_menu.fullscreen_apply_failed) {
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+            "The runtime rejected the requested display mode.");
+    }
+    ImGui::TextDisabled(
+        "Menu selections apply immediately and are saved. Alt+Enter remains "
+        "a transient window/fullscreen toggle and does not overwrite the "
+        "saved mode.");
+}
+
 void draw_system_tab() {
+    draw_fullscreen_controls();
     ImGui::TextWrapped(
         "Live menu choices are merged into the runtime's user-owned "
         "settings.toml. Writes use an atomic replacement, so a failed save "

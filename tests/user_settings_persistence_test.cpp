@@ -37,6 +37,8 @@ int main() {
                 "missing settings must fall through without overrides");
 
         UserSettings written;
+        written.has_fullscreen = true;
+        written.fullscreen = 2;
         written.has_vsync = true;
         written.vsync = -1;
         written.has_supersampling = true;
@@ -80,6 +82,8 @@ int main() {
 
         UserSettings loaded = PSXRecompV4::load_user_settings(path);
         require(!loaded.parse_error, "saved settings failed to parse");
+        require(loaded.has_fullscreen && loaded.fullscreen == 2,
+                "fullscreen mode did not round-trip");
         require(loaded.has_vsync && loaded.vsync == -1,
                 "vsync did not round-trip");
         require(loaded.has_supersampling && loaded.supersampling == 3,
@@ -121,6 +125,7 @@ int main() {
                     replaced.aspect_num == 32 && replaced.aspect_den == 9 &&
                     replaced.has_supersampling &&
                     replaced.supersampling == 3 &&
+                    replaced.has_fullscreen && replaced.fullscreen == 2 &&
                     replaced.has_adaptive_view && !replaced.adaptive_view,
                 "replacement did not preserve the merged settings");
         require(!has_temp_sibling(root), "replacement leaked a temp file");

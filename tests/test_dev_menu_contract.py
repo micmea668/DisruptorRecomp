@@ -100,6 +100,8 @@ for token in (
     "psx_host_video_set_adaptive_view",
     "psx_host_video_get_internal_scale",
     "psx_host_video_set_internal_scale",
+    "psx_host_video_get_fullscreen_mode",
+    "psx_host_video_set_fullscreen_mode",
     "psx_host_user_settings_path",
 ):
     require(token in host_ui, f"host UI ABI is missing {token}")
@@ -198,6 +200,30 @@ for token in (
 ):
     require(token in scale_setter,
             f"live internal-scale setter is missing {token}")
+
+fullscreen_apply = function_body(main_cpp,
+                                 "psx_apply_window_fullscreen_mode")
+for token in (
+    "mode < 0", "mode > 2", "SDL_SetWindowFullscreenMode",
+    "SDL_GetClosestFullscreenDisplayMode", "SDL_SetWindowFullscreen",
+    "SDL_SyncWindow", "psx_window_fullscreen_mode(window) == mode",
+):
+    require(token in fullscreen_apply,
+            f"live fullscreen transition is missing {token}")
+fullscreen_setter = function_body(main_cpp,
+                                  "psx_host_video_set_fullscreen_mode")
+for token in (
+    "mode < 0", "mode > 2", "psx_apply_window_fullscreen_mode",
+    "g_fullscreen = mode",
+):
+    require(token in fullscreen_setter,
+            f"live fullscreen setter is missing {token}")
+require("g_fullscreen == 2" in main_cpp and
+        "failed to enter configured exclusive fullscreen" in main_cpp,
+        "SDL3 exclusive fullscreen must be completed after window creation")
+require("Deliberately do not update g_fullscreen here" in main_cpp,
+        "the fullscreen hotkey must remain a transient toggle")
+
 resize_scale = function_body(gl, "resize_gpu_raster")
 for token in (
     "flush_flat_batch", "flush_tex_batch", "flush_cpu_upload",
@@ -265,6 +291,7 @@ for token in (
     "psx_host_video_set_vsync",
     "psx_host_video_set_display_aspect",
     "psx_host_video_set_internal_scale",
+    "psx_host_video_set_fullscreen_mode",
     "gpu_geometry_correction_stats_detailed",
 ):
     require(token in menu, f"developer menu is missing {token}")
@@ -531,6 +558,42 @@ require("PREF_SUPERSAMPLING" in
         "a pending internal scale must survive a soft runtime session")
 require('BulletText("Supersampling/internal framebuffer allocation")' not in menu,
         "live internal scale must not remain listed as restart-only")
+
+fullscreen_controls = function_body(menu, "draw_fullscreen_controls")
+for token in (
+    'SeparatorText("Window presentation")',
+    'Combo("Display mode"',
+    '"Windowed", "Borderless fullscreen", "Exclusive fullscreen"',
+    "psx_host_video_get_fullscreen_mode",
+    "psx_host_video_set_fullscreen_mode",
+    "mark_fullscreen",
+    'draw_status_badge("LIVE"',
+    "runtime rejected the requested display mode",
+    "Alt+Enter remains",
+    "does not overwrite the ",
+    "saved mode.",
+):
+    require(token in fullscreen_controls,
+            f"live fullscreen controls are missing {token}")
+require("PREF_FULLSCREEN" in
+        function_body(menu, "merge_dirty_preferences") and
+        "settings.has_fullscreen = true" in
+        function_body(menu, "merge_dirty_preferences") and
+        "settings.fullscreen = pending.fullscreen" in
+        function_body(menu, "merge_dirty_preferences"),
+        "explicit fullscreen selections must be merged into user settings")
+require("PREF_FULLSCREEN" in
+        function_body(menu, "apply_pending_preferences") and
+        "psx_host_video_set_fullscreen_mode" in
+        function_body(menu, "apply_pending_preferences"),
+        "a pending fullscreen selection must survive a soft runtime session")
+require("settings.has_fullscreen" in
+        function_body(menu, "apply_saved_preferences") and
+        "psx_host_video_set_fullscreen_mode" in
+        function_body(menu, "apply_saved_preferences"),
+        "saved fullscreen mode must be restored for a soft runtime session")
+require("mark_fullscreen" not in function_body(menu, "on_sdl_event"),
+        "menu event handling must not persist transient fullscreen hotkeys")
 
 billboard_controls = function_body(
     menu, "draw_billboard_aspect_diagnostic_controls")

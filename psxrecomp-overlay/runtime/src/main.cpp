@@ -902,6 +902,81 @@ static Uint32 psx_fullscreen_flag_for_mode(int mode) {
     return 0;                                            /* windowed */
 }
 
+/* SDL2 selects borderless vs exclusive through SDL_SetWindowFullscreen's
+ * flag. SDL3 moved that distinction into the window's optional fullscreen
+ * display mode: NULL means borderless desktop and a concrete display mode
+ * means exclusive. Keep that difference behind one helper so startup, the
+ * host UI, and the fullscreen hotkey all agree. */
+static int psx_window_fullscreen_mode(SDL_Window *window) {
+    if (!window) return g_fullscreen;
+    const Uint32 flags = (Uint32)SDL_GetWindowFlags(window);
+    if ((flags & SDL_WINDOW_FULLSCREEN) == 0) return 0;
+#if defined(PSX_SDL3)
+    return SDL_GetWindowFullscreenMode(window) ? 2 : 1;
+#else
+    return ((flags & SDL_WINDOW_FULLSCREEN_DESKTOP) ==
+            SDL_WINDOW_FULLSCREEN_DESKTOP) ? 1 : 2;
+#endif
+}
+
+static int psx_apply_window_fullscreen_mode(SDL_Window *window, int mode) {
+    if (!window || mode < 0 || mode > 2) return 0;
+#if defined(PSX_SDL3)
+    if (mode == 0) {
+        if (!SDL_SetWindowFullscreen(window, false)) return 0;
+    } else if (mode == 1) {
+        if (!SDL_SetWindowFullscreenMode(window, nullptr)) return 0;
+        if (!SDL_SetWindowFullscreen(window, true)) return 0;
+    } else {
+        const SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+        const SDL_DisplayMode *desktop =
+            display ? SDL_GetDesktopDisplayMode(display) : nullptr;
+        if (!display || !desktop) return 0;
+
+        int width = 0;
+        int height = 0;
+        if (!SDL_GetWindowSizeInPixels(window, &width, &height) ||
+            width <= 0 || height <= 0) {
+            width = desktop->w;
+            height = desktop->h;
+        }
+        SDL_DisplayMode closest = {};
+        if (!SDL_GetClosestFullscreenDisplayMode(
+                display, width, height, desktop->refresh_rate, true,
+                &closest)) {
+            return 0;
+        }
+        if (!SDL_SetWindowFullscreenMode(window, &closest)) return 0;
+        if (!SDL_SetWindowFullscreen(window, true)) return 0;
+    }
+    /* Fullscreen transitions may be asynchronous. Settle the request before
+     * reporting success so the live getter and menu cannot disagree. */
+    if (!SDL_SyncWindow(window)) return 0;
+#else
+    if (SDL_SetWindowFullscreen(
+            window, psx_fullscreen_flag_for_mode(mode)) != 0) {
+        return 0;
+    }
+#endif
+    return psx_window_fullscreen_mode(window) == mode ? 1 : 0;
+}
+
+extern "C" int psx_host_video_get_fullscreen_mode(void) {
+    return sdl_window ? psx_window_fullscreen_mode(sdl_window) : g_fullscreen;
+}
+
+extern "C" int psx_host_video_set_fullscreen_mode(int mode) {
+    if (mode < 0 || mode > 2) return 0;
+    if (sdl_window && !psx_apply_window_fullscreen_mode(sdl_window, mode)) {
+        std::fprintf(stderr,
+            "psxrecomp: failed to apply fullscreen mode %d: %s\n",
+            mode, SDL_GetError());
+        return 0;
+    }
+    g_fullscreen = mode;
+    return 1;
+}
+
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
 extern "C" int      cdrom_xa_stream_active(void);
 extern "C" uint32_t mdec_get_decode_count(void);
@@ -4296,17 +4371,20 @@ static void sdl_vblank_present(void) {
                  * detects "currently fullscreen, either mode". */
                 else if ((key == SDLK_RETURN && (mod & KMOD_ALT)) ||
                          (key == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
-                    Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
-                                   SDL_WINDOW_FULLSCREEN;
-                    if (is_fs) {
-                        SDL_SetWindowFullscreen(sdl_window, 0);
-                    } else {
-                        /* If the configured mode is "off", the hotkey still
-                         * needs a mode to switch INTO — default to borderless,
-                         * matching the historical (pre-tri-state) behaviour. */
-                        Uint32 target = psx_fullscreen_flag_for_mode(g_fullscreen);
-                        if (target == 0) target = SDL_WINDOW_FULLSCREEN_DESKTOP;
-                        SDL_SetWindowFullscreen(sdl_window, target);
+                    const int current =
+                        psx_window_fullscreen_mode(sdl_window);
+                    /* If the configured mode is "off", the hotkey still
+                     * needs a mode to switch INTO — default to borderless,
+                     * matching the historical (pre-tri-state) behaviour.
+                     * Deliberately do not update g_fullscreen here: hotkey
+                     * state is temporary and is not an implicit preference. */
+                    const int target = current ? 0 :
+                        (g_fullscreen ? g_fullscreen : 1);
+                    if (!psx_apply_window_fullscreen_mode(
+                            sdl_window, target)) {
+                        std::fprintf(stderr,
+                            "psxrecomp: fullscreen hotkey failed: %s\n",
+                            SDL_GetError());
                     }
                 }
             }
@@ -7543,6 +7621,17 @@ session_reboot:
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
     }
+#if defined(PSX_SDL3)
+    /* SDL3's creation flag can request fullscreen but cannot select its
+     * exclusive display mode. Complete a configured exclusive startup now,
+     * before renderer/context creation, so mode 2 is not silently borderless. */
+    if (g_fullscreen == 2 &&
+        !psx_apply_window_fullscreen_mode(sdl_window, g_fullscreen)) {
+        std::fprintf(stderr,
+            "psxrecomp: failed to enter configured exclusive fullscreen: %s\n",
+            SDL_GetError());
+    }
+#endif
 
     /* Sync-to-host-refresh: with SDL PRESENTVSYNC on, a fixed 59.94 Hz wall-clock
      * pacer fights a 60.00 Hz panel — rendered frames slip onto an uneven vblank
