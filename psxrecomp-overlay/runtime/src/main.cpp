@@ -927,11 +927,15 @@ extern "C" void debug_get_fmv_config(int *auto_skip, uint32_t *total_table,
  * in config_loader.h). */
 static int           g_video_aspect_num = 4;
 static int           g_video_aspect_den = 3;
-/* Host-UI fixed-aspect requests may arrive while the current frame is being
- * composed.  Keep the renderer/GTE/GPU transition at the next presentation
+/* Host-UI aspect requests may arrive while the current frame is being
+ * composed. Keep the renderer/GTE/GPU transition at the next presentation
  * boundary instead of changing projection state halfway through a frame.
- * Packed as numerator:denominator; zero means no pending request. */
+ * Fixed requests are packed as numerator:denominator; the two reserved values
+ * select adaptive mode. Zero means no pending request. A single atomic makes
+ * the most recent fixed/adaptive selection win without a mixed transition. */
 static std::atomic<uint32_t> g_pending_video_aspect{0};
+static constexpr uint32_t PENDING_VIDEO_ASPECT_ADAPTIVE_ON  = 0xFFFFFFFFu;
+static constexpr uint32_t PENDING_VIDEO_ASPECT_ADAPTIVE_OFF = 0xFFFFFFFEu;
 /* Resize-driven widescreen. The user's fixed aspect is still used to shape the
  * initial window; after the game window exists these values follow its live
  * aspect, clamped to 4:3..the widest mode offered by the title. */
@@ -955,8 +959,12 @@ extern "C" void psx_host_video_get_display_aspect(
     /* Report an accepted pending selection immediately so a host UI does not
      * visibly snap back during the one-frame handoff to the present thread. */
     uint32_t packed = g_pending_video_aspect.load(std::memory_order_acquire);
-    int num = packed ? (int)(packed >> 16) : g_video_aspect_num;
-    int den = packed ? (int)(packed & 0xFFFFu) : g_video_aspect_den;
+    const bool fixed_pending =
+        packed != 0 &&
+        packed != PENDING_VIDEO_ASPECT_ADAPTIVE_ON &&
+        packed != PENDING_VIDEO_ASPECT_ADAPTIVE_OFF;
+    int num = fixed_pending ? (int)(packed >> 16) : g_video_aspect_num;
+    int den = fixed_pending ? (int)(packed & 0xFFFFu) : g_video_aspect_den;
     if (numerator) *numerator = num;
     if (denominator) *denominator = den;
 }
@@ -966,6 +974,23 @@ extern "C" int psx_host_video_set_display_aspect(
     if (!is_host_fixed_display_aspect(numerator, denominator)) return 0;
     g_pending_video_aspect.store(
         pack_display_aspect(numerator, denominator),
+        std::memory_order_release);
+    return 1;
+}
+
+extern "C" int psx_host_video_get_adaptive_view(void) {
+    uint32_t pending =
+        g_pending_video_aspect.load(std::memory_order_acquire);
+    if (pending == PENDING_VIDEO_ASPECT_ADAPTIVE_ON) return 1;
+    if (pending != 0) return 0; /* Explicit off or a pending fixed aspect. */
+    return g_ws_adaptive_view ? 1 : 0;
+}
+
+extern "C" int psx_host_video_set_adaptive_view(int enabled) {
+    if (enabled != 0 && enabled != 1) return 0;
+    g_pending_video_aspect.store(
+        enabled ? PENDING_VIDEO_ASPECT_ADAPTIVE_ON
+                : PENDING_VIDEO_ASPECT_ADAPTIVE_OFF,
         std::memory_order_release);
     return 1;
 }
@@ -1290,10 +1315,34 @@ static void apply_live_display_aspect(int num, int den,
     }
 }
 
-static void apply_pending_fixed_display_aspect() {
+static void update_adaptive_widescreen();
+
+static void apply_pending_display_aspect() {
     uint32_t packed =
         g_pending_video_aspect.exchange(0, std::memory_order_acq_rel);
     if (!packed) return;
+
+    if (packed == PENDING_VIDEO_ASPECT_ADAPTIVE_ON) {
+        g_ws_adaptive_view = true;
+        /* The developer-facing match-window mode supports every intermediate
+         * window ratio, but never exposes more than the audited 32:9 view. */
+        g_ws_adaptive_max_num = 32;
+        g_ws_adaptive_max_den = 9;
+        update_adaptive_widescreen();
+        std::fprintf(stdout,
+            "psxrecomp: live adaptive display aspect enabled "
+            "(match window, maximum 32:9)\n");
+        return;
+    }
+    if (packed == PENDING_VIDEO_ASPECT_ADAPTIVE_OFF) {
+        /* Leave the current effective aspect in place. A subsequent fixed
+         * selection can choose and reshape a canonical fixed output. */
+        g_ws_adaptive_view = false;
+        std::fprintf(stdout,
+            "psxrecomp: live adaptive display aspect disabled\n");
+        return;
+    }
+
     int num = (int)(packed >> 16);
     int den = (int)(packed & 0xFFFFu);
     g_ws_adaptive_view = false;
@@ -4072,7 +4121,14 @@ static void sdl_vblank_present(void) {
      * one coherent aspect. The scope also covers every skipped/early-return
      * vblank path. */
     struct PendingAspectBoundary {
-        ~PendingAspectBoundary() { apply_pending_fixed_display_aspect(); }
+        ~PendingAspectBoundary() {
+            apply_pending_display_aspect();
+            /* SDL resize events were consumed during this vblank. Commit
+             * their ratio only after the old-aspect frame has presented so
+             * projection, packet correction and destination sizing advance
+             * together for the next guest frame. */
+            update_adaptive_widescreen();
+        }
     } pending_aspect_boundary;
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_set_fmv_quiet(mdec_recently_active(2));
@@ -4517,10 +4573,6 @@ static void sdl_vblank_present(void) {
 
     /* Mod hooks. Run after all normal input sampling. */
     mod_call_frame_hooks();
-
-    /* Resize-driven mode updates the pending aspect during BIOS boot too, but
-     * the actual wide compositor remains disengaged until game entry. */
-    update_adaptive_widescreen();
 
     /* Depth24 GP1(07h) retarget (MotK intro→crawl): keep the prior Swap for a
      * few vblanks so stale trailing VRAM never flashes on the right edge. */
@@ -6433,7 +6485,11 @@ int main(int argc, char** argv) {
         g_video_aspect_den = ws_offered ? 9 : 3;
     }
     if (!ws_adaptive_view_supported) g_ws_adaptive_view = false;
-    g_ws_adaptive_max_num = ws_ultrawide_offered ? 21 : 16;
+    /* A title that explicitly opts into resize-driven presentation has
+     * accepted the runtime's full validated aspect range. Launcher-only
+     * ultrawide support remains capped at its historical 21:9 choice. */
+    g_ws_adaptive_max_num = ws_adaptive_view_supported
+        ? 32 : (ws_ultrawide_offered ? 21 : 16);
     g_ws_adaptive_max_den = 9;
 
     /* Explicit process overrides win over saved/configured presentation.

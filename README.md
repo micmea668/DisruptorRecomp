@@ -215,9 +215,10 @@ version of the menu.
 The Controls tab changes horizontal mouse aim, modern controls, both axis
 sensitivities/inversion, experimental vertical look/recentering, and the
 sub-byte camera presentation live. Enhancements contains a live widescreen
-toggle with fixed 16:9, 21:9 and 32:9 choices (4:3 disables widescreen), a live
-1x-4x internal-resolution supersampling selector, exact geometry, perspective
-textures, VSync and the experimental presentation-only frame interpolator. It
+toggle with fixed 16:9, 21:9 and 32:9 choices plus a Match window mode that
+follows any live window ratio from 4:3 through 32:9. A live 1x-4x internal-
+resolution supersampling selector, exact geometry, perspective textures, VSync
+and the experimental presentation-only frame interpolator are also available. It
 also contains a session-only
 experimental draw-distance control with Retail, 1.25x and 1.5x presets.
 Its separate Distance shading control offers the retail palette ramp and a
@@ -354,9 +355,11 @@ fixed 600-VBlank window before enabling that experimental patch.
 
 game-widescreen.toml selects the classic projection-and-stretch 16:9 path at
 launch. The in-game Enhancements tab can now switch the same runtime live
-between 4:3, 16:9, 21:9 and 32:9. A fixed selection is applied only after the
-current frame has presented, updates the window/compositor and projection as
-one transition, disables adaptive aspect, and is saved to `settings.toml`.
+between 4:3, fixed 16:9, 21:9 and 32:9, or Match window. Match window follows
+arbitrary host-window ratios while clamping the rendered view to the audited
+4:3..32:9 range. Every selection is applied only after the current frame has
+presented, updates the window/compositor and projection as one transition, and
+is saved to `settings.toml`; choosing a fixed ratio disables adaptive matching.
 Disruptor's static world uses a yaw-dependent CPU portal projection in addition
 to ordinary GTE geometry. The corrected private Test 8B capture identified the
 upstream visibility seeds at 0x80040FE8 and 0x80040FF0: wrapping eight-bit

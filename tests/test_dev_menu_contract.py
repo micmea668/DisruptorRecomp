@@ -96,6 +96,8 @@ for token in (
     "psx_host_video_set_interpolation",
     "psx_host_video_get_display_aspect",
     "psx_host_video_set_display_aspect",
+    "psx_host_video_get_adaptive_view",
+    "psx_host_video_set_adaptive_view",
     "psx_host_video_get_internal_scale",
     "psx_host_video_set_internal_scale",
     "psx_host_user_settings_path",
@@ -175,6 +177,18 @@ for token in ("numerator == 4", "numerator == 16", "numerator == 21",
               "numerator == 32"):
     require(token in fixed_aspects,
             f"fixed aspect validation is missing {token}")
+adaptive_setter = function_body(main_cpp,
+                                "psx_host_video_set_adaptive_view")
+for token in (
+    "enabled != 0", "enabled != 1", "PENDING_VIDEO_ASPECT_ADAPTIVE_ON",
+    "PENDING_VIDEO_ASPECT_ADAPTIVE_OFF", "g_pending_video_aspect.store",
+    "std::memory_order_release",
+):
+    require(token in adaptive_setter,
+            f"live adaptive-aspect setter is missing {token}")
+require("g_ws_adaptive_max_num = ws_adaptive_view_supported" in main_cpp and
+        "? 32 : (ws_ultrawide_offered ? 21 : 16)" in main_cpp,
+        "saved Match window mode must restore with its 32:9 cap")
 
 scale_setter = function_body(main_cpp, "psx_host_video_set_internal_scale")
 for token in (
@@ -211,14 +225,19 @@ vblank_aspect_prefix = main_cpp[
 ]
 require("PendingAspectBoundary" in vblank_aspect_prefix and
         "~PendingAspectBoundary()" in vblank_aspect_prefix and
-        "apply_pending_fixed_display_aspect" in vblank_aspect_prefix,
-        "fixed aspect requests must apply on vblank-present scope exit")
+        "apply_pending_display_aspect" in vblank_aspect_prefix and
+        "update_adaptive_widescreen" in vblank_aspect_prefix,
+        "aspect requests must apply on vblank-present scope exit")
+require(main_cpp.count("update_adaptive_widescreen();") == 3,
+        "resize-driven aspect must change only at vblank-present scope exit")
 for config_name, config in (
     ("game.toml", game_toml),
     ("game-widescreen.toml", game_wide_toml),
 ):
     require("offer_ultrawide = true" in config,
             f"{config_name} would clamp a saved 21:9 aspect on restart")
+    require("adaptive_view = true" in config,
+            f"{config_name} would clamp saved Match window mode off")
     require('unsquash_funcs = ["0x8003A0F0"]' in config,
             f"{config_name} is missing the finite-skyline diagnostic candidate")
 
@@ -479,7 +498,10 @@ for token in (
     '"16:9", "21:9", "32:9"',
     "psx_host_video_get_display_aspect",
     "psx_host_video_set_display_aspect",
+    "psx_host_video_get_adaptive_view",
+    "psx_host_video_set_adaptive_view",
     "mark_aspect",
+    '"Match window (up to 32:9)"',
     'draw_status_badge("LIVE"',
 ):
     require(token in aspect_controls,
@@ -534,11 +556,13 @@ require("PREF_ASPECT" in function_body(menu, "merge_dirty_preferences") and
         function_body(menu, "merge_dirty_preferences") and
         "settings.has_adaptive_view = true" in
         function_body(menu, "merge_dirty_preferences") and
-        "settings.adaptive_view = false" in
+        "settings.adaptive_view = pending.adaptive_view" in
         function_body(menu, "merge_dirty_preferences"),
-        "fixed live aspect choices must atomically persist and disable adaptive view")
+        "fixed and adaptive aspect choices must persist atomically")
 require("PREF_ASPECT" in function_body(menu, "apply_pending_preferences") and
         "psx_host_video_set_display_aspect" in
+        function_body(menu, "apply_pending_preferences") and
+        "psx_host_video_set_adaptive_view" in
         function_body(menu, "apply_pending_preferences"),
         "a pending aspect choice must survive a soft runtime session")
 require("g_frame_interpolation = 0;" in main_cpp and

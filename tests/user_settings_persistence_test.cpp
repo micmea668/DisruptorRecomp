@@ -125,6 +125,19 @@ int main() {
                 "replacement did not preserve the merged settings");
         require(!has_temp_sibling(root), "replacement leaked a temp file");
 
+        replaced.has_aspect_ratio = true;
+        replaced.aspect_num = 32;
+        replaced.aspect_den = 9;
+        replaced.has_adaptive_view = true;
+        replaced.adaptive_view = true;
+        require(PSXRecompV4::save_user_settings(path, replaced),
+                "adaptive display aspect save failed");
+        UserSettings adaptive = PSXRecompV4::load_user_settings(path);
+        require(adaptive.has_aspect_ratio && adaptive.aspect_num == 32 &&
+                    adaptive.aspect_den == 9 && adaptive.has_adaptive_view &&
+                    adaptive.adaptive_view,
+                "adaptive display aspect did not round-trip");
+
         const fs::path invalid = root / "invalid.toml";
         {
             std::ofstream out(invalid, std::ios::trunc);

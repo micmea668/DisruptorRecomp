@@ -45,7 +45,7 @@ hud_sprt_squash = true
 nw_hud_corners = false
 offer = true
 offer_ultrawide = true
-adaptive_view = false
+adaptive_view = true
 
 [[widescreen.cull.yaw_cone]]
 address = "0x80040FE8"

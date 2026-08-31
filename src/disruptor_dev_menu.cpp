@@ -245,14 +245,14 @@ void mark_interpolation_blend(int value) {
     g_preferences.dirty |= PREF_INTERP_BLEND;
 }
 
-void mark_aspect(int numerator, int denominator) {
+void mark_aspect(int numerator, int denominator, bool adaptive) {
     g_preferences.pending.has_aspect_ratio = true;
     g_preferences.pending.aspect_num = numerator;
     g_preferences.pending.aspect_den = denominator;
-    /* Every menu entry is a fixed aspect. Clear a launcher-era adaptive
-     * preference as part of the same atomic settings update. */
+    /* Keep the adaptive flag and its fixed 32:9 cap in the same atomic
+     * settings update as the fallback/initial aspect. */
     g_preferences.pending.has_adaptive_view = true;
-    g_preferences.pending.adaptive_view = false;
+    g_preferences.pending.adaptive_view = adaptive;
     g_preferences.dirty |= PREF_ASPECT;
 }
 
@@ -321,7 +321,7 @@ void merge_dirty_preferences(PSXRecompV4::UserSettings &settings) {
         settings.aspect_num = pending.aspect_num;
         settings.aspect_den = pending.aspect_den;
         settings.has_adaptive_view = true;
-        settings.adaptive_view = false;
+        settings.adaptive_view = pending.adaptive_view;
     }
     if (g_preferences.dirty & PREF_SUPERSAMPLING) {
         settings.has_supersampling = true;
@@ -466,9 +466,13 @@ void apply_pending_preferences() {
             blend = pending.frame_interpolation_blend;
         (void)psx_host_video_set_interpolation(enabled, target, blend);
     }
-    if (g_preferences.dirty & PREF_ASPECT)
-        (void)psx_host_video_set_display_aspect(
-            pending.aspect_num, pending.aspect_den);
+    if (g_preferences.dirty & PREF_ASPECT) {
+        if (pending.adaptive_view)
+            (void)psx_host_video_set_adaptive_view(1);
+        else
+            (void)psx_host_video_set_display_aspect(
+                pending.aspect_num, pending.aspect_den);
+    }
     if (g_preferences.dirty & PREF_SUPERSAMPLING)
         (void)psx_host_video_set_internal_scale(pending.supersampling);
 }
@@ -834,17 +838,23 @@ void draw_far_rendering_controls() {
 }
 
 void draw_aspect_controls() {
-    static constexpr int kAspectNumerators[] = {16, 21, 32};
-    static constexpr int kAspectDenominators[] = {9, 9, 9};
-    static const char *kAspectLabels[] = {"16:9", "21:9", "32:9"};
-    static constexpr int kAspectCount = 3;
+    static constexpr int kAspectNumerators[] = {16, 21, 32, 32};
+    static constexpr int kAspectDenominators[] = {9, 9, 9, 9};
+    static const char *kAspectLabels[] = {
+        "16:9", "21:9", "32:9", "Match window (up to 32:9)"};
+    static constexpr int kFixedWideAspectCount = 3;
+    static constexpr int kAdaptiveAspectIndex = 3;
+    static constexpr int kAspectCount = 4;
 
     int numerator = 4;
     int denominator = 3;
     psx_host_video_get_display_aspect(&numerator, &denominator);
-    bool widescreen = numerator * 3 != denominator * 4;
-    if (widescreen) {
-        for (int index = 0; index < kAspectCount; ++index) {
+    const bool adaptive = psx_host_video_get_adaptive_view() != 0;
+    bool widescreen = adaptive || numerator * 3 != denominator * 4;
+    if (adaptive) {
+        g_menu.selected_wide_aspect = kAdaptiveAspectIndex;
+    } else if (widescreen) {
+        for (int index = 0; index < kFixedWideAspectCount; ++index) {
             if (numerator * kAspectDenominators[index] ==
                 denominator * kAspectNumerators[index]) {
                 g_menu.selected_wide_aspect = index;
@@ -857,14 +867,23 @@ void draw_aspect_controls() {
 
     ImGui::SeparatorText("Display aspect");
     if (ImGui::Checkbox("Widescreen", &widescreen)) {
-        const int requested_num = widescreen
-            ? kAspectNumerators[g_menu.selected_wide_aspect] : 4;
-        const int requested_den = widescreen
-            ? kAspectDenominators[g_menu.selected_wide_aspect] : 3;
-        g_menu.aspect_apply_failed =
-            psx_host_video_set_display_aspect(requested_num, requested_den) == 0;
-        if (!g_menu.aspect_apply_failed)
-            mark_aspect(requested_num, requested_den);
+        if (widescreen &&
+            g_menu.selected_wide_aspect == kAdaptiveAspectIndex) {
+            g_menu.aspect_apply_failed =
+                psx_host_video_set_adaptive_view(1) == 0;
+            if (!g_menu.aspect_apply_failed)
+                mark_aspect(32, 9, true);
+        } else {
+            const int requested_num = widescreen
+                ? kAspectNumerators[g_menu.selected_wide_aspect] : 4;
+            const int requested_den = widescreen
+                ? kAspectDenominators[g_menu.selected_wide_aspect] : 3;
+            g_menu.aspect_apply_failed =
+                psx_host_video_set_display_aspect(
+                    requested_num, requested_den) == 0;
+            if (!g_menu.aspect_apply_failed)
+                mark_aspect(requested_num, requested_den, false);
+        }
     }
     draw_status_badge("LIVE", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
 
@@ -873,13 +892,20 @@ void draw_aspect_controls() {
                      kAspectCount)) {
         g_menu.selected_wide_aspect = selected;
         if (widescreen) {
-            const int requested_num = kAspectNumerators[selected];
-            const int requested_den = kAspectDenominators[selected];
-            g_menu.aspect_apply_failed =
-                psx_host_video_set_display_aspect(
-                    requested_num, requested_den) == 0;
-            if (!g_menu.aspect_apply_failed)
-                mark_aspect(requested_num, requested_den);
+            if (selected == kAdaptiveAspectIndex) {
+                g_menu.aspect_apply_failed =
+                    psx_host_video_set_adaptive_view(1) == 0;
+                if (!g_menu.aspect_apply_failed)
+                    mark_aspect(32, 9, true);
+            } else {
+                const int requested_num = kAspectNumerators[selected];
+                const int requested_den = kAspectDenominators[selected];
+                g_menu.aspect_apply_failed =
+                    psx_host_video_set_display_aspect(
+                        requested_num, requested_den) == 0;
+                if (!g_menu.aspect_apply_failed)
+                    mark_aspect(requested_num, requested_den, false);
+            }
         }
     }
     if (g_menu.aspect_apply_failed) {
@@ -888,8 +914,9 @@ void draw_aspect_controls() {
             "The runtime rejected the requested display aspect.");
     }
     ImGui::TextDisabled(
-        "4:3 disables widescreen. Fixed 16:9, 21:9 and 32:9 choices "
-        "apply after the current frame and are saved.");
+        "4:3 disables widescreen. Fixed 16:9, 21:9 and 32:9 choices or "
+        "live window matching (capped at 32:9) apply after the current "
+        "frame and are saved.");
 }
 
 void draw_internal_resolution_controls() {

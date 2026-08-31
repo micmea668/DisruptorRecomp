@@ -47,7 +47,7 @@ hud_sprt_squash = true
 nw_hud_corners = false
 offer = true
 offer_ultrawide = true
-adaptive_view = false
+adaptive_view = true
 
 # Disruptor seeds portal traversal with two eight-bit yaw rays at +/-32 units
 # (a 45-degree 4:3 half-FOV). Widen only those signed offsets for the live
