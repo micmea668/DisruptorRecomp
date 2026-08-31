@@ -8,6 +8,7 @@
  */
 
 #include "disruptor_cheats.h"
+#include "disruptor_billboard_aspect.h"
 #include "disruptor_far_rendering.h"
 #include "disruptor_mouse_aim.h"
 #include "config_loader.h"
@@ -32,6 +33,13 @@
 #include <filesystem>
 #include <string>
 
+extern "C" void gte_ws_set_far_threshold(int threshold);
+extern "C" int gte_ws_get_far_threshold(void);
+extern "C" void gte_ws_set_backdrop_repair_enabled(int enabled);
+extern "C" int gte_ws_get_backdrop_repair_enabled(void);
+extern "C" void gte_ws_get_sz_stats(
+    int *minimum, int *maximum, unsigned *samples, unsigned *affected);
+
 namespace {
 
 struct DevMenuState {
@@ -42,9 +50,14 @@ struct DevMenuState {
     bool restore_mouse_capture = false;
     bool interpolation_apply_failed = false;
     bool aspect_apply_failed = false;
+    bool internal_scale_apply_failed = false;
     bool far_rendering_apply_failed = false;
     bool base_keybinds_valid = false;
     int selected_wide_aspect = 0;
+    int backdrop_depth_min = 0;
+    int backdrop_depth_max = 0;
+    unsigned backdrop_depth_samples = 0;
+    unsigned backdrop_depth_affected = 0;
     std::string cheat_status;
     std::array<SDL_Scancode, PSX_KB_COUNT> base_keybinds{};
 };
@@ -68,6 +81,7 @@ enum PreferenceDirty : uint32_t {
     PREF_VERTICAL_SENS     = 1u << 11,
     PREF_INVERT_Y          = 1u << 12,
     PREF_ASPECT            = 1u << 13,
+    PREF_SUPERSAMPLING     = 1u << 14,
 };
 
 struct PreferenceState {
@@ -242,6 +256,12 @@ void mark_aspect(int numerator, int denominator) {
     g_preferences.dirty |= PREF_ASPECT;
 }
 
+void mark_supersampling(int value) {
+    g_preferences.pending.has_supersampling = true;
+    g_preferences.pending.supersampling = value;
+    g_preferences.dirty |= PREF_SUPERSAMPLING;
+}
+
 void merge_dirty_preferences(PSXRecompV4::UserSettings &settings) {
     const auto &pending = g_preferences.pending;
     if (g_preferences.dirty & PREF_MOUSE_AIM) {
@@ -302,6 +322,10 @@ void merge_dirty_preferences(PSXRecompV4::UserSettings &settings) {
         settings.aspect_den = pending.aspect_den;
         settings.has_adaptive_view = true;
         settings.adaptive_view = false;
+    }
+    if (g_preferences.dirty & PREF_SUPERSAMPLING) {
+        settings.has_supersampling = true;
+        settings.supersampling = pending.supersampling;
     }
 }
 
@@ -394,6 +418,8 @@ void apply_saved_preferences(const PSXRecompV4::UserSettings &settings) {
                     gpu_geometry_correction_enabled()
                 ? 1 : 0);
     }
+    if (settings.has_supersampling)
+        (void)psx_host_video_set_internal_scale(settings.supersampling);
 }
 
 void apply_pending_preferences() {
@@ -443,6 +469,8 @@ void apply_pending_preferences() {
     if (g_preferences.dirty & PREF_ASPECT)
         (void)psx_host_video_set_display_aspect(
             pending.aspect_num, pending.aspect_den);
+    if (g_preferences.dirty & PREF_SUPERSAMPLING)
+        (void)psx_host_video_set_internal_scale(pending.supersampling);
 }
 
 void load_preferences_for_session() {
@@ -864,8 +892,137 @@ void draw_aspect_controls() {
         "apply after the current frame and are saved.");
 }
 
+void draw_internal_resolution_controls() {
+    static const char *kScaleLabels[] = {
+        "1x (native)", "2x", "3x", "4x"};
+    int selected = std::clamp(
+        psx_host_video_get_internal_scale(), 1, 4) - 1;
+
+    ImGui::SeparatorText("Rendering resolution");
+    if (ImGui::Combo("Internal resolution scale", &selected,
+                     kScaleLabels, 4)) {
+        const int requested = selected + 1;
+        g_menu.internal_scale_apply_failed =
+            psx_host_video_set_internal_scale(requested) == 0;
+        if (!g_menu.internal_scale_apply_failed)
+            mark_supersampling(requested);
+    }
+    draw_status_badge("LIVE", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
+    if (g_menu.internal_scale_apply_failed) {
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+            "The renderer could not allocate that internal resolution.");
+    }
+    ImGui::TextDisabled(
+        "Supersamples geometry and shading before presentation. GPU fill and "
+        "memory cost grow roughly with the square of this value; changes "
+        "apply immediately and are saved.");
+}
+
+void draw_billboard_aspect_diagnostic_controls() {
+    static constexpr std::array<const char *, 6> kPathLabels{{
+        "Path A - 0x8003BB88",
+        "Path B - 0x8003BFB0",
+        "Path C - 0x8003C848",
+        "Path D - 0x8003CAD4",
+        "Path E - 0x8003D488",
+        "Path F - 0x800433A0",
+    }};
+
+    ImGui::SeparatorText("Widescreen sprite diagnosis");
+    const uint32_t all_mask = disruptor_billboard_aspect_all_site_mask();
+    uint32_t mask = disruptor_billboard_aspect_get_site_mask();
+    if (ImGui::Button("Disable world-sprite repair")) {
+        disruptor_billboard_aspect_set_site_mask(0);
+        mask = 0;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Restore all sprite paths")) {
+        disruptor_billboard_aspect_set_site_mask(all_mask);
+        mask = all_mask;
+    }
+    draw_status_badge("SESSION", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
+
+    int active_paths = 0;
+    for (std::size_t i = 0; i < kPathLabels.size(); ++i)
+        active_paths += (mask & (1u << i)) != 0 ? 1 : 0;
+    ImGui::Text("Active correction paths: %d / %d", active_paths,
+                static_cast<int>(kPathLabels.size()));
+
+    if (ImGui::TreeNode("Isolate packet-builder paths")) {
+        for (std::size_t i = 0; i < kPathLabels.size(); ++i) {
+            const uint32_t bit = 1u << i;
+            bool enabled = (mask & bit) != 0;
+            if (ImGui::Checkbox(kPathLabels[i], &enabled)) {
+                mask = enabled ? (mask | bit) : (mask & ~bit);
+                disruptor_billboard_aspect_set_site_mask(mask);
+            }
+        }
+        ImGui::TreePop();
+    }
+    ImGui::TextWrapped(
+        "Diagnostic only: disabling these paths restores retail-width enemy, "
+        "item, and decorative FT4 sprites. It does not change world geometry, "
+        "the level clear colour, or saved settings.");
+    ImGui::TextDisabled(
+        "Every runtime start restores all reviewed sprite paths.");
+}
+
+void draw_finite_backdrop_controls() {
+    ImGui::SeparatorText("Finite skyline diagnosis");
+    int threshold = gte_ws_get_far_threshold();
+    bool enabled = gte_ws_get_backdrop_repair_enabled() != 0;
+    if (ImGui::Checkbox("Depth-gated backdrop coverage", &enabled)) {
+        gte_ws_set_backdrop_repair_enabled(enabled ? 1 : 0);
+        g_menu.backdrop_depth_samples = 0;
+    }
+    draw_status_badge("SESSION", ImVec4(1.0f, 0.73f, 0.25f, 1.0f));
+
+    if (!enabled) ImGui::BeginDisabled();
+    int edited_threshold = std::clamp(threshold, 1, 65535);
+    if (ImGui::SliderInt("Backdrop depth threshold", &edited_threshold,
+                         1, 65535, "%d", ImGuiSliderFlags_Logarithmic)) {
+        gte_ws_set_far_threshold(edited_threshold);
+        g_menu.backdrop_depth_samples = 0;
+    }
+    if (!enabled) ImGui::EndDisabled();
+
+    int minimum = 0;
+    int maximum = 0;
+    unsigned samples = 0;
+    unsigned affected = 0;
+    gte_ws_get_sz_stats(&minimum, &maximum, &samples, &affected);
+    if (samples != 0) {
+        g_menu.backdrop_depth_min = minimum;
+        g_menu.backdrop_depth_max = maximum;
+        g_menu.backdrop_depth_samples = samples;
+        g_menu.backdrop_depth_affected = affected;
+    }
+    if (g_menu.backdrop_depth_samples != 0) {
+        ImGui::Text("Static-renderer depth: %d .. %d (%u samples)",
+                    g_menu.backdrop_depth_min, g_menu.backdrop_depth_max,
+                    g_menu.backdrop_depth_samples);
+        ImGui::Text("Backdrop-qualified vertices: %u (%.1f%%)",
+                    g_menu.backdrop_depth_affected,
+                    100.0 * static_cast<double>(
+                        g_menu.backdrop_depth_affected) /
+                        static_cast<double>(g_menu.backdrop_depth_samples));
+    } else {
+        ImGui::TextDisabled(
+            "Depth samples appear while wide gameplay renders behind this menu.");
+    }
+    ImGui::TextWrapped(
+        "This narrowly targets the static-room transform used by finite skyline "
+        "meshes. Lower values include progressively nearer geometry; "
+        "higher values restrict the repair to the farthest layer.");
+    ImGui::TextDisabled(
+        "Diagnostic control only: coverage starts disabled at threshold 900 "
+        "on each launch and is not saved.");
+}
+
 void draw_enhancements_tab() {
     draw_aspect_controls();
+    draw_internal_resolution_controls();
 
     bool geometry = gpu_geometry_correction_enabled() != 0;
     if (ImGui::Checkbox("Exact-provenance geometry", &geometry))
@@ -882,6 +1039,10 @@ void draw_enhancements_tab() {
     draw_status_badge("LIVE", ImVec4(0.35f, 0.90f, 0.45f, 1.0f));
     if (!geometry)
         ImGui::TextDisabled("Enable exact geometry before perspective textures.");
+
+    draw_billboard_aspect_diagnostic_controls();
+
+    draw_finite_backdrop_controls();
 
     draw_far_rendering_controls();
 
@@ -1210,7 +1371,6 @@ void draw_system_tab() {
         "off each launch.");
     ImGui::SeparatorText("Restart required");
     ImGui::BulletText("Renderer backend");
-    ImGui::BulletText("Supersampling/internal framebuffer allocation");
     ImGui::BulletText("Audio backend and buffer configuration");
     ImGui::BulletText("BIOS, disc and memory-card wiring");
     ImGui::Separator();
@@ -1261,7 +1421,11 @@ void draw_menu() {
 void on_runtime_ready(void *, SDL_Window *window, int backend) {
     disruptor_cheats_reset_session();
     disruptor_far_rendering_reset_session();
+    disruptor_billboard_aspect_set_site_mask(
+        disruptor_billboard_aspect_all_site_mask());
     disruptor_mouse_recenter_vertical();
+    gte_ws_set_far_threshold(900);
+    gte_ws_set_backdrop_repair_enabled(0);
     g_menu.window = window;
     g_menu.backend = backend;
     load_preferences_for_session();
@@ -1271,7 +1435,11 @@ void on_runtime_ready(void *, SDL_Window *window, int backend) {
 void on_runtime_shutdown(void *) {
     disruptor_cheats_reset_session();
     disruptor_far_rendering_reset_session();
+    disruptor_billboard_aspect_set_site_mask(
+        disruptor_billboard_aspect_all_site_mask());
     disruptor_mouse_recenter_vertical();
+    gte_ws_set_far_threshold(900);
+    gte_ws_set_backdrop_repair_enabled(0);
     (void)flush_preferences();
     if (disruptor_mouse_captured())
         (void)disruptor_mouse_set_captured(0);

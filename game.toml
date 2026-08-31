@@ -93,6 +93,11 @@ x_sites = [
     "0x8003B988", "0x8003BD9C", "0x8003C4AC", "0x8003D074",
     "0x8003F6B4",
 ]
+# Diagnostic candidate for the static-room renderer used near the affected
+# skyline. The runtime keeps this scope disabled by default; its depth gate can
+# be enabled session-only to test whether far GTE-projected meshes need to keep
+# their authored 4:3 coverage before the final wide stretch.
+unsquash_funcs = ["0x8003A0F0"]
 
 [audit]
 [[audit.regions]]

@@ -39,6 +39,8 @@ int main() {
         UserSettings written;
         written.has_vsync = true;
         written.vsync = -1;
+        written.has_supersampling = true;
+        written.supersampling = 3;
         written.has_frame_interpolation_fps = true;
         written.frame_interpolation_fps = 144;
         written.has_frame_interpolation_blend = true;
@@ -80,6 +82,8 @@ int main() {
         require(!loaded.parse_error, "saved settings failed to parse");
         require(loaded.has_vsync && loaded.vsync == -1,
                 "vsync did not round-trip");
+        require(loaded.has_supersampling && loaded.supersampling == 3,
+                "internal resolution scale did not round-trip");
         require(loaded.has_frame_interpolation_fps &&
                     loaded.frame_interpolation_fps == 144 &&
                     loaded.has_frame_interpolation_blend &&
@@ -115,6 +119,8 @@ int main() {
         require(replaced.has_mouse_aim && !replaced.mouse_aim &&
                     replaced.has_language && replaced.has_aspect_ratio &&
                     replaced.aspect_num == 32 && replaced.aspect_den == 9 &&
+                    replaced.has_supersampling &&
+                    replaced.supersampling == 3 &&
                     replaced.has_adaptive_view && !replaced.adaptive_view,
                 "replacement did not preserve the merged settings");
         require(!has_temp_sibling(root), "replacement leaked a temp file");

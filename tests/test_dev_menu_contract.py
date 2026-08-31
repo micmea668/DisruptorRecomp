@@ -57,6 +57,7 @@ manifest = read("PSXRECOMP_OVERLAY_FILES.txt")
 host_ui = read("psxrecomp-overlay/runtime/include/host_ui.h")
 main_cpp = read("psxrecomp-overlay/runtime/src/main.cpp")
 gl = read("psxrecomp-overlay/runtime/src/gpu_gl_renderer.c")
+gte = read("psxrecomp-overlay/runtime/src/gte.cpp")
 menu = read("src/disruptor_dev_menu.cpp")
 mouse = read("src/disruptor_mouse_aim.cpp")
 cheats = read("src/disruptor_cheats.cpp")
@@ -95,6 +96,8 @@ for token in (
     "psx_host_video_set_interpolation",
     "psx_host_video_get_display_aspect",
     "psx_host_video_set_display_aspect",
+    "psx_host_video_get_internal_scale",
+    "psx_host_video_set_internal_scale",
     "psx_host_user_settings_path",
 ):
     require(token in host_ui, f"host UI ABI is missing {token}")
@@ -172,6 +175,24 @@ for token in ("numerator == 4", "numerator == 16", "numerator == 21",
               "numerator == 32"):
     require(token in fixed_aspects,
             f"fixed aspect validation is missing {token}")
+
+scale_setter = function_body(main_cpp, "psx_host_video_set_internal_scale")
+for token in (
+    "scale < 1", "scale > SW_MAX_INTERNAL_SCALE",
+    "PSX_HOST_UI_BACKEND_OPENGL", "std::realloc", "gr_set_scale(scale)",
+    "gr_scale()", "g_video_scale = applied",
+):
+    require(token in scale_setter,
+            f"live internal-scale setter is missing {token}")
+resize_scale = function_body(gl, "resize_gpu_raster")
+for token in (
+    "flush_flat_batch", "flush_tex_batch", "flush_cpu_upload",
+    "new_hr_tex", "new_scratch_tex", "new_wide_tex",
+    "p_glBlitFramebuffer", "rebuild_target_stencil", "u_shift",
+    "gl_renderer_invalidate_present", "delete_scale_target",
+):
+    require(token in resize_scale,
+            f"transactional GL internal-scale rebuild is missing {token}")
 aspect_apply = function_body(main_cpp, "apply_live_display_aspect")
 for token in (
     "gl_renderer_set_display_aspect",
@@ -198,6 +219,18 @@ for config_name, config in (
 ):
     require("offer_ultrawide = true" in config,
             f"{config_name} would clamp a saved 21:9 aspect on restart")
+    require('unsquash_funcs = ["0x8003A0F0"]' in config,
+            f"{config_name} is missing the finite-skyline diagnostic candidate")
+
+require("gte_ws_get_far_threshold" in menu and
+        "gte_ws_set_far_threshold" in menu and
+        "gte_ws_get_backdrop_repair_enabled" in menu and
+        "gte_ws_set_backdrop_repair_enabled" in menu and
+        "gte_ws_get_sz_stats" in menu and
+        'SeparatorText("Finite skyline diagnosis")' in menu,
+        "developer menu is missing the session-only finite-skyline tuner")
+require("static int s_ws_backdrop_repair_enabled = 0;" in gte,
+        "the unvalidated finite-skyline probe must default off")
 
 for token in (
     "SDL_SCANCODE_GRAVE",
@@ -212,6 +245,7 @@ for token in (
     "psx_host_video_set_interpolation",
     "psx_host_video_set_vsync",
     "psx_host_video_set_display_aspect",
+    "psx_host_video_set_internal_scale",
     "gpu_geometry_correction_stats_detailed",
 ):
     require(token in menu, f"developer menu is missing {token}")
@@ -450,6 +484,51 @@ for token in (
 ):
     require(token in aspect_controls,
             f"live aspect controls are missing {token}")
+
+scale_controls = function_body(menu, "draw_internal_resolution_controls")
+for token in (
+    'SeparatorText("Rendering resolution")',
+    'Combo("Internal resolution scale"',
+    '"1x (native)", "2x", "3x", "4x"',
+    "psx_host_video_get_internal_scale",
+    "psx_host_video_set_internal_scale",
+    "mark_supersampling",
+    'draw_status_badge("LIVE"',
+):
+    require(token in scale_controls,
+            f"live internal-resolution controls are missing {token}")
+require("PREF_SUPERSAMPLING" in
+        function_body(menu, "merge_dirty_preferences") and
+        "settings.has_supersampling = true" in
+        function_body(menu, "merge_dirty_preferences"),
+        "internal scale must be merged into the user settings")
+require("PREF_SUPERSAMPLING" in
+        function_body(menu, "apply_pending_preferences") and
+        "psx_host_video_set_internal_scale" in
+        function_body(menu, "apply_pending_preferences"),
+        "a pending internal scale must survive a soft runtime session")
+require('BulletText("Supersampling/internal framebuffer allocation")' not in menu,
+        "live internal scale must not remain listed as restart-only")
+
+billboard_controls = function_body(
+    menu, "draw_billboard_aspect_diagnostic_controls")
+for token in (
+    'SeparatorText("Widescreen sprite diagnosis")',
+    'Button("Disable world-sprite repair")',
+    'Button("Restore all sprite paths")',
+    'TreeNode("Isolate packet-builder paths")',
+    "disruptor_billboard_aspect_get_site_mask",
+    "disruptor_billboard_aspect_set_site_mask",
+    "the level clear colour",
+    "Every runtime start restores all reviewed sprite paths",
+):
+    require(token in billboard_controls,
+            f"billboard isolation control is missing {token}")
+for function_name in ("on_runtime_ready", "on_runtime_shutdown"):
+    session_body = function_body(menu, function_name)
+    require("disruptor_billboard_aspect_all_site_mask" in session_body and
+            "disruptor_billboard_aspect_set_site_mask" in session_body,
+            f"{function_name} must restore every billboard repair path")
 require("PREF_ASPECT" in function_body(menu, "merge_dirty_preferences") and
         "settings.has_aspect_ratio = true" in
         function_body(menu, "merge_dirty_preferences") and

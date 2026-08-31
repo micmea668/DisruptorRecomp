@@ -79,6 +79,8 @@ x_sites = [
     "0x8003B988", "0x8003BD9C", "0x8003C4AC", "0x8003D074",
     "0x8003F6B4",
 ]
+# Session-only diagnostic candidate; runtime-disabled unless explicitly enabled.
+unsquash_funcs = ["0x8003A0F0"]
 
 [audit]
 [[audit.regions]]

@@ -477,6 +477,10 @@ static PlayerInput g_players[2];
  * 640*scale x 512*scale. Allocated once the supersampling scale is known
  * (sized for the native 640x512 when supersampling is off). */
 static uint32_t*     sdl_pixel_buf = nullptr;
+/* Live OpenGL internal-scale changes may grow the CPU fallback/readback path.
+ * Never shrink this allocation during a session: if a GL target rebuild fails,
+ * the previous (larger) renderer scale must remain safe to present. */
+static int           sdl_pixel_buf_scale_capacity = 0;
 
 typedef void (*ModFrameHook)(void);
 
@@ -963,6 +967,38 @@ extern "C" int psx_host_video_set_display_aspect(
     g_pending_video_aspect.store(
         pack_display_aspect(numerator, denominator),
         std::memory_order_release);
+    return 1;
+}
+
+extern "C" int psx_host_video_get_internal_scale(void) {
+    return g_video_scale;
+}
+
+extern "C" int psx_host_video_set_internal_scale(int scale) {
+    if (scale < 1 || scale > SW_MAX_INTERNAL_SCALE) return 0;
+    /* The developer UI itself is OpenGL-backed. Software and Vulkan keep
+     * startup-only allocation rules until their presentation resources gain
+     * an equivalent transactional rebuild. */
+    if (!host_ui_state().session_live ||
+        host_ui_state().backend != PSX_HOST_UI_BACKEND_OPENGL) {
+        return 0;
+    }
+    if (scale == g_video_scale) return 1;
+
+    if (scale > sdl_pixel_buf_scale_capacity) {
+        uint32_t *grown = static_cast<uint32_t *>(std::realloc(
+            sdl_pixel_buf,
+            (size_t)640 * scale * 512 * scale * sizeof(uint32_t)));
+        if (!grown) return 0;
+        sdl_pixel_buf = grown;
+        sdl_pixel_buf_scale_capacity = scale;
+    }
+
+    gr_set_scale(scale);
+    const int applied = gr_scale();
+    if (applied != scale) return 0;
+    g_video_scale = applied;
+    gl_renderer_invalidate_present();
     return 1;
 }
 
@@ -2080,6 +2116,7 @@ static void teardown_game_session_keep_lobby(void) {
     if (sdl_renderer) { SDL_DestroyRenderer(sdl_renderer); sdl_renderer = nullptr; }
     if (sdl_window) { SDL_DestroyWindow(sdl_window); sdl_window = nullptr; }
     if (sdl_pixel_buf) { std::free(sdl_pixel_buf); sdl_pixel_buf = nullptr; }
+    sdl_pixel_buf_scale_capacity = 0;
     psx_lobby_set_ready(0);
     psx_lobby_clear_launch_pending();
     psx_clear_return_to_lobby();
@@ -7579,6 +7616,7 @@ session_reboot:
         std::fprintf(stderr, "failed to allocate %dx staging buffer\n", g_video_scale);
         return 1;
     }
+    sdl_pixel_buf_scale_capacity = g_video_scale;
 
   if (!g_gl_active && !g_vk_active) {
     sdl_texture = SDL_CreateTexture(

@@ -18,6 +18,7 @@ option(DISRUPTOR_DEV_MENU
     ON)
 
 set(DISRUPTOR_EXTRA_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_billboard_aspect.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_cheats.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_control_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_far_rendering.cpp"
@@ -104,6 +105,7 @@ psxrecomp_add_runtime_target(psx-runtime
     EXE_NAME "DisruptorRecompiled"
 )
 target_compile_definitions(psx-runtime PRIVATE
+    PSX_HAS_DISRUPTOR_BILLBOARD_ASPECT=1
     PSX_HAS_DISRUPTOR_FAR_RENDERING=1
     PSX_HAS_DISRUPTOR_VERTICAL_CAMERA=1)
 if(DISRUPTOR_DEV_MENU)
@@ -155,6 +157,10 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_far_rendering_contract.py")
 
+    add_test(NAME disruptor_billboard_aspect_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_billboard_aspect_contract.py")
+
     add_test(NAME disruptor_framework_overlay_new_file
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_framework_overlay_new_file.py")
@@ -203,6 +209,18 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
         "${PSXRECOMP_ROOT}/runtime/include")
     target_compile_features(disruptor-far-rendering-test PRIVATE cxx_std_17)
 
+    add_executable(disruptor-billboard-aspect-test
+        tests/disruptor_billboard_aspect_test.cpp)
+    target_include_directories(disruptor-billboard-aspect-test PRIVATE
+        "${PSXRECOMP_ROOT}/runtime/include")
+    target_compile_features(disruptor-billboard-aspect-test PRIVATE cxx_std_17)
+
+    add_executable(disruptor-gpu-ws-tag-match-test
+        tests/gpu_ws_tag_match_test.cpp)
+    target_include_directories(disruptor-gpu-ws-tag-match-test PRIVATE
+        "${PSXRECOMP_ROOT}/runtime/include")
+    target_compile_features(disruptor-gpu-ws-tag-match-test PRIVATE cxx_std_17)
+
     add_executable(disruptor-presentation-yaw-math-test
         tests/presentation_yaw_math_test.cpp)
     target_compile_features(disruptor-presentation-yaw-math-test PRIVATE cxx_std_17)
@@ -227,6 +245,10 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
         COMMAND disruptor-vertical-camera-test)
     add_test(NAME disruptor_far_rendering
         COMMAND disruptor-far-rendering-test)
+    add_test(NAME disruptor_billboard_aspect
+        COMMAND disruptor-billboard-aspect-test)
+    add_test(NAME disruptor_gpu_ws_tag_match
+        COMMAND disruptor-gpu-ws-tag-match-test)
     set_tests_properties(disruptor_mouse_aim PROPERTIES
         ENVIRONMENT "PSX_DISRUPTOR_MOUSE_AIM=;PSX_DISRUPTOR_VERTICAL_LOOK=;PSX_DISRUPTOR_MODERN_CONTROLS=;PSX_DISRUPTOR_HIGH_PRECISION_CAMERA=")
 

@@ -25,6 +25,7 @@
 #include "mod_runtime.h"
 #include "ws_cull_detect.h"
 #include "ws_aspect_cone_math.h"
+#include "gpu_ws_tag_match.h"
 #include "ws_ui_group.h"
 #include <math.h>
 #include <stdint.h>
@@ -127,7 +128,13 @@ static void ws_nw_sync_target(void);
 #define WS_TAG_BUCKETS 4096                  /* power of two */
 #define WS_TAG_PROBES  8
 #define WS_FMV_HYSTERESIS 30                 /* frames a colour MDEC decode pins 4:3 */
-typedef struct { uint32_t key; uint32_t stamp; int32_t anchor_x; } WsTag;
+typedef struct {
+    uint32_t key;
+    uint32_t stamp;
+    int32_t anchor_x;
+    uint32_t signature;
+    uint8_t content_validated;
+} WsTag;
 static WsTag    ws_tags[WS_TAG_BUCKETS];
 static uint32_t ws_last_tag_stamp = (uint32_t)-1000; /* frame of newest tag */
 static uint32_t ws_last_3d_stamp  = (uint32_t)-1000; /* frame of newest shaded prim (diagnostic) */
@@ -1699,17 +1706,10 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
     ws_nw_sync_target();
 }
 
-/* Called from generated code at the entry of each [widescreen]
- * sprite_tag_funcs function: record prim pointer ($a0) -> projected anchor.
- * Gated on ws_configured (NOT ws_active): ws_active depends on game_mode which
- * THIS function sets, so gating it on ws_active would never let gameplay
- * start (the first character of a frame would be suppressed forever). */
-void psx_ws_sprite_tag(CPUState* cpu) {
-    if (!ws_engaged() || !ws_anchor_addr) return;
-    uint32_t key = cpu->gpr[4] & 0x1FFFFCu;
+static void ws_tag_primitive(uint32_t primitive_addr, int32_t anchor_x,
+                             uint32_t signature, int content_validated) {
+    uint32_t key = primitive_addr & 0x1FFFFCu;
     if (!key) return;
-    uint32_t sxy = cpu->read_word(ws_anchor_addr);
-    int32_t  ax  = (int32_t)(int16_t)(sxy & 0xFFFFu);
     uint32_t now = (uint32_t)s_frame_count;
     uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
     uint32_t victim = idx;
@@ -1721,8 +1721,50 @@ void psx_ws_sprite_tag(CPUState* cpu) {
     }
     ws_tags[victim].key      = key;
     ws_tags[victim].stamp    = now;
-    ws_tags[victim].anchor_x = ax;
+    ws_tags[victim].anchor_x = anchor_x;
+    ws_tags[victim].signature = signature;
+    ws_tags[victim].content_validated = content_validated != 0;
     ws_last_tag_stamp = now;
+}
+
+/* Explicit provenance seam for a title-specific, reviewed world-billboard
+ * builder.  Unlike sprite_tag_funcs this does not depend on a fixed scratchpad
+ * anchor: the caller has already identified both the completed P_TAG packet and
+ * its projected centre.  Restrict it to the classic squash path so a tag cannot
+ * affect native-wide backdrop classification or a native-4:3 presentation. */
+void gpu_ws_tag_primitive(CPUState *cpu, uint32_t primitive_addr,
+                          int32_t anchor_x) {
+    if (!ws_active() || !cpu || !cpu->read_word) return;
+    uint32_t words[9];
+    for (int i = 0; i < 9; i++)
+        words[i] = cpu->read_word(primitive_addr + 4u + (uint32_t)i * 4u);
+    ws_tag_primitive(primitive_addr, anchor_x,
+                     psx_ws_ft4_signature_words(words), 1);
+}
+
+/* Called from generated code at the entry of each [widescreen]
+ * sprite_tag_funcs function: record prim pointer ($a0) -> projected anchor.
+ * Gated on ws_engaged (NOT ws_active): ws_active can depend on game_mode which
+ * this legacy tag path establishes for sprite-classified games. */
+void psx_ws_sprite_tag(CPUState* cpu) {
+    if (!ws_engaged() || !ws_anchor_addr) return;
+    uint32_t sxy = cpu->read_word(ws_anchor_addr);
+    int32_t  ax  = (int32_t)(int16_t)(sxy & 0xFFFFu);
+    ws_tag_primitive(cpu->gpr[4], ax, 0, 0);
+}
+
+static int ws_tag_matches_current(WsTag *tag, uint32_t now) {
+    const int result = psx_ws_tag_match_result(
+        now, tag->stamp, tag->content_validated,
+        tag->signature, gp0_cmd_buf);
+    if (result == PSX_WS_TAG_MATCH) return 1;
+    if (result != PSX_WS_TAG_CONTENT_MISMATCH) return 0;
+
+    /* The packet pool reused this address.  Invalidate immediately instead of
+     * letting a stale world-billboard tag flicker onto an unrelated primitive. */
+    tag->key = 0;
+    tag->content_validated = 0;
+    return 0;
 }
 
 /* Look up the executing GP0 command's prim in the tag table. The command's
@@ -1736,7 +1778,7 @@ static int ws_tagged_anchor(int32_t *out_ax) {
         uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
         for (int i = 0; i < WS_TAG_PROBES; i++) {
             WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
-            if (t->key == key && now - t->stamp <= 2) {
+            if (t->key == key && ws_tag_matches_current(t, now)) {
                 *out_ax = t->anchor_x;
                 return 1;
             }
@@ -1873,7 +1915,7 @@ int psx_ws_prim_is_tagged(void) {
         uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
         for (int i = 0; i < WS_TAG_PROBES; i++) {
             WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
-            if (t->key == key && now - t->stamp <= 2) return 1;
+            if (t->key == key && ws_tag_matches_current(t, now)) return 1;
         }
     }
     return 0;

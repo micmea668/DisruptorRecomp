@@ -1598,6 +1598,26 @@ static int disruptor_far_rendering_site(uint32_t pc, uint32_t insn) {
 }
 #endif
 
+#ifdef PSX_HAS_DISRUPTOR_BILLBOARD_ASPECT
+extern void disruptor_billboard_aspect_instruction_hook(
+    CPUState *cpu, uint32_t address, uint32_t instruction, int phase);
+
+static int disruptor_billboard_aspect_site(uint32_t pc, uint32_t insn) {
+    switch (pc) {
+    case 0x8003BB88u: case 0x8003BFB0u: case 0x8003C848u:
+        return insn == 0xA6030016u;
+    case 0x8003CAD4u:
+        return insn == 0xA6020016u;
+    case 0x8003D488u:
+        return insn == 0xA2060025u;
+    case 0x800433A0u:
+        return insn == 0x02A02821u;
+    default:
+        return 0;
+    }
+}
+#endif
+
 static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
                             uint32_t *next_pc_out) {
     /* A load's writeback becomes visible to the instruction AFTER its delay
@@ -1662,6 +1682,12 @@ static int exec_one_fetched(CPUState *cpu, uint32_t pc, uint32_t insn,
 #ifdef PSX_HAS_DISRUPTOR_FAR_RENDERING
     if (disruptor_far_rendering_site(pc, insn)) {
         disruptor_far_rendering_instruction_hook(cpu, pc, insn, 1);
+    }
+#endif
+
+#ifdef PSX_HAS_DISRUPTOR_BILLBOARD_ASPECT
+    if (disruptor_billboard_aspect_site(pc, insn)) {
+        disruptor_billboard_aspect_instruction_hook(cpu, pc, insn, 1);
     }
 #endif
 

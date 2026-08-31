@@ -995,23 +995,31 @@ extern "C" int gte_geometry_correction_lookup(uint32_t packed,
 #endif
 }
 
-// Per-draw suppression of the X-squash (8C far-backdrop). The far backdrop
-// (ocean/cloud/distant mountain) is a parallax layer that is conceptually at
-// infinity: squashing it toward centre leaves its geometry short of the
-// revealed 16:9 edges (blue void). Drawing it UN-squashed lets its 4:3-extent
-// fill the stretched frame (skybox treatment) while the near 3D world keeps the
-// wider FOV. The recompiler brackets the backdrop driver (FUN_8004db3c) with
-// gte_ws_set_suppress(1)/(0) ([widescreen] backdrop_unsquash_funcs).
-// The driver (FUN_8004db3c) actually draws a MIX: the far backdrop (which we
-// want un-squashed) AND nearer props (doors/mansion models) that must stay
-// squashed or they drift relative to the rest of the world. So suppression is
-// DEPTH-GATED: only vertices with SZ (projected Z) >= s_ws_far_threshold get
-// un-squashed while suppress is active; nearer props keep the squash. Threshold
-// tuned live via the ws_far_threshold TCP cmd; SZ stats below characterize the
-// driver's depth range so the split is set from data, not a guess.
-static int s_ws_suppress = 0;
+// Per-scope diagnostic suppression of the classic widescreen X squash for
+// candidate finite far backdrops. The recompiler brackets each reviewed
+// [widescreen.backdrop].unsquash_funcs driver with
+// gte_ws_set_suppress(1)/(0). Those drivers may draw a mixture of backdrop and
+// ordinary room geometry, so the scope remains DEPTH-GATED: only vertices with
+// SZ >= s_ws_far_threshold retain their authored 4:3 projection before the
+// final wide stretch. The counter makes nested/recursive tagged renderers safe:
+// an inner return must not clear its caller's active scope. Live testing has
+// not linked this path to the skyline plane, so it must remain opt-in.
+static unsigned s_ws_suppress_depth = 0;
+static int s_ws_backdrop_repair_enabled = 0;
 static int32_t s_ws_far_threshold = 900;  /* SZ split: near props squashed, far backdrop un-squashed (8C, tunable via ws_far_threshold) */
-extern "C" void gte_ws_set_suppress(int on) { s_ws_suppress = on ? 1 : 0; }
+extern "C" void gte_ws_set_suppress(int on) {
+    if (on) {
+        if (s_ws_suppress_depth != 0xFFFFFFFFu) ++s_ws_suppress_depth;
+    } else if (s_ws_suppress_depth != 0) {
+        --s_ws_suppress_depth;
+    }
+}
+extern "C" void gte_ws_set_backdrop_repair_enabled(int on) {
+    s_ws_backdrop_repair_enabled = on ? 1 : 0;
+}
+extern "C" int gte_ws_get_backdrop_repair_enabled(void) {
+    return s_ws_backdrop_repair_enabled;
+}
 extern "C" void gte_ws_set_far_threshold(int t) { s_ws_far_threshold = t; }
 extern "C" int  gte_ws_get_far_threshold(void) { return (int)s_ws_far_threshold; }
 /* SZ stats observed while suppress is active (one frame window, reset on read). */
@@ -1439,7 +1447,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     // In classic widescreen, leave that projection intact and let the normal
     // final-frame stretch cover the wide output instead of shrinking it first.
     if (dome_call) do_squash = false;
-    if (do_squash && s_ws_suppress) {
+    if (do_squash && s_ws_suppress_depth != 0) {
         /* Depth-gated: un-squash only FAR geometry (the backdrop); keep near
          * props squashed so they stay aligned. Record SZ stats for tuning. */
         int32_t sz = gte->SZ[3];
@@ -1448,7 +1456,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
             if (sz > s_ws_sz_max) s_ws_sz_max = sz;
             s_ws_sz_n++;
         }
-        if (sz >= s_ws_far_threshold) {
+        if (s_ws_backdrop_repair_enabled && sz >= s_ws_far_threshold) {
             do_squash = false;
             if (!s_gte_replay_sandbox) s_ws_sz_far++;
         }

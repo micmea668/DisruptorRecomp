@@ -21,8 +21,9 @@ No proprietary PlayStation BIOS is bundled or required.
 - The corrected packaged execution path holds approximately 59.94 updates per
   second through menus, movies, and gameplay, with clean audio in the latest
   user validation.
-- OpenGL geometry supersampling renders at 4x internal scale (2560x1920 at
-  authentic 4:3). A Windows test supplied 120 steady-state one-second samples
+- OpenGL geometry supersampling defaults to 4x internal scale (2560x1920 at
+  authentic 4:3) and can be switched live between 1x, 2x, 3x and 4x from the
+  developer menu. A Windows test supplied 120 steady-state one-second samples
   from 59.52 to 60.37 Hz, averaging 59.94 Hz.
 - Opt-in modern controls combine direct horizontal mouse turning with WASD,
   mouse fire/psionic buttons, and conventional keyboard action bindings.
@@ -214,9 +215,10 @@ version of the menu.
 The Controls tab changes horizontal mouse aim, modern controls, both axis
 sensitivities/inversion, experimental vertical look/recentering, and the
 sub-byte camera presentation live. Enhancements contains a live widescreen
-toggle with fixed 16:9, 21:9 and 32:9 choices (4:3 disables widescreen), exact
-geometry, perspective textures, VSync and the experimental presentation-only
-frame interpolator. It also contains a session-only
+toggle with fixed 16:9, 21:9 and 32:9 choices (4:3 disables widescreen), a live
+1x-4x internal-resolution supersampling selector, exact geometry, perspective
+textures, VSync and the experimental presentation-only frame interpolator. It
+also contains a session-only
 experimental draw-distance control with Retail, 1.25x and 1.5x presets.
 Its separate Distance shading control offers the retail palette ramp and a
 session-only Row 0 diagnostic. Disruptor implements this ramp by selecting one
@@ -274,7 +276,7 @@ only fields changed in the menu and publish through an atomic replacement, so
 an I/O failure leaves the previous file intact. Explicit launch switches or
 environment values override saved preferences for that run. Mouse aim, modern
 controls, vertical-look enablement, both axis sensitivities/inversion,
-sub-byte camera, display aspect, exact geometry, perspective textures and
+sub-byte camera, display aspect, internal resolution, exact geometry, perspective textures and
 VSync persist; the current pitch does not. The interpolator remembers target/blend but its
 activation remains session-only because its current crossfade is too blurry
 for release. Menu layout/open state, mouse capture and diagnostics never
@@ -372,6 +374,20 @@ rotation-dependent corruption caused by feeding native-wide coordinates into
 the static-world renderer. Every helper is an identity in 4:3. The HUD is
 proportion-corrected before presentation, while depth-24 FMVs, BIOS output,
 and full-screen 2D menu scenes remain pillarboxed at 4:3.
+
+Disruptor also builds enemies, pickups, and several related world billboards
+as CPU-projected `POLY_FT4` packets. Their centres used the nine X hooks above,
+but their retail pixel widths bypassed both the GTE and HUD-SPRT correction, so
+they appeared increasingly wide at 16:9, 21:9, and 32:9. Six exact packet-
+completion/submission sites now attach host-only provenance to those audited
+funnels, including the deferred sorted-actor pass that builds the base enemy
+quad. Each explicit tag fingerprints all nine completed GP0 words, so a packet
+slot reused by the fixed-screen compositor is rejected immediately rather than
+inheriting a two-frame-old world tag. The existing textured-quad executor scales
+only the matched primitive's X coordinates about its inclusive packet midpoint;
+Y, UVs, guest RAM, HUD, and first-person weapon sprites remain unchanged. The
+generated and dirty-interpreter paths share the same PC/opcode guard, and
+4:3/native-wide presentations are explicit no-ops.
 
 `PSX_WS_FRUSTUM_MODE=yaw` is a diagnostic A/B that enables only the upstream
 yaw-ray widening; the default `full` mode also adjusts the four later object

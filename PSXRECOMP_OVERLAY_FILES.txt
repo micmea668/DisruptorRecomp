@@ -11,6 +11,7 @@ runtime/CMakeLists.txt
 runtime/include/dirty_ram_interp.h
 +runtime/include/gte_precision.h
 runtime/include/gpu.h
++runtime/include/gpu_ws_tag_match.h
 runtime/include/gpu_render.h
 runtime/include/gpu_sw_renderer.h
 +runtime/include/host_ui.h

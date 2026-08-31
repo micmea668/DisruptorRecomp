@@ -86,7 +86,7 @@ excluded_sites = {
 }
 codegen_table = codegen[
     codegen.index("kDisruptorFarRenderingSites"):
-    codegen.index("static bool codegen_cycle_per_insn")
+    codegen.index("struct DisruptorBillboardAspectSite")
 ]
 found_sites = {
     int(pc, 16): int(word, 16)

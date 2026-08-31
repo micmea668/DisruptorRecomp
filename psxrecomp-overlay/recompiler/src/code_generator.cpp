@@ -225,6 +225,35 @@ static const DisruptorFarRenderingSite *disruptor_far_rendering_site(
     return nullptr;
 }
 
+/* Disruptor's world actors and pickups are CPU-built POLY_FT4 billboards.
+ * Their projected centre goes through the reviewed classic-wide X squash, but
+ * their retail pixel width does not.  These are five final packet writes plus
+ * the deferred base-actor submission seam; the host callback tags only a
+ * completed, shape-validated packet for proportion repair. */
+struct DisruptorBillboardAspectSite {
+    uint32_t pc;
+    uint32_t instruction;
+    uint8_t packet_gpr;
+};
+
+static const DisruptorBillboardAspectSite kDisruptorBillboardAspectSites[] = {
+    {0x8003BB88u, 0xA6030016u, 16u},
+    {0x8003BFB0u, 0xA6030016u, 16u},
+    {0x8003C848u, 0xA6030016u, 16u},
+    {0x8003CAD4u, 0xA6020016u, 16u},
+    {0x8003D488u, 0xA2060025u, 16u},
+    {0x800433A0u, 0x02A02821u, 5u},
+};
+
+static const DisruptorBillboardAspectSite *disruptor_billboard_aspect_site(
+        uint32_t address) {
+    for (const DisruptorBillboardAspectSite &site :
+         kDisruptorBillboardAspectSites) {
+        if (site.pc == address) return &site;
+    }
+    return nullptr;
+}
+
 static bool codegen_cycle_per_insn() {
     // DEFAULT ON for the faithful-timing (cycle-audit) branch: each instruction
     // charges its cost at its own site, so the running cycle count is correct
@@ -1044,6 +1073,19 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                 addr, far_rendering_site->instruction, instr));
         }
         far_rendering_site = nullptr;
+    }
+
+    const DisruptorBillboardAspectSite *billboard_aspect_site =
+        disruptor_billboard_aspect_site(addr);
+    if (billboard_aspect_site &&
+        instr != billboard_aspect_site->instruction) {
+        if (!config_.overlay_mode) {
+            throw std::runtime_error(fmt::format(
+                "Disruptor billboard-aspect site 0x{:08X} expected word "
+                "0x{:08X}, found 0x{:08X}",
+                addr, billboard_aspect_site->instruction, instr));
+        }
+        billboard_aspect_site = nullptr;
     }
 
     // Full-word-guarded terrain-frustum half-angle constants. Scaling the
@@ -2110,6 +2152,12 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     if (far_rendering_site) {
         code += fmt::format(
             "\n{}disruptor_far_rendering_instruction_hook(cpu, "
+            "0x{:08X}u, 0x{:08X}u, 1);",
+            config_.indent, addr, instr);
+    }
+    if (billboard_aspect_site) {
+        code += fmt::format(
+            "\n{}disruptor_billboard_aspect_instruction_hook(cpu, "
             "0x{:08X}u, 0x{:08X}u, 1);",
             config_.indent, addr, instr);
     }
@@ -3508,6 +3556,7 @@ void CodeGenerator::emit_runtime_externs(std::ostream& ss) const {
     ss << "extern void psx_mod_function_entry(CPUState* cpu, uint32_t address);  /* trusted opt-in game-mod hook */\n";
     ss << "extern void disruptor_vertical_camera_instruction_hook(CPUState* cpu, uint32_t address, uint32_t instruction, int phase);  /* version-pinned vertical-camera seam */\n";
     ss << "extern void disruptor_far_rendering_instruction_hook(CPUState* cpu, uint32_t address, uint32_t instruction, int phase);  /* version-pinned far-rendering seam */\n";
+    ss << "extern void disruptor_billboard_aspect_instruction_hook(CPUState* cpu, uint32_t address, uint32_t instruction, int phase);  /* version-pinned world-billboard seam */\n";
     ss << "extern void psx_datashard_ret(CPUState* cpu);                  /* data-shard capture finalize */\n";
     ss << "extern int  psx_vsync_query_hle_enter(CPUState* cpu, uint32_t func, uint32_t counter_addr, uint32_t gpustat_ptr_addr, uint32_t timer1_ptr_addr, uint32_t timer1_cache_addr);  /* load_accel.c */\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";

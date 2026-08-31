@@ -255,6 +255,11 @@ void gpu_geometry_correction_stats_detailed(
  * (render the wider FOV into a wider frame, present 1:1; GTE not squashed). */
 void gpu_ws_configure(int aspect_num, int aspect_den,
                       uint32_t sprite_anchor_addr, int hud_sprt_squash, int mode);
+/* Add an audited world primitive to the existing classic-squash provenance
+ * table.  This is host presentation metadata only; it never edits guest RAM.
+ * Calls are ignored outside an active classic-wide gameplay presentation. */
+void gpu_ws_tag_primitive(CPUState *cpu, uint32_t primitive_addr,
+                          int32_t anchor_x);
 /* [widescreen] full_2d: opt a pure-2D sprite game into the widescreen present
  * path (treat every in-game frame as gameplay, since it never tags 3D prims). */
 void gpu_ws_set_full_2d(int on);

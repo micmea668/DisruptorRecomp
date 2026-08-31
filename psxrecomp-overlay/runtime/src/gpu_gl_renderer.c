@@ -247,6 +247,7 @@ static void gl_perf_mirror_end(void);   /* mirror pass (timestamp pair; splits s
 static int s_ws_ablate = 0;
 static void flush_tex_batch(void); /* textured-prim batch — defined below, flushed from coherency points */
 static void flush_flat_batch(void); /* flat/gouraud GEO batch (MotK starfield 0x68 dots) */
+static int resize_gpu_raster(int scale); /* live internal-resolution rebuild */
 static PFN_glGenRenderbuffers  p_glGenRenderbuffers;
 static PFN_glDeleteRenderbuffers p_glDeleteRenderbuffers;
 static PFN_glBindRenderbuffer  p_glBindRenderbuffer;
@@ -2179,6 +2180,8 @@ static void glb_set_scale(int s) {
     if (s < 1) s = 1;
     if (s > GL_MAX_INTERNAL_SCALE) s = GL_MAX_INTERNAL_SCALE;
     s_req_scale = s;
+    if (s_raster_ok && s != s_scale && !resize_gpu_raster(s))
+        s_req_scale = s_scale;
     sw_renderer_set_scale(1);
 }
 static int  glb_scale(void) { return s_scale; }   /* real internal SSAA scale (was a stub 1; the
@@ -2495,6 +2498,157 @@ static int make_fbo(GLuint *out_fbo, GLuint color_tex, GLuint stencil_rb) {
         return 0;
     }
     return 1;
+}
+
+static void delete_scale_target(GLuint *fbo, GLuint *tex, GLuint *rb) {
+    if (*fbo) { p_glDeleteFramebuffers(1, fbo); *fbo = 0; }
+    if (*tex) { glDeleteTextures(1, tex); *tex = 0; }
+    if (rb && *rb) { p_glDeleteRenderbuffers(1, rb); *rb = 0; }
+}
+
+/* Rebuild only the scale-dependent GL targets while keeping the current VRAM
+ * image alive.  All replacement targets are validated before any live handle
+ * changes; a failed allocation therefore leaves the old renderer untouched.
+ * Colour is nearest-blitted between equivalent logical grids, then stencil is
+ * reconstructed from the copied bit-15 alpha.  Native-wide surfaces are
+ * migrated too, avoiding a black/stale transition when the game does not
+ * repaint every framebuffer pixel on the following frame. */
+static int resize_gpu_raster(int scale) {
+    if (!s_raster_ok || scale == s_scale) return 1;
+    if (scale < 1 || scale > GL_MAX_INTERNAL_SCALE) return 0;
+
+    flush_flat_batch();
+    flush_tex_batch();
+    flush_cpu_upload();
+
+    const int old_scale = s_scale;
+    const int new_hw = VRAM_W * scale;
+    const int new_hh = VRAM_H * scale;
+    GLuint new_hr_tex = 0, new_hr_fbo = 0, new_hr_rb = 0;
+    GLuint new_scratch_tex = 0, new_scratch_fbo = 0;
+    GLuint new_wide_tex[WIDE_MAX_SURF] = {0};
+    GLuint new_wide_fbo[WIDE_MAX_SURF] = {0};
+    GLuint new_wide_rb[WIDE_MAX_SURF] = {0};
+    int current_wide_index = -1;
+
+    new_hr_tex = make_tex(GL_RGBA8, new_hw, new_hh,
+                          GL_RGBA, GL_UNSIGNED_BYTE);
+    new_scratch_tex = make_tex(GL_RGBA8, new_hw, new_hh,
+                               GL_RGBA, GL_UNSIGNED_BYTE);
+    p_glGenRenderbuffers(1, &new_hr_rb);
+    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, new_hr_rb);
+    p_glRenderbufferStorage(PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8,
+                            new_hw, new_hh);
+    p_glBindRenderbuffer(PSXGL_RENDERBUFFER, 0);
+    if (!new_hr_tex || !new_scratch_tex || !new_hr_rb ||
+        !make_fbo(&new_hr_fbo, new_hr_tex, new_hr_rb) ||
+        !make_fbo(&new_scratch_fbo, new_scratch_tex, 0)) {
+        goto fail;
+    }
+
+    for (int i = 0; i < WIDE_MAX_SURF; ++i) {
+        if (!s_wide_fbo[i]) continue;
+        if (g_wide_cur == s_wide_fbo[i]) current_wide_index = i;
+        const int wide_w = g_wide_w * scale;
+        new_wide_tex[i] = make_tex(GL_RGBA8, wide_w, new_hh,
+                                   GL_RGBA, GL_UNSIGNED_BYTE);
+        p_glGenRenderbuffers(1, &new_wide_rb[i]);
+        p_glBindRenderbuffer(PSXGL_RENDERBUFFER, new_wide_rb[i]);
+        p_glRenderbufferStorage(PSXGL_RENDERBUFFER,
+                                PSXGL_DEPTH24_STENCIL8, wide_w, new_hh);
+        p_glBindRenderbuffer(PSXGL_RENDERBUFFER, 0);
+        if (!new_wide_tex[i] || !new_wide_rb[i] ||
+            !make_fbo(&new_wide_fbo[i], new_wide_tex[i],
+                      new_wide_rb[i])) {
+            goto fail;
+        }
+    }
+
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, new_hr_fbo);
+    p_glBlitFramebuffer(0, 0, VRAM_W * old_scale, VRAM_H * old_scale,
+                        0, 0, new_hw, new_hh,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    for (int i = 0; i < WIDE_MAX_SURF; ++i) {
+        if (!new_wide_fbo[i]) continue;
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_wide_fbo[i]);
+        p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, new_wide_fbo[i]);
+        p_glBlitFramebuffer(0, 0, g_wide_w * old_scale,
+                            VRAM_H * old_scale,
+                            0, 0, g_wide_w * scale, new_hh,
+                            GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+
+    {
+        GLuint old_hr_tex = s_hr_tex, old_hr_fbo = s_hr_fbo,
+               old_hr_rb = s_hr_rb;
+        GLuint old_scratch_tex = s_scratch_tex,
+               old_scratch_fbo = s_scratch_fbo;
+        GLuint old_wide_tex[WIDE_MAX_SURF];
+        GLuint old_wide_fbo[WIDE_MAX_SURF];
+        GLuint old_wide_rb[WIDE_MAX_SURF];
+        for (int i = 0; i < WIDE_MAX_SURF; ++i) {
+            old_wide_tex[i] = s_wide_tex[i];
+            old_wide_fbo[i] = s_wide_fbo[i];
+            old_wide_rb[i] = s_wide_rb[i];
+            s_wide_tex[i] = new_wide_tex[i]; new_wide_tex[i] = 0;
+            s_wide_fbo[i] = new_wide_fbo[i]; new_wide_fbo[i] = 0;
+            s_wide_rb[i] = new_wide_rb[i]; new_wide_rb[i] = 0;
+        }
+        s_hr_tex = new_hr_tex; new_hr_tex = 0;
+        s_hr_fbo = new_hr_fbo; new_hr_fbo = 0;
+        s_hr_rb = new_hr_rb; new_hr_rb = 0;
+        s_scratch_tex = new_scratch_tex; new_scratch_tex = 0;
+        s_scratch_fbo = new_scratch_fbo; new_scratch_fbo = 0;
+        s_scale = scale;
+        s_req_scale = scale;
+        g_wide_cur = current_wide_index >= 0
+            ? s_wide_fbo[current_wide_index] : 0;
+
+        const float shift = 0.5f / (float)s_scale - 1.0f / 64.0f;
+        p_glUseProgram(s_geo_prog);
+        p_glUniform1f(p_glGetUniformLocation(s_geo_prog, "u_shift"), shift);
+        p_glUseProgram(s_tex_prog);
+        p_glUniform1f(p_glGetUniformLocation(s_tex_prog, "u_shift"), shift);
+        p_glUseProgram(s_blit_prog);
+        p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), shift);
+        p_glUseProgram(0);
+
+        rebuild_target_stencil(s_hr_fbo, new_hw, new_hh);
+        for (int i = 0; i < WIDE_MAX_SURF; ++i) {
+            if (s_wide_fbo[i])
+                rebuild_target_stencil(s_wide_fbo[i],
+                                       g_wide_w * s_scale, new_hh);
+        }
+        s_stencil_valid = 1;
+
+        delete_scale_target(&old_hr_fbo, &old_hr_tex, &old_hr_rb);
+        delete_scale_target(&old_scratch_fbo, &old_scratch_tex, NULL);
+        for (int i = 0; i < WIDE_MAX_SURF; ++i)
+            delete_scale_target(&old_wide_fbo[i], &old_wide_tex[i],
+                                &old_wide_rb[i]);
+    }
+
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    gl_renderer_invalidate_present();
+    fprintf(stdout, "psxrecomp: live internal scale = %dx\n", s_scale);
+    return 1;
+
+fail:
+    delete_scale_target(&new_hr_fbo, &new_hr_tex, &new_hr_rb);
+    delete_scale_target(&new_scratch_fbo, &new_scratch_tex, NULL);
+    for (int i = 0; i < WIDE_MAX_SURF; ++i)
+        delete_scale_target(&new_wide_fbo[i], &new_wide_tex[i],
+                            &new_wide_rb[i]);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    fprintf(stderr,
+            "psxrecomp: live internal-scale allocation failed; keeping %dx\n",
+            s_scale);
+    return 0;
 }
 
 static int init_gpu_raster(void) {

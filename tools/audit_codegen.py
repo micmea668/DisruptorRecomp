@@ -14,6 +14,7 @@ CODE_END = 0x80056938
 EXPECTED_SHARDS = 22
 EXPECTED_FUNCTIONS = 579
 EXPECTED_DISPATCH_ENTRIES = 12_797
+FINITE_SKYLINE_RENDERER = 0x8003A0F0
 
 FUNCTION_DEFINITION = re.compile(
     r"^void func_([0-9A-F]{8})\(CPUState\* cpu\)$", re.MULTILINE
@@ -188,6 +189,15 @@ FAR_RENDERING_SITES = {
     0x8004279C: 0x8FBF016C,
 }
 
+BILLBOARD_ASPECT_SITES = {
+    0x8003BB88: 0xA6030016,
+    0x8003BFB0: 0xA6030016,
+    0x8003C848: 0xA6030016,
+    0x8003CAD4: 0xA6020016,
+    0x8003D488: 0xA2060025,
+    0x800433A0: 0x02A02821,
+}
+
 # Tests 4-6 widened Disruptor's portal spans into negative X.  Its static-world
 # renderer was authored around unsigned 0..320 spans, and yaw-dependent portal
 # selection became unstable.  Test 7 instead keeps every portal/outcode bound
@@ -221,6 +231,24 @@ def format_addresses(addresses: set[int]) -> str:
     return shown
 
 
+def generated_function_body(source: str, address: int) -> str | None:
+    start_match = re.search(
+        rf"^void func_{address:08X}\(CPUState\* cpu\)\s*\{{",
+        source,
+        re.MULTILINE,
+    )
+    if start_match is None:
+        return None
+    next_match = re.search(
+        r"^void func_[0-9A-F]{8}\(CPUState\* cpu\)\s*\{",
+        source[start_match.end():],
+        re.MULTILINE,
+    )
+    end = (start_match.end() + next_match.start()
+           if next_match is not None else len(source))
+    return source[start_match.start():end]
+
+
 def main() -> int:
     shards = sorted(GENERATED.glob("SLUS_002.24.code_full_*.c"))
     dispatch_path = GENERATED / "SLUS_002.24.code_dispatch.c"
@@ -239,6 +267,22 @@ def main() -> int:
 
     shard_text = "\n".join(path.read_text(encoding="utf-8") for path in shards)
     dispatch_text = dispatch_path.read_text(encoding="utf-8")
+
+    skyline_body = generated_function_body(
+        shard_text, FINITE_SKYLINE_RENDERER)
+    if skyline_body is None:
+        failures.append(
+            f"missing finite-skyline renderer 0x{FINITE_SKYLINE_RENDERER:08X}")
+    else:
+        enable = "gte_ws_set_suppress(1);"
+        disable = "gte_ws_set_suppress(0);"
+        if skyline_body.count(enable) != 1 or skyline_body.count(disable) != 1:
+            failures.append(
+                "finite-skyline renderer lost its single balanced GTE "
+                "unsquash scope")
+        elif skyline_body.index(enable) > skyline_body.index(disable):
+            failures.append(
+                "finite-skyline GTE unsquash scope closes before it opens")
 
     definition_matches = FUNCTION_DEFINITION.findall(shard_text)
     definitions = {int(value, 16) for value in definition_matches}
@@ -430,6 +474,24 @@ def main() -> int:
             + str(FAR_RENDERING_SITES)
             + ", found "
             + str(generated_far_rendering_sites)
+        )
+
+    billboard_aspect_matches = re.findall(
+        r"disruptor_billboard_aspect_instruction_hook\(cpu, "
+        r"0x([0-9A-F]{8})u, 0x([0-9A-F]{8})u, 1\)",
+        shard_text,
+    )
+    generated_billboard_aspect_sites = {
+        int(address, 16): int(word, 16)
+        for address, word in billboard_aspect_matches
+    }
+    if (generated_billboard_aspect_sites != BILLBOARD_ASPECT_SITES or
+            len(billboard_aspect_matches) != len(BILLBOARD_ASPECT_SITES)):
+        failures.append(
+            "reviewed billboard-aspect hooks differ: expected "
+            + str(BILLBOARD_ASPECT_SITES)
+            + ", found "
+            + str(generated_billboard_aspect_sites)
         )
 
     precision_mfc2_matches = re.findall(
