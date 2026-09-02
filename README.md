@@ -1,5 +1,8 @@
 # DisruptorRecomp
 
+<img width="1270" height="635" alt="2" src="https://github.com/user-attachments/assets/eaea752d-cf39-4ac8-9df1-b2447ab3c9d3" />
+
+
 A native PC static recompilation project for **Disruptor (USA, SLUS-00224)**,
 built on [PSXRecomp](https://github.com/mstan/psxrecomp).
 
