@@ -3128,11 +3128,19 @@ static void render_host_ui_for_swap(int drawable_w, int drawable_h) {
  * force_4_3 pins the rect to native 4:3 regardless of the display aspect —
  * FMVs are authored 4:3 and have no GTE squash to compensate a stretch, so
  * widescreen presents them pillarboxed instead of distorted. */
+/* Rows of the window above the screen (host_borderless.h): the picture goes in the rest, which starts at the bottom row as OpenGL counts. */
+static int s_hidden_rows;
+void gl_renderer_set_hidden_rows(int rows) { s_hidden_rows = rows > 0 ? rows : 0; }
+static void gl_visible_size(int *w, int *h) {
+    SDL_GL_GetDrawableSize(s_win, w, h);
+    if (*h > s_hidden_rows) *h -= s_hidden_rows;
+}
+
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
                          int force_4_3, int content_w) {
     if (!s_ctx) return;
     interp_reset_history();
-    int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    int ww = 0, wh = 0; gl_visible_size(&ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
@@ -3193,7 +3201,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
 void gl_renderer_present_blank(void) {
     if (!s_ctx) return;
     interp_reset_history();
-    int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    int ww = 0, wh = 0; gl_visible_size(&ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     pres_record(GL_PRES_BLANK, 0, 0, 0, 0, 0, 0, ww, wh);
@@ -4138,7 +4146,7 @@ static int interp_present(void) {
     if (a > 1.0) a = 1.0;
     if (a < 0.0) a = 0.0;
 
-    int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    int ww = 0, wh = 0; gl_visible_size(&ww, &wh);
     int lx, ly, lw, lh;
     if (s_interp_force_4_3)
         letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
@@ -4310,6 +4318,7 @@ void gl_renderer_set_interpolation(int enabled, double host_hz, double target_hz
             host_hz);
 }
 void gl_renderer_set_interpolation_suspended(int suspended) { (void)suspended; }
+void gl_renderer_set_hidden_rows(int rows) { (void)rows; }
 void gl_renderer_set_host_ui_suspended(int suspended) { (void)suspended; }
 void gl_renderer_interpolation_diag(int *enabled, int *suspended,
                                     int *history_frames, double *host_hz,
@@ -4367,7 +4376,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
         return;
     }
     gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
-    int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    int ww = 0, wh = 0; gl_visible_size(&ww, &wh);
     int lx, ly, lw, lh;
     if (force_4_3)
         letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
@@ -4471,7 +4480,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         return 1;
     }
     gl_perf_present_enter();
-    int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    int ww = 0, wh = 0; gl_visible_size(&ww, &wh);
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     wide_blit_center(fbo, disp_x, disp_y, disp_h);   /* fast-path: authoritative centre */

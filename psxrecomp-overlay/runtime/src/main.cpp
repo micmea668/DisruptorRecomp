@@ -42,6 +42,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
 #include "gpu_vk_renderer.h"
+#include "host_borderless.h"
 #include "host_pick_slot.h"
 #include "host_ui.h"
 extern "C" void gl_renderer_geometry_interpolation_diag(uint64_t out[6]);
@@ -124,6 +125,7 @@ extern "C" void disruptor_language_settle(void);
 /* Internal GL seam: host-menu suspension is a separate reason from FMV/
  * content suspension, so either owner can release independently. */
 extern "C" void gl_renderer_set_host_ui_suspended(int suspended);
+extern "C" void gl_renderer_set_hidden_rows(int rows);
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -961,6 +963,35 @@ static int psx_window_fullscreen_mode(SDL_Window *window) {
 #endif
 }
 
+#if defined(_WIN32) && defined(PSX_SDL3)
+/* Keeps a borderless OpenGL window from covering its screen exactly (host_borderless.h). SDL fits it to the screen again when it is restored, so this is asked every frame. */
+static void psx_borderless_keep_windowed(void) {
+    int hidden = 0;
+    if (sdl_window && g_video_renderer == 1 && psx_window_fullscreen_mode(sdl_window) == 1) {
+        const HWND handle = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+        MONITORINFO info = {};
+        info.cbSize = sizeof(info);
+        RECT now = {};
+        if (handle && GetMonitorInfoW(MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST), &info) && GetWindowRect(handle, &now)) {
+            const PsxHostRect screen = {info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom};
+            PsxHostRect window = {now.left, now.top, now.right, now.bottom}, wanted = {};
+            if (psx_borderless_wanted(window, screen, &wanted) &&
+                SetWindowPos(handle, nullptr, wanted.left, wanted.top, wanted.right - wanted.left, wanted.bottom - wanted.top,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER)) {
+                window = wanted;
+                std::fprintf(stderr, "psxrecomp: borderless window kept one row taller than its screen\n");
+            }
+            int pixels_wide = 0, pixels_high = 0;
+            SDL_GetWindowSizeInPixels(sdl_window, &pixels_wide, &pixels_high);
+            hidden = psx_borderless_hidden_rows(window, screen, pixels_high);
+        }
+    }
+    gl_renderer_set_hidden_rows(hidden);
+}
+#else
+static void psx_borderless_keep_windowed(void) {}
+#endif
+
 static int psx_apply_window_fullscreen_mode(SDL_Window *window, int mode) {
     if (!window || mode < 0 || mode > 2) return 0;
 #if defined(PSX_SDL3)
@@ -1000,6 +1031,7 @@ static int psx_apply_window_fullscreen_mode(SDL_Window *window, int mode) {
         return 0;
     }
 #endif
+    psx_borderless_keep_windowed(); /* at once: a present may come before the next vblank */
     return psx_window_fullscreen_mode(window) == mode ? 1 : 0;
 }
 
@@ -4386,6 +4418,7 @@ static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
 
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
+    psx_borderless_keep_windowed();
     /* A host UI normally submits its request from the GL render callback near
      * the end of this function. Apply on scope exit, after the old-aspect frame
      * has been presented, so the next guest frame and its eventual present use

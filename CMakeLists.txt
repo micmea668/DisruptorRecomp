@@ -408,6 +408,15 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
     add_test(NAME host_pick_slot
         COMMAND host-pick-slot-test)
 
+    add_executable(host-borderless-test
+        tests/host_borderless_test.cpp)
+    target_compile_features(host-borderless-test PRIVATE cxx_std_20)
+    add_test(NAME host_borderless
+        COMMAND host-borderless-test)
+    add_test(NAME host_borderless_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_borderless_contract.py")
+
     add_executable(disruptor-restart-test
         tests/disruptor_restart_test.cpp)
     target_include_directories(disruptor-restart-test PRIVATE

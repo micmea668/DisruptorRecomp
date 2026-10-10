@@ -22,6 +22,7 @@ runtime/include/gpu.h
 +runtime/include/gpu_pinned_corner.h
 runtime/include/gpu_render.h
 runtime/include/gpu_sw_renderer.h
++runtime/include/host_borderless.h
 +runtime/include/host_pick_slot.h
 +runtime/include/host_ui.h
 +runtime/include/iso_overlay.h
