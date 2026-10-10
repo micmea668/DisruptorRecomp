@@ -31,6 +31,7 @@
 #include "gpu_ws_screen_tile.h"
 #include "gpu_ws_tag_match.h"
 #include "gpu_ws_frame_kind.h"
+#include "gpu_ws_menu.h"
 #include "gpu_temporal_sprite.h"
 #include "ws_ui_group.h"
 #include <math.h>
@@ -349,8 +350,18 @@ static int ws_2d_only_scene(void) {
 static uint32_t s_ws_fmv_frame_cache = 0xFFFFFFFFu;
 static int      s_ws_fmv_cached = 0;
 
+/* The front end's backdrop on a wide screen (gpu_ws_menu.h). Squash mode only: a wider frame of its own has nothing to put beside the picture. */
+static int ws_menu_logo;   /* the picture at (320,0) is the front end's, and its logo is kept at (512,0) */
+static int ws_menu_halves; /* the halves of the backdrop drawn since the logo was last drawn */
+static int ws_menu_wanted(void) { return ws_mode == 1 && ws_xnum != ws_xden; }
+static int ws_menu_frame(void) { return psx_ws_frame_kinds_menu(&ws_frame_kinds); }
+/* On a front-end frame everything but the backdrop keeps its shape on the stretched screen. Returns the rectangle's width. */
+static int ws_menu_rect(int32_t *x0, int w) { return ws_menu_frame() ? psx_ws_menu_squash_rect(x0, w, ws_xnum, ws_xden) : w; }
+int gpu_ws_displayed_menu(void) { return psx_ws_frame_kinds_displayed_menu(&ws_frame_kinds, display_area_x, display_area_y); }
+
 static int ws_native_43(int displayed) {
     if (!ws_engaged()) return 0;
+    if (displayed ? gpu_ws_displayed_menu() : ws_menu_frame()) return 0;
     if (!ws_game_mode_of(displayed)) return 1;     /* full-2D screen */
     if (ws_2d_only_scene()) return 1;              /* 2D-only gameplay scene */
     uint32_t f = (uint32_t)s_frame_count;
@@ -364,6 +375,11 @@ static int ws_native_43(int displayed) {
 int gpu_ws_present_native_43(void) { return ws_native_43(0); }
 int gpu_ws_displayed_native_43(void) { return ws_native_43(1); }
 void gpu_ws_tell_frame_kind(int flat) { psx_ws_frame_kinds_tell(&ws_frame_kinds, flat); }
+/* The frame on display is a full-2D one of a GTE-detected game and not the front end's: uploads and copies make it, and they do not reach the corrected mirror. */
+int gpu_ws_displayed_flat(void) {
+    return ws_gte_game_mode_cfg && !gpu_ws_displayed_menu() &&
+           psx_ws_frame_kinds_displayed(&ws_frame_kinds, display_area_x, display_area_y) == 1;
+}
 
 /* Squash applies only when configured AND the frame is being stretched. */
 static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43(); }
@@ -2105,6 +2121,12 @@ static int32_t ws_disp_h(void) {
     return di.height ? (int32_t)di.height : 240;
 }
 
+/* An upload or a copy into a frame buffer has no drawing area to announce it. */
+static void ws_frame_pictured(int x, int y, int w, int h) {
+    psx_ws_frame_kinds_pictured(&ws_frame_kinds, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,
+                                (uint32_t)ws_disp_w(), (uint32_t)ws_disp_h());
+}
+
 /* Full-screen fades and environmental filters are authored as 320x240 TILEs.
  * In native-wide mode, grow only primitives that cover the complete native
  * display; ordinary world-space rectangles remain untouched. */
@@ -2298,6 +2320,7 @@ static void ws_hud_widget_quad(int32_t vx[4], int32_t vy[4]) {
  * height when the user's HUD size changed it, else 0. */
 static int ws_sprt_fixed_transform(int32_t *x0, int32_t *y0, int w, int *out_h) {
     *out_h = 0;
+    if (ws_menu_frame()) return ws_menu_rect(x0, w);
     if (!ws_active()) return 0;
     int32_t ax;
     if (ws_tagged_anchor(&ax)) {
@@ -2382,6 +2405,10 @@ static int32_t ws_nw_hud_shift(int32_t x, int32_t w) {
  * the game's dedicated HUD packet arena reaches here, never world polygons. */
 static void ws_nw_hud_shift_vertices(int32_t *vx, int count) {
     if (count <= 0) return;
+    if (ws_menu_frame()) { /* the front end's polygons and lines keep their shape like its text */
+        psx_ws_menu_squash_corners(vx, count, ws_xnum, ws_xden);
+        return;
+    }
     /* Sprite-tag titles: polygon/line prims are the GTE world and the tagged
      * character billboards, never HUD — only the rect-family sites (which
      * call ws_nw_hud_shift directly, with the untagged filter) re-anchor. */
@@ -2461,6 +2488,7 @@ static uint32_t vram_write_remaining;          /* words remaining */
  * CPU-visible transfer remains ordered because GP0 accepts no next command
  * until this payload is complete. Maximum PS1 transfer = full VRAM (1 MiB). */
 static uint16_t vram_write_pixels[1024 * 512];
+static uint16_t ws_menu_clut_x = 0, ws_menu_clut_y = 480; /* the backdrop's palette, as its rectangles last named it */
 
 /* Depth24 CPU→VRAM upload span (halfwords, exclusive end). See
  * gpu_depth24_rgb_limit — declared early so gpu_reset_state can clear it. */
@@ -2468,6 +2496,58 @@ static uint32_t s_d24_upload_x1 = 0;
 static int      s_d24_present_hold = 0; /* vblanks to skip Swap after GP1(07h) */
 static uint32_t s_d24_prev_disp_h = 0;  /* last GP1(07h) band height */
 static void depth24_note_upload(uint32_t x, uint32_t w);
+
+/* The wide front end's logo and paint are in the renderer's video memory alone, the one the game reads and a save state holds. */
+static uint16_t ws_menu_kept[PSX_WS_MENU_LOGO_ROWS * PSX_WS_MENU_LOGO_WIDE], ws_menu_under[PSX_WS_MENU_LOGO_ROWS * PSX_WS_MENU_LOGO_WIDE];
+static uint16_t ws_menu_painted[PSX_WS_MENU_LOGO_ROWS * PSX_WS_MENU_WORDS], ws_menu_uploaded[PSX_WS_MENU_LOGO_ROWS * PSX_WS_MENU_WORDS];
+static int ws_menu_fresh; /* the CPU copy at (320,0) is a whole picture with the logo, and no state was loaded since it came */
+static int ws_menu_lent;  /* the renderer holds the kept logo at (512,0) */
+static int ws_menu_rows;  /* and the painted rows in the picture */
+static int ws_menu_due;   /* the frame has drawn nothing yet: its first primitive says whether it is the front end's */
+
+static const uint16_t *ws_menu_palette(void) { return &vram[ws_menu_clut_y * 1024u + ws_menu_clut_x]; }
+
+/* Gives a rectangle of the renderer's back word by word: what is still as it was put there becomes what it was before. */
+static void ws_menu_return(int x, int y, int w, int h, const uint16_t *put, const uint16_t *before) {
+    static uint16_t now[PSX_WS_MENU_LOGO_ROWS * PSX_WS_MENU_LOGO_WIDE];
+    gr_vram_transfer_out(x, y, w, h, now);
+    if (psx_ws_menu_return(now, w, w, h, put, before)) gr_vram_transfer_in(x, y, w, h, now);
+}
+
+/* The front end is left, or the game is about to read or write there: it finds its own words. */
+static void ws_menu_give_back(void) {
+    if (ws_menu_lent) ws_menu_return(PSX_WS_MENU_KEPT_X, 0, PSX_WS_MENU_LOGO_WIDE, PSX_WS_MENU_LOGO_ROWS, ws_menu_kept, ws_menu_under);
+    if (ws_menu_rows) ws_menu_return(PSX_WS_MENU_X, PSX_WS_MENU_LOGO_TOP, PSX_WS_MENU_WORDS, PSX_WS_MENU_LOGO_ROWS, ws_menu_painted, ws_menu_uploaded);
+    ws_menu_lent = ws_menu_rows = ws_menu_logo = 0;
+}
+
+/* The game is about to read or write this rectangle of video memory, in words. What it writes there the CPU copy does not have. */
+static void ws_menu_yield(int x, int y, int w, int h, int written) {
+    if (!psx_ws_menu_reaches(x, y, w, h)) return;
+    ws_menu_give_back();
+    if (written) ws_menu_fresh = 0;
+}
+
+/* The front end's picture is at (320,0): its logo goes to (512,0) and is painted over in the picture, both in the renderer's video memory. */
+static void ws_menu_take_picture(void) {
+    static uint8_t mask[PSX_WS_MENU_LOGO_ROWS * PSX_WS_MENU_LOGO_WIDE];
+    static uint16_t picture[PSX_WS_MENU_HIGH * PSX_WS_MENU_WORDS];
+    const uint16_t *palette = ws_menu_palette();
+    if (!ws_menu_fresh || !ws_menu_wanted()) {
+        ws_menu_give_back();
+        return;
+    }
+    if (!ws_menu_lent) gr_vram_transfer_out(PSX_WS_MENU_KEPT_X, 0, PSX_WS_MENU_LOGO_WIDE, PSX_WS_MENU_LOGO_ROWS, ws_menu_under);
+    for (int row = 0; row < PSX_WS_MENU_HIGH; ++row) memcpy(&picture[row * PSX_WS_MENU_WORDS], &vram[row * 1024 + PSX_WS_MENU_X], PSX_WS_MENU_WORDS * sizeof(uint16_t));
+    memcpy(ws_menu_uploaded, &picture[PSX_WS_MENU_LOGO_TOP * PSX_WS_MENU_WORDS], sizeof(ws_menu_uploaded));
+    psx_ws_menu_logo_mask(picture, PSX_WS_MENU_WORDS, palette, mask);
+    psx_ws_menu_keep_logo(picture, PSX_WS_MENU_WORDS, palette, mask, ws_menu_kept);
+    gr_vram_transfer_in(PSX_WS_MENU_KEPT_X, 0, PSX_WS_MENU_LOGO_WIDE, PSX_WS_MENU_LOGO_ROWS, ws_menu_kept);
+    psx_ws_menu_paint(picture, PSX_WS_MENU_WORDS, mask);
+    memcpy(ws_menu_painted, &picture[PSX_WS_MENU_LOGO_TOP * PSX_WS_MENU_WORDS], sizeof(ws_menu_painted));
+    gr_vram_transfer_in(PSX_WS_MENU_X, PSX_WS_MENU_LOGO_TOP, PSX_WS_MENU_WORDS, PSX_WS_MENU_LOGO_ROWS, ws_menu_painted);
+    ws_menu_logo = ws_menu_lent = ws_menu_rows = 1;
+}
 
 static void gp0_commit_cpu_to_vram(void) {
     for (uint32_t row = 0; row < vram_write_h; row++)
@@ -2478,6 +2558,11 @@ static void gp0_commit_cpu_to_vram(void) {
     gr_vram_transfer_in(vram_write_x, vram_write_y,
                         vram_write_w, vram_write_h, vram_write_pixels);
     depth24_note_upload(vram_write_x, vram_write_w);
+    if (psx_ws_menu_is_picture(vram_write_x, vram_write_y, vram_write_w, vram_write_h)) {
+        ws_menu_rows = 0; /* the renderer's rows are the game's again */
+        ws_menu_fresh = psx_ws_menu_has_logo(&vram[PSX_WS_MENU_X], 1024, ws_menu_palette());
+        ws_menu_take_picture();
+    }
     gp0_state = GP0_IDLE;
     vram_write_remaining = 0;
     text_xlate_vram_upload(vram_write_x, vram_write_y,
@@ -4454,6 +4539,7 @@ static void gp0_exec_mono_rect(void) {
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
     ws_expand_fullscreen_rect(&x0, y0, &w, h);
+    w = ws_menu_rect(&x0, w);
     x0 += ws_nw_hud_shift(x0, w);   /* native-wide HUD corner re-anchor (no-op else) */
     x0 += draw_offset_x; y0 += draw_offset_y;
     if (draw_area_out_rect(x0, y0, w, h)) return;
@@ -4482,7 +4568,22 @@ static void gp0_exec_textured_rect(void) {
      * untagged SPRTs are screen-space 2D (HUD/menus) and squash around the
      * display centre. Texels keep full coverage via the scaled-rect path. */
     int ws_w = 0, ws_h = 0;
-    if (ws_active() && w > 0) {
+    const int menu_page = texpage_y != 0 || texpage_colors != 1 || clut_x > 1024 - 256 ? 0 : texpage_x == PSX_WS_MENU_X / 64 ? 1 : texpage_x == (PSX_WS_MENU_X + 128) / 64 ? 2 : 0; /* a palette that runs off its row is not the picture's */
+    const int menu_shape = psx_ws_menu_backdrop_half(x0, y0, w, h) & menu_page;
+    if (ws_menu_due) { /* the front end's frame begins with its backdrop */
+        ws_menu_due = 0;
+        if (!menu_shape) ws_menu_give_back();
+    }
+    if (menu_shape) {
+        ws_menu_clut_x = clut_x;
+        ws_menu_clut_y = clut_y;
+        if (!ws_menu_logo) ws_menu_take_picture(); /* a save state or a read took it away, or the screen has become wide */
+    }
+    const int menu_half = ws_menu_logo ? menu_shape : 0;
+    if (menu_half && ws_menu_wanted()) psx_ws_frame_kinds_menu_begin(&ws_frame_kinds);
+    if (ws_menu_frame()) {
+        if (!menu_half) ws_w = ws_menu_rect(&x0, w); /* the backdrop itself is stretched */
+    } else if (ws_active() && w > 0) {
         int32_t ws_ax;
         if (ws_screen_tile_take()) {
             /* Both edges go through one mapping, so neighbours keep touching. */
@@ -4526,6 +4627,16 @@ static void gp0_exec_textured_rect(void) {
                                      clut_x, clut_y, current_texpage());
     else
         gr_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
+    if (!menu_half) return;
+    if (ws_menu_halves & menu_half) ws_menu_halves = 0;
+    ws_menu_halves |= menu_half;
+    if (ws_menu_halves != 3) return;
+    ws_menu_halves = 0;
+    int32_t logo_left = PSX_WS_MENU_LOGO_LEFT, logo_right = PSX_WS_MENU_LOGO_RIGHT; /* where it was when the screen is not wide after all */
+    if (ws_menu_frame()) psx_ws_menu_logo_span(PSX_WS_MENU_WIDE / 2, ws_xnum, ws_xden, &logo_left, &logo_right);
+    gr_draw_textured_rect_scaled(logo_left + draw_offset_x, PSX_WS_MENU_LOGO_TOP + draw_offset_y, logo_right - logo_left, PSX_WS_MENU_LOGO_ROWS,
+                                 0, 0, PSX_WS_MENU_LOGO_WIDE, PSX_WS_MENU_LOGO_ROWS,
+                                 clut_x, clut_y, PSX_WS_MENU_KEPT_PAGE);
 }
 
 /* Execute 1x1 dot (GP0 0x68-0x6B) */
@@ -4534,6 +4645,7 @@ static void gp0_exec_mono_dot(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x, y;
     parse_vertex(gp0_cmd_buf[1], &x, &y);
+    (void)ws_menu_rect(&x, 1);
     x += ws_nw_hud_shift(x, 1);
     x += draw_offset_x; y += draw_offset_y;
     if (draw_area_out_point(x, y)) return;
@@ -4574,11 +4686,12 @@ static void gp0_exec_mono_8x8(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    const int w = ws_menu_rect(&x0, 8);
     x0 += ws_nw_hud_shift(x0, 8);
     x0 += draw_offset_x; y0 += draw_offset_y;
-    if (draw_area_out_rect(x0, y0, 8, 8)) return;
+    if (draw_area_out_rect(x0, y0, w, 8)) return;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_flat_rect(x0, y0, 8, 8, color);
+    gr_draw_flat_rect(x0, y0, w, 8, color);
 }
 
 /* Execute 16x16 textured sprite (GP0 0x7C-0x7F) */
@@ -4633,6 +4746,7 @@ static void gp0_exec_fill_rect(void) {
     /* Fill ignores draw area, mask bits, and draw offset — writes directly to
      * VRAM. Routed through the renderer so it also fills the hi-res
      * supersampling mirror (no-op cost when supersampling is off). */
+    ws_menu_yield((int)dst_x, (int)dst_y, (int)width, (int)height, 1);
     gr_fill_rect((int)dst_x, (int)dst_y, (int)width, (int)height, color16);
 
     /* Keep every active presentation mirror in lockstep with the canonical
@@ -4675,6 +4789,11 @@ static void gp0_exec_texture_window(void) {
     gr_set_texture_window(texture_window_value);
 }
 
+/* The game may draw anywhere in its drawing area. */
+static void ws_menu_yield_drawing_area(void) {
+    ws_menu_yield((int)draw_area_left, (int)draw_area_top, (int)draw_area_right - (int)draw_area_left + 1, (int)draw_area_bottom - (int)draw_area_top + 1, 1);
+}
+
 static void gp0_exec_draw_area_tl(void) {
     /* 0xE3 — Set Drawing Area Top-Left
      * Bits 0-9: X
@@ -4686,6 +4805,9 @@ static void gp0_exec_draw_area_tl(void) {
                      (int)draw_area_right, (int)draw_area_bottom);
     psx_ws_hud_widgets_frame(&ws_hud);
     ws_nw_sync_target();  /* back buffer (draw_area_left) → wide mirror surface */
+    ws_menu_due = 1;
+    ws_menu_halves = 0;
+    ws_menu_yield_drawing_area();
     psx_ws_frame_kinds_area(&ws_frame_kinds, draw_area_left, draw_area_top, WS_GTE_GAME_MODE_MIN_VERTS);
 }
 
@@ -4698,6 +4820,7 @@ static void gp0_exec_draw_area_br(void) {
     draw_area_bottom = (param >> 10) & 0x3FF;
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
+    ws_menu_yield_drawing_area();
     ws_nw_sync_target();  /* back buffer (draw_area_left) → wide mirror surface */
 }
 
@@ -4794,7 +4917,10 @@ static void gp0_exec_cpu_to_vram(void) {
     /* 0 means max dimension */
     vram_write_w = (w == 0) ? 0x400 : (uint16_t)w;
     vram_write_h = (h == 0) ? 0x200 : (uint16_t)h;
+    if (!psx_ws_menu_is_picture(vram_write_x, vram_write_y, vram_write_w, vram_write_h)) /* the whole picture is dealt with once it has arrived */
+        ws_menu_yield(vram_write_x, vram_write_y, vram_write_w, vram_write_h, 1); /* before its words land */
 
+    ws_frame_pictured(vram_write_x, vram_write_y, vram_write_w, vram_write_h);
     /* Record for debug */
     if (a0_history_count < A0_HISTORY_CAP) {
         int slot = a0_history_count++;
@@ -4874,6 +5000,7 @@ static void gp0_exec_vram_to_cpu(void) {
     uint32_t h = (gp0_cmd_buf[2] >> 16) & 0x1FFu;
     vram_read_w = (w == 0) ? 0x400 : (uint16_t)w;
     vram_read_h = (h == 0) ? 0x200 : (uint16_t)h;
+    ws_menu_yield(vram_read_x, vram_read_y, vram_read_w, vram_read_h, 0);
 
     /* Record for debug */
     if (c0_history_count < C0_HISTORY_CAP) {
@@ -5392,6 +5519,10 @@ static void gp0_execute_command(void) {
     extern void ws_bg_phase_note(uint32_t op);
     ws_bg_phase_note(opcode);   /* native-wide 2D-backdrop stretch: background-phase latch */
 
+    if (ws_menu_due && opcode >= 0x20 && opcode <= 0x7F && (opcode & 0xFC) != 0x64) { /* a frame that begins with anything but a textured rectangle is not the front end's */
+        ws_menu_due = 0;
+        ws_menu_give_back();
+    }
     /* Draw-census: capture every drawing primitive's first vertex + camera. */
     if (opcode >= 0x20 && opcode <= 0x7F) {
         int32_t cvx, cvy;
@@ -5518,9 +5649,10 @@ static void gp0_execute_command(void) {
             uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
             int32_t x0, y0;
             parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+            const int w = ws_menu_rect(&x0, 16);
             x0 += draw_offset_x; y0 += draw_offset_y;
             gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-            gr_draw_flat_rect(x0, y0, 16, 16, color);
+            gr_draw_flat_rect(x0, y0, w, 16, color);
             break;
         }
         case 0x7C: case 0x7D: case 0x7E: case 0x7F:
@@ -5545,7 +5677,10 @@ static void gp0_execute_command(void) {
             int h = (gp0_cmd_buf[3] >> 16) & 0x1FF;
             if (w == 0) w = 0x400;
             if (h == 0) h = 0x200;
+            ws_menu_yield(src_x, src_y, w, h, 0);
+            ws_menu_yield(dst_x, dst_y, w, h, 1);
             gr_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
+            ws_frame_pictured(dst_x, dst_y, w, h);
             break;
         }
 
@@ -6087,11 +6222,16 @@ uint32_t gpu_snapshot_bytes(void) {
 }
 void gpu_snapshot_write(uint8_t *p) {
     PstW w; uint32_t n = gpu_snapshot_bytes();
+    ws_menu_give_back(); /* a save state reads video memory from the renderer after this, and holds the game's alone */
     pst_w_init(&w, p, n);
     (void)gpu_snap_emit(&w);
 }
 uint32_t gpu_cosim_snapshot_bytes(void) { return gpu_snapshot_bytes(); }
-void gpu_cosim_snapshot_write(uint8_t *p) { gpu_snapshot_write(p); }
+void gpu_cosim_snapshot_write(uint8_t *p) { /* a hash of the registers between blocks, not a save state: nothing is given back for it */
+    PstW w;
+    pst_w_init(&w, p, gpu_snapshot_bytes());
+    (void)gpu_snap_emit(&w);
+}
 void gpu_cosim_dump(char *out, int cap) {
     if (!out || cap <= 0) return;
     char *p = out;
@@ -6136,6 +6276,7 @@ int gpu_snapshot_read(const uint8_t *p, uint32_t len) {
     if (len != gpu_snapshot_bytes()) return 0;
     pst_r_init(&r, p, len);
     if (!gpu_snap_parse(&r)) return 0;
+    ws_menu_lent = ws_menu_rows = ws_menu_logo = ws_menu_fresh = 0; /* the loaded video memory holds nothing of the wide menu's, and the CPU copy is not it */
     /* Sync renderer clip/scissor to restored GP0(E3/E4); vars alone leave GL
      * on stale drawing state after savestate load. The offset also selects the
      * correct framebuffer-relative horizon for optional full-Y yaw. */

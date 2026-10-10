@@ -13,9 +13,9 @@ disc revision; the redistributable OpenBIOS backend is used for booting.
 ## Features
 
 - OpenGL rendering at 1x–8x internal resolution, with 4x as the default.
-- Optional widescreen: 16:9, 21:9, 32:9, or Match window. Menus and movies stay
-  at 4:3, and the HUD retains its proportions. A HUD size setting shrinks it
-  toward the screen edges.
+- Optional widescreen: 16:9, 21:9, 32:9, or Match window. The main menu fills
+  the screen too, movies stay at 4:3, and the HUD retains its proportions. A
+  HUD size setting shrinks it toward the screen edges.
 - Optional geometry and perspective-texture correction.
 - Optional 60 FPS gameplay and in-between frames, both experimental.
 - Keyboard/controller input and optional modern WASD/mouse controls.

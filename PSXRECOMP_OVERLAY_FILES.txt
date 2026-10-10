@@ -16,6 +16,7 @@ runtime/include/gpu.h
 +runtime/include/gpu_ws_screen_tile.h
 +runtime/include/gpu_ws_tag_match.h
 +runtime/include/gpu_ws_frame_kind.h
++runtime/include/gpu_ws_menu.h
 +runtime/include/gpu_temporal_sprite.h
 +runtime/include/gpu_temporal_match.h
 +runtime/include/gpu_temporal_mesh.h

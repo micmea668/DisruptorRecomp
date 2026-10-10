@@ -83,9 +83,11 @@ leaves the weapon size unchanged.
 automatically. It starts off; the other movies still play normally. Escape
 can skip the logo or movie currently on screen when the settings menu is closed.
 
-The default is 4x at 4:3; lower the scale if performance is poor. Menus and
-movies remain at 4:3. Controls, display, and audio preferences are saved in
-`settings.toml` beside the executable.
+The default is 4x at 4:3; lower the scale if performance is poor. The main
+menu and its screens fill a wide screen: the backdrop is stretched, and the
+logo and the text keep their shape. Movies, the map and loading screens remain
+at 4:3. Controls, display, and audio preferences are saved in `settings.toml`
+beside the executable.
 
 ## Other languages
 
