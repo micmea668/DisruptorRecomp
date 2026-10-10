@@ -38,6 +38,8 @@ struct Preset { const wchar_t* label; std::span<const PresetValue> values; };
 std::span<const Option> options();
 std::span<const Preset> presets();
 const Option* find_option(const char* key);
+// Whether a release's settings.toml names the row: for these the game's own value is not the one a release runs with.
+bool shipped(const Option& option);
 std::span<const wchar_t* const> page_labels();
 
 std::string utf8(const std::filesystem::path& path);
@@ -61,6 +63,8 @@ public:
     bool set(const Option& option, int value);
     bool apply(const Preset& preset);
     bool reset();
+    // Writes each shipped row the file does not name: for those the game's own value is not the one shown here.
+    bool complete();
 
     // UTF-8 paths. An empty language disc means the US disc alone.
     const std::string& language_disc() const { return settings_.language_disc; }

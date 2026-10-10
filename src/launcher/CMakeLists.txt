@@ -20,6 +20,7 @@ target_compile_definitions(disruptor-launcher-config PUBLIC
 
 # A language disc is checked with the game's own layout code.
 add_library(disruptor-launcher-model STATIC
+    launcher_flow.cpp
     launcher_settings.cpp
     region_disc.cpp
     startup_log.cpp
@@ -82,7 +83,12 @@ if(BUILD_TESTING)
 
     add_executable(disruptor-launcher-settings-test "${PROJECT_SOURCE_DIR}/tests/launcher_settings_test.cpp")
     target_link_libraries(disruptor-launcher-settings-test PRIVATE disruptor-launcher-model)
+    target_compile_definitions(disruptor-launcher-settings-test PRIVATE "DISRUPTOR_SOURCE_DIR=LR\"(${PROJECT_SOURCE_DIR})\"")
     add_test(NAME disruptor_launcher_settings COMMAND disruptor-launcher-settings-test)
+
+    add_executable(disruptor-launcher-flow-test "${PROJECT_SOURCE_DIR}/tests/launcher_flow_test.cpp")
+    target_link_libraries(disruptor-launcher-flow-test PRIVATE disruptor-launcher-model)
+    add_test(NAME disruptor_launcher_flow COMMAND disruptor-launcher-flow-test)
 
     # The synthetic discs include the layout code whole, so this test takes region_disc.cpp and not the library.
     add_executable(disruptor-region-disc-test
@@ -91,12 +97,13 @@ if(BUILD_TESTING)
     target_link_libraries(disruptor-region-disc-test PRIVATE disruptor-disc-import)
     add_test(NAME disruptor_region_disc COMMAND disruptor-region-disc-test)
 
-    set_target_properties(disruptor-launcher-settings-test disruptor-region-disc-test PROPERTIES
+    set_target_properties(disruptor-launcher-settings-test disruptor-launcher-flow-test disruptor-region-disc-test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
     if(MSVC)
-        set_property(TARGET disruptor-launcher-settings-test disruptor-region-disc-test
+        set_property(TARGET disruptor-launcher-settings-test disruptor-launcher-flow-test disruptor-region-disc-test
             PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
         target_compile_options(disruptor-launcher-settings-test PRIVATE /utf-8)
+        target_compile_options(disruptor-launcher-flow-test PRIVATE /utf-8)
         target_compile_options(disruptor-region-disc-test PRIVATE /utf-8)
     endif()
 endif()

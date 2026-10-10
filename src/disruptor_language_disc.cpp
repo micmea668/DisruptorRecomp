@@ -65,6 +65,7 @@ constexpr uint32_t kNamePlaces = 0x800569F8u;  /* where the ten control names ar
 constexpr int kMenuWidth = 320;
 constexpr int kNameRaster = 256;  /* a control's name is drawn into a raster this wide before it goes on the screen */
 constexpr size_t kSmallFontFirst = 10, kSmallFontLast = 19;  /* the menu strings drawn in the small font */
+constexpr int kTextRaster = 256, kGlyphWide = 12, kSpaceWide = 6;  /* func_8001A46C clears a raster this wide, func_80044BDC writes each glyph's twelve bytes into it unchecked */
 constexpr uint32_t kLoad = 0x80010000u, kExeHeader = 0x800u;
 constexpr uint32_t kMostFileSectors = 0x1FFFFFu;  /* a file's bytes, rounded up to a sector, stay within 32 bits */
 constexpr uint32_t kMovieTables = 0x8005701Cu, kMovieTable = 0x28u;  /* sound sectors, pitch, frames, top row */
@@ -129,8 +130,11 @@ const std::vector<Language> &languages() {
           {0x80071224u, 0x80071D18u}, {0x8007123Cu, 0x80071D34u}, {0x80071260u, 0x800103B8u}},
          {{0x8005725Cu, 16, 10, 0x80057CF4u, 24}, {0x800572FCu, 10, 6, 0x80057DE4u, 16}},
          {0x80010098u, 0x800100B8u},
-         {{73, "SELECTIONNER LA PARTIE"}, {75, "SAUVEGARDE AUTO EN COURS"}, {76, "SAUVEGARDE AUTO REUSSIE"}, {77, "SAUVEGARDE AUTO ECHOUEE"}},
-         {{0x80010098u, "REMPLACER PAR M%d f  NON"}, {0x800100B8u, "REMPLACER PAR M%d f  OUI"}},
+         {{53, "SELECTIONNER FICHIER A EFFACER"}, {61, "LECTURE DU FICHIER IMPOSSIBLE"}, {62, "CREATION FICHIER IMPOSSIBLE"},
+          {63, "LECTURE DU FICHIER IMPOSSIBLE"}, {64, "SAUVEGARDE NON DISPONIBLE"}, {72, "SAUVEGARDES INACCESSIBLES"},
+          {73, "SELECTIONNER LA PARTIE"}, {75, "SAUVEGARDE AUTO EN COURS"}, {76, "SAUVEGARDE AUTO REUSSIE"}, {77, "SAUVEGARDE AUTO ECHOUEE"}},
+         {{0x80010098u, "REMPLACER PAR M%d f  NON"}, {0x800100B8u, "REMPLACER PAR M%d f  OUI"}, {0x80010140u, "ESSAYEZ LE MODE DUR"},
+          {0x8001018Cu, "ECRASER CETTE PARTIE f"}},
          0x8001A4E0u},
         {"SLES_005.65", "German", 0x80057548u, {0x80057344u, 0x80057384u, 0x800573C8u}, true,
          true, Hints::kSame, 4, {{'k', "j"}, {'l', "\x8F"}, {'m', "\x90"}, {'n', "SS"}},
@@ -470,6 +474,57 @@ bool menu_piece(const Bytes &home, const Bytes &other, const Language &language,
     return true;
 }
 
+/* How far func_80044BDC writes into its raster for a string, with this executable's widths and the signs spelled out: -1 for a character it has no width for or a glyph that starts before the raster. A number counts as two of the widest digit, a format's other parts as nothing. */
+int large_font_reach(const Bytes &exe, std::string_view text, const Language &language) {
+    const size_t widths = kWidths[2] - kLoad + kExeHeader;
+    if (widths + kWidthsC > exe.size()) return -1;
+    const uint8_t *digits = exe.data() + widths + kSignsC + 26;
+    const auto widest_digit = static_cast<uint8_t>('0' + (std::max_element(digits, digits + 10, [](uint8_t one, uint8_t other) { return static_cast<int8_t>(one) < static_cast<int8_t>(other); }) - digits));
+    int at = 0, reach = 0;
+    const auto draw = [&](uint8_t letter) {
+        if (letter == ' ') {
+            at += kSpaceWide;
+            return true;
+        }
+        const int glyph = letter >= 'a' ? letter - 'a' : letter >= 'A' ? letter - 'A' + static_cast<int>(kSignsC) : letter - 12;
+        if (glyph < 0 || glyph >= static_cast<int>(kWidthsC) || at < 0) return false;
+        reach = std::max(reach, at + kGlyphWide);
+        at += static_cast<int8_t>(exe[widths + static_cast<size_t>(glyph)]);
+        return true;
+    };
+    for (size_t index = 0; index < text.size(); ++index) {
+        const auto letter = static_cast<uint8_t>(text[index]);
+        if (letter < ' ') continue;  /* a part of a pack's string, numbered */
+        if (letter == '%' && index + 1 < text.size()) {
+            if (text[++index] == 'd' && !(draw(widest_digit) && draw(widest_digit))) return -1;
+            continue;
+        }
+        const auto sign = std::find_if(language.signs.begin(), language.signs.end(), [&](const Sign &one) { return static_cast<uint8_t>(one.written) == letter; });
+        const std::string drawn = sign != language.signs.end() ? sign->drawn : std::string(1, static_cast<char>(letter));
+        for (const char one : drawn) {
+            if (!draw(static_cast<uint8_t>(one))) return -1;
+        }
+    }
+    return reach;
+}
+
+/* A string past the raster's edge comes out wrapped round onto its own start. */
+bool fits_text_raster(const Bytes &exe, std::string_view text, const Language &language) {
+    const int reach = large_font_reach(exe, text, language);
+    return reach >= 0 && reach <= kTextRaster;
+}
+
+/* Whether every menu string of the large font ends inside its raster: the first that does not is named. */
+bool menu_strings_fit(const Bytes &exe, const std::vector<std::string> &texts, const Language &language, std::string &why) {
+    for (size_t index = 0; index < std::min(texts.size(), kMenuStrings); ++index) {
+        const bool small = index >= kSmallFontFirst && index <= kSmallFontLast;
+        if (small || !for_large_font(texts[index], language) || fits_text_raster(exe, texts[index], language)) continue;
+        why = "menu string " + std::to_string(index) + ", \"" + texts[index] + "\", is wider than the raster the menu draws it in";
+        return false;
+    }
+    return true;
+}
+
 std::string exe_string(const Bytes &exe, uint32_t address) {
     const size_t at = address - kLoad + kExeHeader;
     if (address < kLoad || at >= exe.size()) return {};
@@ -660,7 +715,7 @@ std::vector<Place> other_places(const Bytes &home, const Bytes &other, uint32_t 
 }
 
 /* The other executable's strings for the strings of the US one, in the pack the language module takes. */
-bool build_pack(const Bytes &home, const Bytes &other, const Language &language, Bytes &pack, std::string &why) {
+bool build_pack(const Bytes &home, const Bytes &other, const Language &language, Bytes &pack, std::string &why, const Bytes *drawn_with = nullptr) {
     std::map<uint32_t, uint32_t> pairs;
     for (const Pair &pair : language.strings) pairs[pair.home] = pair.other;
     for (const Names &names : language.names) {
@@ -678,6 +733,10 @@ bool build_pack(const Bytes &home, const Bytes &other, const Language &language,
         std::string words = stand_in != language.string_stand_ins.end() ? stand_in->second : exe_string(other, other_address);
         if (text.empty() || words.empty() || writes_taken_glyph(words, language)) {
             why = "a string of one of the executables is not where it is expected";
+            return false;
+        }
+        if (drawn_with && for_large_font(words, language) && !fits_text_raster(*drawn_with, words, language)) {
+            why = "the string \"" + words + "\" is wider than the raster the menu draws it in";
             return false;
         }
         const std::string kinds = parts_of(text);
@@ -913,7 +972,7 @@ bool LanguageDisc::build(DiscImage &home, DiscImage &other, std::string &why) {
     }
 
     Bytes patched_exe = home_exe;
-    if (!patch_executable(patched_exe, other_exe, *language) || (language->text && !build_pack(home_exe, other_exe, *language, pack_, why))) {
+    if (!patch_executable(patched_exe, other_exe, *language) || (language->text && !build_pack(home_exe, other_exe, *language, pack_, why, &patched_exe))) {
         if (why.empty()) why = "the executables do not have the tables this build expects";
         return false;
     }
@@ -959,6 +1018,7 @@ bool LanguageDisc::build(DiscImage &home, DiscImage &other, std::string &why) {
                 why = "a control's name cannot be placed beside the picture of the pad";
                 return false;
             }
+            if (!menu_strings_fit(patched_exe, names, *language, why)) return false;
             for (uint32_t sector = 0; sector < count; ++sector) {
                 const uint8_t *data = reworked.data() + sector * kSectorData;
                 if (std::memcmp(data, ours.data() + sector * kSectorData, kSectorData) != 0) set_data(sectors_ + sector, data);

@@ -213,7 +213,7 @@ require(
     "names no sign the module would refuse",
 )
 require(
-    "    if (!patch_executable(patched_exe, other_exe, *language) || (language->text && !build_pack(home_exe, other_exe, *language, pack_, why))) {" in disc
+    "    if (!patch_executable(patched_exe, other_exe, *language) || (language->text && !build_pack(home_exe, other_exe, *language, pack_, why, &patched_exe))) {" in disc
     and "    if (count == 0 && (!language.signs.empty() || !places.empty())) {" in disc
     and "        const bool menu = language->text && within(piece, kMenuFirst, kMenuLast), level = language->text && within(piece, kLevelFirst, kLevelLast);\n"
     "        const bool speech = within(piece, kSpeechFirst, kSpeechLast), hint = within(piece, kHintFirst, kHintLast);" in disc
@@ -228,6 +228,7 @@ require(
     and "        if (home_width < 0 || width < 0) return false;" in disc
     and "        if (glyph < 0 && letter != ' ') return -1;\n        width += glyph < 0 ? 4 : exe[widths + static_cast<size_t>(glyph)];" in disc
     and "            if (!place_control_names(patched_exe, home_exe, home_names, names)) {" in disc
+    and "            if (!menu_strings_fit(patched_exe, names, *language, why)) return false;" in disc
     and "                !menu_piece(ours, their_piece, *language, reworked, why, &home_names, &names)) {" in disc
     and "    if (home_names) *home_names = old;\n    if (names) *names = texts;" in disc
     and "    static_assert(kWidths[1] > kNamePlaces + 80, " in disc

@@ -675,6 +675,79 @@ Read read(disruptor::LanguageDisc &disc, uint32_t lba) {
     return {raw[16], Bytes(raw + 24, raw + 24 + kSectorData), static_cast<uint32_t>(raw[12]) << 16 | static_cast<uint32_t>(raw[13]) << 8 | raw[14]};
 }
 
+void test_strings_fit_the_menu_raster() {
+    const size_t table = 0x80056EC4u - 0x80010000u + 0x800u;
+    Bytes exe(0x62000, 0);
+    std::fill_n(exe.begin() + static_cast<std::ptrdiff_t>(table), 48, uint8_t{10});
+    exe[table + 9] = 4;                /* the glyph a sign is put in */
+    exe[table + 10 + ('I' - 'A')] = 6;
+    exe[table + 36 + 7] = 11;          /* the widest digit */
+    disruptor::Language language{};
+    language.more_signs = 4;
+    language.signs = {{'k', "j"}, {'n', "SS"}};
+    const auto reach = [&](std::string_view text) { return disruptor::large_font_reach(exe, text, language); };
+    expect(reach("") == 0 && reach("   ") == 0 && reach("A") == 12 && reach("AB") == 22 && reach("A B") == 28,
+           "a glyph is written twelve bytes wide where the widths before it end, and a space is six");
+    expect(reach("I") == 12 && reach("IA") == 18 && reach("A7") == 22 && reach("7A") == 23 && reach("!") == 12,
+           "a narrow glyph still writes twelve bytes, a digit and a mark below the capitals have glyphs of their own");
+    expect(reach("kA") == 16 && reach("n") == 22 && reach("\x90") == 12 && reach("\x91") == -1,
+           "a sign is measured as it is drawn, and a character past the last glyph has no width");
+    expect(reach("A%d") == 33 && reach("A%sB") == 22 && reach("A\x01" "B") == 22 && reach("A%") == 22,
+           "a number counts as two of the widest digit, a format's other parts as nothing, and a last % is a character");
+    expect(disruptor::large_font_reach(Bytes(0x1000, 0), "A", language) == -1, "an executable without the widths measures nothing");
+    const std::string full = std::string(24, 'A') + "kA", past = std::string(23, 'A') + "7kA";
+    expect(reach(full) == 256 && reach(past) == 257 && disruptor::fits_text_raster(exe, full, language) &&
+               !disruptor::fits_text_raster(exe, past, language) && !disruptor::fits_text_raster(exe, "\x91", language),
+           "a string fits when its last glyph ends inside the 256 bytes of the raster, and not a byte later");
+    exe[table + 10 + ('N' - 'A')] = 0xF8;
+    expect(reach("AANA") == 32 && reach("NA") == -1 && reach("N A") == -1 && reach("N") == 12,
+           "a glyph that steps back does not take the reach back with it, and one that would start before the raster has no place");
+    exe[table + 10 + ('N' - 'A')] = 10;
+
+    Bytes home(0x2000, 0), other(0x2000, 0), pack;
+    disruptor::Language two{};
+    two.strings = {{0x80010100u, 0x80010200u}, {0x80010140u, 0x80010240u}};
+    two.more_signs = 4;
+    put_string(home, 0x80010100u, "SMALL");
+    put_string(other, 0x80010200u, std::string(40, 'x'));
+    put_string(home, 0x80010140u, "LARGE");
+    put_string(other, 0x80010240u, std::string(20, 'A'));
+    std::string refusal;
+    expect(disruptor::build_pack(home, other, two, pack, refusal, &exe), "a string of another font is not measured, however long");
+    put_string(other, 0x80010240u, std::string(26, 'A'));
+    expect(!disruptor::build_pack(home, other, two, pack, refusal, &exe) && refusal.find("the string \"" + std::string(26, 'A') + "\" is wider") == 0,
+           "a string of the large font that would wrap round is refused and named");
+    expect(disruptor::build_pack(home, other, two, pack, refusal), "and is built where no executable is given to measure with");
+
+    std::vector<std::string> texts(79, "A");
+    std::string why;
+    texts[12] = std::string(40, 'A');  /* drawn in the small font */
+    texts[30] = "zzzz" + std::string(40, 'A');  /* a small letter the large font has no sign for */
+    expect(disruptor::menu_strings_fit(exe, texts, language, why) && why.empty(), "strings of another font are not measured");
+    texts[60] = " " + full;
+    texts[61] = " " + full;
+    expect(!disruptor::menu_strings_fit(exe, texts, language, why) && why.find("menu string 60, \" AAAA") == 0 && why.find("is wider") != std::string::npos,
+           "the first menu string that would wrap round is named");
+    texts.resize(60);
+    expect(disruptor::menu_strings_fit(exe, texts, language, why), "a shorter list is measured as far as it goes");
+
+    /* The French entry's longest menu string has 24 letters and its longest executable string 18. */
+    Discs fitting, menu_wide, string_wide;
+    const size_t in_home = 24 * kSectorData + table + 10;
+    make_discs(fitting);
+    make_discs(menu_wide);
+    make_discs(string_wide);
+    std::fill_n(fitting.home.data.begin() + static_cast<std::ptrdiff_t>(in_home), 26, uint8_t{8});
+    std::fill_n(menu_wide.home.data.begin() + static_cast<std::ptrdiff_t>(in_home), 26, uint8_t{11});
+    std::fill_n(string_wide.home.data.begin() + static_cast<std::ptrdiff_t>(in_home), 26, uint8_t{127});
+    disruptor::LanguageDisc disc;
+    expect(disc.build(fitting.home, fitting.other, why), "a disc whose strings fit their raster is laid out");
+    expect(!disc.build(menu_wide.home, menu_wide.other, why) && why.find("menu string ") == 0 && why.find("is wider") != std::string::npos,
+           "a menu string that would wrap round refuses the disc");
+    expect(!disc.build(string_wide.home, string_wide.other, why) && why.find("the string \"FR") == 0 && why.find("is wider") != std::string::npos,
+           "so does a string of the executable, with the widths the laid out executable has");
+}
+
 void test_the_two_discs_become_one() {
     Discs discs;
     make_discs(discs);
@@ -966,6 +1039,7 @@ int main() {
     test_places_come_from_calls_that_pair_up();
     test_the_executable_takes_the_other_tables();
     test_the_two_discs_become_one();
+    test_strings_fit_the_menu_raster();
     test_signs_go_where_the_us_routine_reaches();
     test_control_names_stand_beside_the_us_pad();
     test_a_german_disc_is_laid_out();

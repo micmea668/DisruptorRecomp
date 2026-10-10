@@ -1,4 +1,5 @@
 #include "disc_import.h"
+#include "launcher_flow.h"
 #include "launcher_settings.h"
 #include "region_disc.h"
 #include "startup_log.h"
@@ -32,7 +33,6 @@ constexpr int browse_id = 100, play_id = 101, cancel_id = 102, help_id = 103;
 constexpr int language_id = 104, add_disc_id = 105, remove_disc_id = 106, reset_id = 107, saves_id = 108;
 constexpr int preset_base = 200, option_base = 1000;
 constexpr int client_width = 680, client_height = 664;
-constexpr int slider_steps = 200;
 constexpr size_t log_lines = 8;
 constexpr LRESULT status_lines = 3;
 constexpr const wchar_t* image_filter =
@@ -64,27 +64,10 @@ void check_package(const fs::path& root, const DiscProfile& profile) {
         throw std::runtime_error("The bundled OpenBIOS is incomplete. Extract the complete release again.");
 }
 
-// Windows command-line quoting, including trailing backslashes and quotes.
-std::wstring quote(const std::wstring& argument) {
-    std::wstring result = L"\"";
-    size_t slashes = 0;
-    for (const auto ch : argument) {
-        if (ch == L'\\') { ++slashes; continue; }
-        if (ch == L'\"') result.append(slashes * 2 + 1, L'\\');
-        else result.append(slashes, L'\\');
-        result += ch;
-        slashes = 0;
-    }
-    result.append(slashes * 2, L'\\');
-    return result + L'\"';
-}
-
 HANDLE start_game(const fs::path& root, const VerifiedDisc& disc) {
     check_package(root, *disc.profile);
     const auto executable = root / "DisruptorRecompiled.exe";
-    // Keep disc/config arguments relative and ASCII for the game's path loader.
-    std::wstring command = quote(executable.wstring()) + L" --no-launcher --game " +
-        quote(disc.profile->game_config) + L" --disc " + quote(disc.cue.lexically_relative(root).wstring());
+    std::wstring command = game_command(root, disc);
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
     HANDLE log = CreateFileW((root / "startup.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                              &security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -114,30 +97,6 @@ HANDLE start_game(const fs::path& root, const VerifiedDisc& disc) {
     return process.hProcess;
 }
 
-std::wstring widen(const std::string& ascii) { return {ascii.begin(), ascii.end()}; }
-
-std::wstring value_text(const Option& option, int value) {
-    wchar_t text[32] = L"";
-    if (option.unit == Unit::percent) swprintf(text, 32, L"%d%%", value);
-    else if (option.unit == Unit::frames) swprintf(text, 32, L"%d FPS", value);
-    else if (option.unit == Unit::thousandths) swprintf(text, 32, L"%.3f", value / 1000.0);
-    return text;
-}
-
-// Sensitivity spans 0.005 to 2.000, so its slider is logarithmic like the in-game one.
-int to_position(const Option& option, int value, int highest) {
-    if (option.unit != Unit::thousandths) return value;
-    const double span = std::log(static_cast<double>(highest) / option.lowest);
-    return static_cast<int>(std::lround(std::log(static_cast<double>(value) / option.lowest) / span * slider_steps));
-}
-
-int from_position(const Option& option, int position, int highest) {
-    if (option.unit != Unit::thousandths) return position;
-    const double ratio = static_cast<double>(highest) / option.lowest;
-    const double value = option.lowest * std::pow(ratio, static_cast<double>(position) / slider_steps);
-    return std::clamp(static_cast<int>(std::lround(value)), option.lowest, highest);
-}
-
 std::optional<fs::path> pick_image(HWND owner, const wchar_t* title) {
     std::wstring selected(32768, L'\0');
     OPENFILENAMEW picker{};
@@ -153,19 +112,7 @@ std::optional<fs::path> pick_image(HWND owner, const wchar_t* title) {
     return fs::path(selected);
 }
 
-// take: an image whose kind the worker finds out. look: only the descriptions of the listed discs.
-enum class Task { import, verify, language, take, look };
-using Regions = std::map<std::string, std::optional<RegionDisc>>;
 struct Update { std::wstring status; unsigned percent; };
-struct Result {
-    Task task = Task::verify;
-    VerifiedDisc disc;
-    std::optional<RegionDisc> language;
-    fs::path image;
-    Regions regions;
-    std::wstring error, language_error;
-    bool play = false;
-};
 struct Placed { HWND window; int x, y, width, height; bool heading; };
 struct Row { const Option* option; HWND label = nullptr, control = nullptr, value = nullptr; };
 
@@ -185,7 +132,7 @@ struct App {
     HBRUSH page_brush = nullptr;
     std::thread worker;
     std::atomic_bool cancelled{false};
-    bool busy = false, closing = false;
+    bool busy = false, closing = false, unwritten = false;
     HANDLE game = nullptr;
     VerifiedDisc verified;
 
@@ -262,26 +209,12 @@ struct App {
 
     void show_languages() {
         discs = settings.language_discs();
+        const LanguageList list = language_list(discs, regions, settings.language_disc());
         SendMessageW(language, CB_RESETCONTENT, 0, 0);
-        SendMessageW(language, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"English (the US disc alone)"));
-        int selected = 0;
-        std::wstring note = L"Add a French, German or Japanese disc image to play in that language.";
-        for (size_t index = 0; index < discs.size(); ++index) {
-            const auto looked = regions.find(discs[index]);
-            const RegionDisc* disc = looked != regions.end() && looked->second ? &*looked->second : nullptr;
-            const std::wstring kind = disc ? widen(disc->language)
-                : looked == regions.end() ? L"Disc image" : L"Unknown or missing";
-            const std::wstring label = kind + L" (" + from_utf8(discs[index]).filename().wstring() + L")";
-            SendMessageW(language, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
-            if (discs[index] != settings.language_disc()) continue;
-            selected = static_cast<int>(index) + 1;
-            note = disc ? describe(*disc) + L" The image is used where it is."
-                : looked == regions.end() ? L""
-                : L"This image is missing or is not a known disc. Choose another one or English.";
-        }
-        SendMessageW(language, CB_SETCURSEL, selected, 0);
-        SetWindowTextW(language_note, note.c_str());
-        EnableWindow(remove_disc, editable() && selected > 0);
+        for (const std::wstring& label : list.labels) SendMessageW(language, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        SendMessageW(language, CB_SETCURSEL, list.selected, 0);
+        SetWindowTextW(language_note, list.note.c_str());
+        EnableWindow(remove_disc, editable() && list.selected > 0);
     }
     void show_settings() {
         const int page = static_cast<int>(SendMessageW(tabs, TCM_GETCURSEL, 0, 0));
@@ -331,10 +264,9 @@ struct App {
 
     void begin(Task task, fs::path source, bool launch) {
         if (worker.joinable()) worker.join();
-        if (launch) settings.load(); // the game reads the file, not what this window last saw of it
-        const fs::path home = verified.data;
-        const std::string spoken = settings.language_disc();
-        std::vector<std::string> listed = settings.language_discs();
+        // The game reads the file, not what this window last saw or shows of it.
+        if (launch) unwritten = !settings.complete() && settings.readable();
+        Request request{task, std::move(source), launch, verified.data, settings.language_disc(), settings.language_discs()};
         if (task == Task::import || task == Task::verify) verified = {}; // release previous read locks before replacing data
         cancelled = false;
         busy = true;
@@ -344,51 +276,27 @@ struct App {
             say(task == Task::import ? L"Preparing to import your image..."
                 : task == Task::verify ? L"Checking installed game data..."
                 : task == Task::take ? L"Looking at the image..." : L"Checking the language disc...");
-        worker = std::thread([this, task, source = std::move(source), launch, home, spoken, listed]() mutable {
-            auto result = std::make_unique<Result>();
-            result->task = task;
-            result->image = source;
-            result->play = launch;
-            try {
-                unsigned previous = 101;
-                std::wstring previous_status;
-                auto report = [this, &previous, &previous_status](const std::wstring& text, unsigned percent) {
-                    if (previous == percent && previous_status == text) return;
-                    previous = percent;
-                    previous_status = text;
-                    auto update = std::make_unique<Update>(Update{text, percent});
-                    if (PostMessageW(window, progress_message, 0, reinterpret_cast<LPARAM>(update.get())))
-                        update.release();
-                };
-                if (task == Task::take && region_disc(source)) {
-                    if (home.empty())
-                        throw std::runtime_error("That is a disc of another region. Install the USA disc first: "
-                                                 "it is the game, and the other disc gives it a language.");
-                    result->task = Task::language;
-                }
-                if (result->task == Task::language) {
-                    result->language = check_region_disc(home, source);
-                    listed.push_back(utf8(source));
-                } else if (task == Task::import || task == Task::verify) {
-                    result->disc = task == Task::import ? import_disc(source, root, cancelled, report)
-                                                        : verify_disc(source, cancelled, report);
-                    check_package(root, *result->disc.profile);
-                    if (cancelled) {
-                        result->disc = {};
-                        result->error = L"Cancelled. Any completed import is kept; reopen the launcher to verify it again.";
-                    } else if (launch && !spoken.empty()) {
-                        report(L"Checking the language disc...", 100);
-                        try {
-                            check_region_disc(result->disc.data, from_utf8(spoken));
-                        } catch (const std::exception& error) {
-                            result->language_error = L"The language disc cannot be used. " + error_text(error);
-                        }
-                    }
-                }
-            } catch (const std::exception& error) { result->error = error_text(error); }
-            for (const std::string& path : listed) result->regions.emplace(path, region_disc(from_utf8(path)));
-            if (PostMessageW(window, finished_message, 0, reinterpret_cast<LPARAM>(result.get())))
-                result.release();
+        worker = std::thread([this, request = std::move(request)]() mutable {
+            unsigned previous = 101;
+            std::wstring previous_status;
+            const auto report = [this, &previous, &previous_status](const std::wstring& text, unsigned percent) {
+                if (previous == percent && previous_status == text) return;
+                previous = percent;
+                previous_status = text;
+                auto update = std::make_unique<Update>(Update{text, percent});
+                if (PostMessageW(window, progress_message, 0, reinterpret_cast<LPARAM>(update.get())))
+                    update.release();
+            };
+            Discs discs;
+            discs.import = [&](const fs::path& image) { return import_disc(image, root, cancelled, report); };
+            discs.verify = [&](const fs::path& cue) { return verify_disc(cue, cancelled, report); };
+            discs.check_package = [&](const VerifiedDisc& disc) { check_package(root, *disc.profile); };
+            discs.look = [](const fs::path& image) { return region_disc(image); };
+            discs.check = [](const fs::path& home, const fs::path& image) { return check_region_disc(home, image); };
+            discs.report = report;
+            auto outcome = std::make_unique<Outcome>(run(std::move(request), discs, cancelled));
+            if (PostMessageW(window, finished_message, 0, reinterpret_cast<LPARAM>(outcome.get())))
+                outcome.release();
         });
     }
     void take_image(const fs::path& image) {
@@ -400,10 +308,7 @@ struct App {
     void launch() {
         try {
             game = start_game(root, verified);
-            const std::wstring overriding = environment_overrides();
-            say(std::wstring(L"Disruptor is running. You can close this launcher and keep playing.") +
-                (overriding.empty() ? L"" : L"\nPSX_ environment variables are set, and the game lets some of them "
-                                            L"replace settings for this run: " + overriding));
+            say(running_text(environment_overrides(), unwritten));
             SetTimer(window, 1, 500, nullptr);
         } catch (const std::exception& error) {
             say(error_text(error));
@@ -647,42 +552,22 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
         return 0;
     }
     case finished_message: {
-        std::unique_ptr<Result> result(reinterpret_cast<Result*>(lparam));
+        std::unique_ptr<Outcome> outcome(reinterpret_cast<Outcome*>(lparam));
         if (app->worker.joinable()) app->worker.join();
         app->busy = false;
         if (app->closing) { DestroyWindow(window); return 0; }
         SendMessageW(app->progress, PBM_SETPOS, 0, 0);
-        app->regions = std::move(result->regions);
-        if (result->task == Task::take && result->error.empty() && !app->cancelled) {
-            app->begin(Task::import, result->image, result->play); // no disc of another region: the game disc
+        app->regions = std::move(outcome->regions);
+        Step step = after(*outcome, app->cancelled);
+        if (step.import_next) {
+            app->begin(Task::import, outcome->image, outcome->launch);
             return 0;
         }
-        if (result->task == Task::look || (result->task == Task::take && result->error.empty())) {
-            if (app->cancelled) app->say(L"Cancelled.");
-        } else if (result->task == Task::language || result->task == Task::take) {
-            if (!result->error.empty()) {
-                app->say(result->error);
-            } else if (app->cancelled) {
-                app->say(L"Cancelled. The language is as it was.");
-            } else if (app->settings.choose_language_disc(utf8(result->image))) {
-                app->say(describe(*result->language) + L"\nThe image is used where it is, so keep it there.");
-            } else {
-                app->say(app->settings_error());
-            }
-        } else if (!result->error.empty()) {
-            // A cancellation can leave an already committed installation.
-            // Browsing again or reopening the launcher checks it afresh.
-            app->verified = {};
-            app->say(result->error);
-        } else {
-            app->verified = std::move(result->disc);
-            if (!result->language_error.empty()) {
-                app->say(result->language_error + L"\nChoose English or another disc, then select Play game.");
-            } else {
-                app->say(L"Game data is installed and ready. Select Play game to start.");
-                if (result->play && !app->cancelled) app->launch();
-            }
-        }
+        if (step.disc == DiscAfter::cleared) app->verified = {};
+        else if (step.disc == DiscAfter::taken) app->verified = std::move(outcome->disc);
+        if (step.save_language && !app->settings.choose_language_disc(utf8(outcome->image))) step.status = app->settings_error();
+        if (!step.status.empty()) app->say(step.status);
+        if (step.launch) app->launch();
         app->controls();
         return 0;
     }

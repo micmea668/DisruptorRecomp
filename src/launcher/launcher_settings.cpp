@@ -149,6 +149,10 @@ constexpr PresetValue enhanced_values[] = {
     {"disruptor.improved_shadows", 1}, {"disruptor.frame_unlock", 1}, {"video.frame_interpolation", 1}};
 constexpr Preset preset_list[] = {{L"Original", original_values}, {L"Enhanced (experimental)", enhanced_values}};
 
+constexpr const char* shipped_keys[] = {
+    "disruptor.mouse_aim", "disruptor.modern_controls", "disruptor.vertical_look", "disruptor.geometry_correction",
+    "disruptor.perspective_textures", "disruptor.frame_unlock", "disruptor.improved_shadows", "video.frame_interpolation"};
+
 int stored(const Settings& settings, const Option& option) {
     return option.saved(settings) ? option.get(settings) : option.initial;
 }
@@ -247,6 +251,21 @@ bool SettingsFile::apply(const Preset& preset) {
 bool SettingsFile::reset() {
     return change([](Settings& settings) {
         for (const auto& option : option_list) option.set(settings, option.initial);
+    });
+}
+
+bool shipped(const Option& option) {
+    const auto same = [&](const char* key) { return std::string_view(key) == option.key; };
+    return std::any_of(std::begin(shipped_keys), std::end(shipped_keys), same);
+}
+
+bool SettingsFile::complete() {
+    if (!load()) return false;
+    const auto whole = [this](const Option& option) { return !shipped(option) || option.saved(settings_); };
+    if (std::all_of(std::begin(option_list), std::end(option_list), whole)) return true;
+    return change([](Settings& settings) {
+        for (const auto& option : option_list)
+            if (shipped(option) && !option.saved(settings)) option.set(settings, option.initial);
     });
 }
 

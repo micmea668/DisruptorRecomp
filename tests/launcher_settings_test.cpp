@@ -312,6 +312,78 @@ void log(const fs::path& folder) {
     require(log_tail(file, 5) == L"last\r\n", "a line cut by the read is not shown");
     fs::remove(file);
 }
+
+void completed(const fs::path& folder) {
+    const fs::path file = folder / "complete.toml";
+    for (const char* start : {"", "# nothing named\n", "[video]\n\n[disruptor]\n"}) {
+        fs::remove(file);
+        if (*start) write(file, start);
+        SettingsFile fresh(file);
+        require(fresh.complete() && fs::exists(file), "Play must write the shipped rows a missing or empty file does not name");
+        const Settings written = PSXRecompV4::load_user_settings(file);
+        for (const auto& one : options()) {
+            require(one.saved(written) == shipped(one), "only the rows a release ships are written, the others stay the game's");
+            require(!shipped(one) || one.get(written) == one.initial, "a shipped row is written with the value a release has");
+            if (std::string_view(one.key) != "video.frame_interpolation_fps")
+                require(fresh.shown(one) == one.initial, "and the window shows every row as before");
+        }
+    }
+
+    const std::string before = read(file);
+    fs::permissions(file, fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write, fs::perm_options::remove);
+    SettingsFile whole(file);
+    require(whole.complete() && read(file) == before, "a file that names every shipped row is not written again");
+    fs::permissions(file, fs::perms::owner_write, fs::perm_options::add);
+
+    write(file, "[disruptor]\nmouse_aim = false\nhud_scale = 70\nfuture_key = 3\n\n[video]\nsupersampling = 2\n");
+    SettingsFile partly(file);
+    require(partly.complete(), "a file that names some rows is completed");
+    const Settings kept = PSXRecompV4::load_user_settings(file);
+    require(!kept.mouse_aim && kept.hud_scale == 70 && kept.supersampling == 2, "what the file named stays as it was");
+    for (const auto& one : options()) {
+        const std::string_view key = one.key;
+        const bool named = key == "disruptor.mouse_aim" || key == "disruptor.hud_scale" || key == "video.supersampling";
+        require(one.saved(kept) == (named || shipped(one)), "the absent shipped rows are named, and no other row is added");
+        if (shipped(one) && !named) require(one.get(kept) == one.initial, "each with the value a release has");
+    }
+    require(partly.shown(option("disruptor.mouse_aim")) == 0 && partly.shown(option("disruptor.geometry_correction")) == 1,
+            "the window shows the completed file");
+
+    write(file, "[disruptor]\nmouse_aim = true\nmodern_controls = true\nvertical_look = false\ngeometry_correction = false\n"
+                "perspective_textures = true\nframe_unlock = false\nimproved_shadows = false\n\n[video]\nframe_interpolation = false\n");
+    const std::string chosen = read(file);
+    SettingsFile theirs(file);
+    require(theirs.complete() && read(file) == chosen && theirs.shown(option("disruptor.geometry_correction")) == 0,
+            "a shipped row the player turned off is left off");
+
+    write(file, "[video\nbroken");
+    SettingsFile broken(file);
+    require(!broken.complete() && read(file) == "[video\nbroken", "a file that is not TOML is left as it is");
+    fs::remove(file);
+}
+
+// The game's own readers say what a new installation runs with: the table must start from the same values.
+void shipped_values() {
+    const fs::path source = DISRUPTOR_SOURCE_DIR;
+    const Settings file = PSXRecompV4::load_user_settings(source / "release/windows/settings.toml");
+    require(!file.parse_error, "the shipped settings.toml must be readable");
+    size_t named = 0;
+    for (const auto& one : options()) {
+        require(one.saved(file) == shipped(one), "the rows Play restores are not the rows the shipped settings.toml names");
+        if (!one.saved(file)) continue;
+        ++named;
+        require(one.get(file) == one.initial, "a row starts from another value than the shipped settings.toml gives it");
+    }
+    require(named == 8, "the shipped settings.toml names eight rows");
+    const auto game = PSXRecompV4::load_game_config(source / "game.toml");
+    Settings as_game;
+    as_game.has_supersampling = as_game.has_aspect_ratio = true;
+    as_game.supersampling = game.runtime.video_supersampling;
+    as_game.aspect_num = game.runtime.video_aspect_num;
+    as_game.aspect_den = game.runtime.video_aspect_den;
+    for (const char* key : {"video.supersampling", "video.aspect_ratio"})
+        require(option(key).get(as_game) == option(key).initial, "a row starts from another value than game.toml gives the game");
+}
 } // namespace
 
 int main() {
@@ -333,6 +405,8 @@ int main() {
         overrides();
         languages(folder);
         log(folder);
+        completed(folder);
+        shipped_values();
         std::cout << "Launcher settings, presets, language discs and log tail tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << "\n";

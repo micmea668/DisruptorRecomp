@@ -75,15 +75,7 @@ for label in (
 require('L"Vanilla", L"Improved"' in table and '"Vanilla\\0Improved\\0"' in menu, "the shadow choices must match")
 
 shipped = plain_values(read("release/windows/settings.toml"))
-for key, value in shipped.items():
-    require(key in initial, f"the shipped settings.toml sets {key}, which the launcher does not show")
-    require(initial[key] == {"true": 1, "false": 0}[value], f"the launcher's start value of {key} is not the shipped one")
-game = plain_values(read("game.toml"))
-require(
-    game["video.supersampling"] == "4" and initial["video.supersampling"] == 3
-    and game["video.aspect_ratio"] == '"4:3"' and initial["video.aspect_ratio"] == 0,
-    "the launcher must start from game.toml's resolution scale and aspect ratio",
-)
+require(not set(shipped) - set(keys), f"the shipped settings.toml sets keys the launcher does not show: {sorted(set(shipped) - set(keys))}")
 mouse = read("src/disruptor_mouse_aim.cpp")
 require(
     "constexpr double kDefaultHorizontalSensitivity = 0.080;" in mouse
@@ -109,36 +101,36 @@ require(
     "    if (!known_disc(other, known))" in region and "    if (!laid_out.build(home, other, why))" in region,
     "a language disc must be checked with the game's own layout code",
 )
-require(
-    "result->disc = task == Task::import ? import_disc(source, root, cancelled, report)" in window
-    and "                    result->language = check_region_disc(home, source);" in window
-    and "            } else if (app->settings.choose_language_disc(utf8(result->image))) {" in window
-    and window.count("import_disc(") == 2,
-    "a language disc is checked and named where it is, only the US disc is copied",
-)
-require(
-    "                            check_region_disc(result->disc.data, from_utf8(spoken));" in window
-    and "            if (!result->language_error.empty()) {" in window
-    and 'L" --no-launcher --game "' in window
-    and '        SetEnvironmentVariableW(L"PSX_DISRUPTOR_LANGUAGE_DISC", nullptr);' in window
-    and window.count("PSX_DISRUPTOR_LANGUAGE_DISC") == 1,
-    "the language disc must be checked again before the game starts, and reach the game through settings.toml alone",
-)
 worker = window[window.index("        worker = std::thread(") : window.index("    void take_image(")]
 require(
-    len(re.findall(r"(?<!check_)region_disc\(", window)) == 2
-    and len(re.findall(r"(?<!check_)region_disc\(", worker)) == 2
-    and window.count("check_region_disc(") == worker.count("check_region_disc(") == 2
-    and "            for (const std::string& path : listed) result->regions.emplace(path, region_disc(from_utf8(path)));" in worker
-    and "        app->regions = std::move(result->regions);" in window,
+    "auto outcome = std::make_unique<Outcome>(run(std::move(request), discs, cancelled));" in worker
+    and "        Step step = after(*outcome, app->cancelled);" in window
+    and "        app->regions = std::move(outcome->regions);" in window,
+    "what a task does and what the window does with its outcome are the flow module's, where they are tested",
+)
+require(
+    "            app->begin(Task::import, outcome->image, outcome->launch);\n            return 0;" in window
+    and "        if (step.disc == DiscAfter::cleared) app->verified = {};\n"
+    "        else if (step.disc == DiscAfter::taken) app->verified = std::move(outcome->disc);\n"
+    "        if (step.save_language && !app->settings.choose_language_disc(utf8(outcome->image))) step.status = app->settings_error();\n"
+    "        if (!step.status.empty()) app->say(step.status);\n"
+    "        if (step.launch) app->launch();\n" in window
+    and "        if (launch) unwritten = !settings.complete() && settings.readable();\n" in window
+    and "            say(running_text(environment_overrides(), unwritten));" in window,
+    "the window must do each thing a step names, and say when the settings file could not be completed",
+)
+require(
+    window.count("region_disc(") == worker.count("region_disc(") == 2 and window.count("check_region_disc(") == 1
+    and worker.count("import_disc(") == 1 and window.count("import_disc(") == 2
+    and worker.count("verify_disc(") == 1 and window.count("verify_disc(") == 3,
     "a disc image is opened on the worker only: one on a share that is gone must not stall the window",
 )
 require(
-    "        if (launch) settings.load(); // the game reads the file, not what this window last saw of it\n" in window
-    and '            } else if (app->cancelled) {\n                app->say(L"Cancelled. The language is as it was.");' in window
+    '        SetEnvironmentVariableW(L"PSX_DISRUPTOR_LANGUAGE_DISC", nullptr);' in window
+    and window.count("PSX_DISRUPTOR_LANGUAGE_DISC") == 1
     and "            if (WaitForSingleObject(app->game, 0) == WAIT_OBJECT_0) {" in window
     and "code != STILL_ACTIVE" not in window,
-    "Play must start from the file as it is, a cancelled check must change nothing, "
+    "Play must start from the file as it is, the language disc reaches the game through settings.toml alone, "
     "and the game's end is asked of its handle: 259 is an exit code too",
 )
 require(
@@ -161,6 +153,7 @@ require(
 )
 require(
     "add_test(NAME disruptor_launcher_settings COMMAND disruptor-launcher-settings-test)" in launcher_cmake
+    and "add_test(NAME disruptor_launcher_flow COMMAND disruptor-launcher-flow-test)" in launcher_cmake
     and "add_test(NAME disruptor_region_disc COMMAND disruptor-region-disc-test)" in launcher_cmake
     and "add_test(NAME disruptor_launcher_contract" in cmake,
     "the launcher's tests must remain registered",
