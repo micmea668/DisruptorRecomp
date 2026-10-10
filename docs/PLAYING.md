@@ -67,6 +67,7 @@ folder; these backups can be removed manually once the repaired copy works.
 | Skip a logo or movie | Escape |
 | Fast-forward | Hold ] |
 | Save / load state | Shift+F1–F12 / F1–F12 |
+| Name a save | Type it: letters, digits, Space, Backspace and Delete. Enter moves to DONE |
 
 Modern mouse/keyboard controls, geometry correction, and perspective textures
 are enabled initially. Vertical mouse look is experimental and starts off;

@@ -32,7 +32,7 @@ require("0x80040E68u" in camera and
         "disruptor.vertical_camera.renderer" in camera,
         "renderer entry must stay pinned to the audited game function")
 require(configs.count(
-    'mod_function_entry_funcs = ["0x80011888", "0x8001A46C", "0x80020DD8", "0x80040E68", "0x80044A10", "0x80044BDC", "0x8004B3D4", "0x8004D348", "0x8004D410"]') == 2,
+    'mod_function_entry_funcs = ["0x80011888", "0x8001A46C", "0x8001C484", "0x80020DD8", "0x80040E68", "0x80044A10", "0x80044BDC", "0x8004B3D4", "0x8004D348", "0x8004D410"]') == 2,
         "both game configs must emit the renderer function-entry hook")
 
 expected_sites = {

@@ -38,6 +38,7 @@ set(DISRUPTOR_EXTRA_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_language_source.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_restart.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_mouse_aim.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_name_entry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_render_arena.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_grown_quad.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_hud_widgets.cpp"
@@ -133,6 +134,7 @@ target_compile_definitions(psx-runtime PRIVATE
     PSX_HAS_DISRUPTOR_FAR_RENDERING=1
     PSX_HAS_DISRUPTOR_INTRO_SKIP=1
     PSX_HAS_DISRUPTOR_LANGUAGE=1
+    PSX_HAS_DISRUPTOR_NAME_ENTRY=1
     PSX_HAS_DISRUPTOR_SPRITE_DEPTH=1
     PSX_HAS_DISRUPTOR_GROWN_QUAD=1
     PSX_HAS_DISRUPTOR_VERTICAL_CAMERA=1)
@@ -232,6 +234,13 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hud_widget_contract.py")
 
+    add_test(NAME disruptor_name_entry_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_name_entry_contract.py"
+            --require-artifacts)
+    set_tests_properties(disruptor_name_entry_contract
+        PROPERTIES LABELS retail)
+
     add_test(NAME disruptor_grown_quad_contract
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_grown_quad_contract.py"
@@ -319,6 +328,13 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
         "${PSXRECOMP_ROOT}/runtime/include")
     target_compile_features(disruptor-render-arena-test PRIVATE cxx_std_20)
     add_test(NAME disruptor_render_arena COMMAND disruptor-render-arena-test)
+
+    add_executable(disruptor-name-entry-test
+        tests/disruptor_name_entry_test.cpp)
+    target_include_directories(disruptor-name-entry-test PRIVATE
+        "${PSXRECOMP_ROOT}/runtime/include")
+    target_compile_features(disruptor-name-entry-test PRIVATE cxx_std_20)
+    add_test(NAME disruptor_name_entry COMMAND disruptor-name-entry-test)
 
     add_executable(disruptor-backdrop-tiles-test
         tests/disruptor_backdrop_tiles_test.cpp)

@@ -15,7 +15,7 @@ out_dir = "generated"
 out_stem = "SLUS_002.24.code"
 strict = true
 discovery = "whole-image"
-mod_function_entry_funcs = ["0x80011888", "0x8001A46C", "0x80020DD8", "0x80040E68", "0x80044A10", "0x80044BDC", "0x8004B3D4", "0x8004D348", "0x8004D410"]
+mod_function_entry_funcs = ["0x80011888", "0x8001A46C", "0x8001C484", "0x80020DD8", "0x80040E68", "0x80044A10", "0x80044BDC", "0x8004B3D4", "0x8004D348", "0x8004D410"]
 
 # The gameplay loop presents only when two VBlanks have elapsed, although its
 # simulation already steps once per VBlank. Drop the constant floor here; the

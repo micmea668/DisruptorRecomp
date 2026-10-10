@@ -77,6 +77,9 @@ extern "C" void disruptor_language_set_disc(const char* path);
 extern "C" void disruptor_language_settle(void);
 #endif
 #endif
+#ifdef PSX_HAS_DISRUPTOR_NAME_ENTRY
+extern "C" int disruptor_name_entry_key(int scancode, uint32_t keycode, int down, int plain);
+#endif
 #include "dirty_ram_interp.h"
 #include "crc32.h"
 #include "disc_identity.h"
@@ -4521,18 +4524,34 @@ static void sdl_vblank_present(void) {
                     close_controller();
                     refresh_player_devices();
                 }
+#ifdef PSX_HAS_DISRUPTOR_NAME_ENTRY
+            } else if (ev.type == SDL_KEYUP) {
+#if defined(PSX_SDL3)
+                (void)disruptor_name_entry_key((int)ev.key.scancode, (uint32_t)ev.key.key, 0, 1);
+#else
+                (void)disruptor_name_entry_key((int)ev.key.keysym.scancode, (uint32_t)ev.key.keysym.sym, 0, 1);
+#endif
+#endif
             } else if (!ui_consumed && ev.type == SDL_KEYDOWN) {
 #if defined(PSX_SDL3)
                 const SDL_Keymod mod = ev.key.mod;
                 const SDL_Keycode key = ev.key.key;
+                const SDL_Scancode scancode = ev.key.scancode;
 #else
                 const Uint16 mod = ev.key.keysym.mod;
                 const SDL_Keycode key = ev.key.keysym.sym;
+                const SDL_Scancode scancode = ev.key.keysym.scancode;
 #endif
                 if (key == SDLK_ESCAPE && psx_netplay_active()) {
                     netplay_soft_exit("netplay_escape");
                     return;
                 }
+#ifdef PSX_HAS_DISRUPTOR_NAME_ENTRY
+                if (disruptor_name_entry_key((int)scancode, (uint32_t)key, 1, !(mod & (KMOD_CTRL | KMOD_ALT | KMOD_GUI))))
+                    continue; /* the key is a letter of a save's name */
+#else
+                (void)scancode;
+#endif
                 /* Save states: Shift+F1-F12 = save slot 0-11, F1-F12 = load.
                  * (F11 is a save slot per the user's spec, so fullscreen is
                  * Alt+Enter / Cmd+Ctrl+F only — no F11.) */
