@@ -30,8 +30,6 @@ psx_freeze_heartbeat.json
 psx_freeze_dump*.json
 psx_cps_exit_trace.json
 starvation_dump.jsonl
-frustum-capture.json
-frustum-capture-status.txt
 *.log
 *.png
 !docs/images/*.png

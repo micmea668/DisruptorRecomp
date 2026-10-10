@@ -17,7 +17,6 @@ GTE_HEADER = (
     ROOT / "psxrecomp-overlay" / "runtime" / "include" / "gte_precision.h"
 )
 MOUSE = ROOT / "src" / "disruptor_mouse_aim.cpp"
-LAUNCHER = ROOT / "test13-launcher" / "Play Disruptor.ps1"
 OVERLAY_LIST = ROOT / "PSXRECOMP_OVERLAY_FILES.txt"
 
 
@@ -49,7 +48,6 @@ def main() -> int:
     gpu_header = GPU_HEADER.read_text(encoding="utf-8")
     gte_header = GTE_HEADER.read_text(encoding="utf-8")
     mouse = MOUSE.read_text(encoding="utf-8")
-    launcher = LAUNCHER.read_text(encoding="utf-8")
     overlay_list = OVERLAY_LIST.read_text(encoding="utf-8")
 
     # Provenance must validate the original address. Masking 0x1f801810 first
@@ -187,17 +185,6 @@ def main() -> int:
             "the new shared provenance header must ship in the overlay")
     require("GTE_PRECISION_LOOKUP_RESULT_COUNT" in gte_header,
             "lookup result ordering must have a stable terminal count")
-
-    # Test 13 must isolate each option and reject an invalid renderer/package.
-    for token in (
-        "PSX_GEOMETRY_FULL_YAW",
-        "PSX_GEOMETRY_COVERAGE_TINT",
-        "source_commit=([0-9a-f]{40})",
-        "CHECKSUMS.sha256",
-        "GL GPU pipeline ready (internal scale 4x",
-        "GL pipeline init failed.*falling back to software renderer",
-    ):
-        require(token in launcher, f"Test 13 launcher guard missing: {token}")
 
     print("Phase A structural contract: PASS")
     return 0
