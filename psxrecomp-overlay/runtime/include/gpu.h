@@ -350,6 +350,7 @@ int  gpu_ws_present_native_43(void);
 int  gpu_ws_displayed_native_43(void);
 /* A game says what the frame it begins to build is, before it culls or projects for it: 1 a full-2D screen, 0 a world. */
 void gpu_ws_tell_frame_kind(int flat);
+int  gpu_ws_displayed_flat(void);
 /* Per-side X cull-margin (screen/world units) emitted into the game's draw-
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);

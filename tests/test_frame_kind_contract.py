@@ -125,8 +125,40 @@ require(
 )
 require(
     gpu.count("psx_ws_frame_kinds_project(") == 1 and gpu.count("psx_ws_frame_kinds_area(") == 1
-    and gpu.count("psx_ws_frame_kinds_drawing(") == 1 and gpu.count("psx_ws_frame_kinds_displayed(") == 1,
+    and gpu.count("psx_ws_frame_kinds_drawing(") == 1 and gpu.count("psx_ws_frame_kinds_displayed(") == 2,
     "nothing else in the renderer may move or ask the frame kinds",
+)
+upload = body(gpu, "static void gp0_exec_cpu_to_vram(void)")
+require(
+    "static void ws_frame_pictured(int x, int y, int w, int h) {\n"
+    "    psx_ws_frame_kinds_pictured(&ws_frame_kinds, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,\n"
+    "                                (uint32_t)ws_disp_w(), (uint32_t)ws_disp_h());\n}" in gpu
+    and gpu.count("psx_ws_frame_kinds_pictured(") == 1
+    and gpu.count("ws_frame_pictured(") == 3,
+    "a picture is measured against buffers the size of the display, and only an upload and a copy report one",
+)
+require(
+    "\n    ws_frame_pictured(vram_write_x, vram_write_y, vram_write_w, vram_write_h);\n    /* Record for debug */\n" in upload
+    and upload.index("vram_write_h = (h == 0) ? 0x200 : (uint16_t)h;") < upload.index("ws_frame_pictured("),
+    "every upload must report where it lands, whatever the front end makes of it",
+)
+require(
+    "            gr_copy_rect(src_x, src_y, dst_x, dst_y, w, h);\n            ws_frame_pictured(dst_x, dst_y, w, h);\n            break;\n" in gpu,
+    "every copy inside video memory must report where it lands",
+)
+require(
+    "int gpu_ws_displayed_flat(void) {\n"
+    "    return ws_gte_game_mode_cfg && psx_ws_frame_kinds_displayed(&ws_frame_kinds, display_area_x, display_area_y) == 1;\n}" in gpu
+    and "int  gpu_ws_displayed_flat(void);" in header,
+    "the present must be able to ask whether the frame on display is a flat one",
+)
+require(
+    "        bool wide_present = (!fmv_frame && !di.depth24 && g_ws_engaged &&\n"
+    "                             gr_wide_supported() && !gpu_ws_displayed_flat() &&\n"
+    "                             (ws_native_wide_active() || corrected_present));\n" in runtime
+    and runtime.count("wide_present = true") == 0
+    and runtime.count("gpu_ws_displayed_flat()") == 1,
+    "a flat frame must be presented from video memory whatever would send it to the mirror: uploads and copies do not reach it",
 )
 require(
     "        fmv_frame = di.depth24 || !g_ws_engaged || gpu_ws_displayed_native_43() != 0;" in runtime

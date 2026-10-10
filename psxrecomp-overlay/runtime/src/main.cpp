@@ -4944,7 +4944,7 @@ static void sdl_vblank_present(void) {
             (!fmv_frame && !di.depth24 && g_ws_engaged &&
              gpu_geometry_correction_enabled() && gr_wide_supported());
         bool wide_present = (!fmv_frame && !di.depth24 && g_ws_engaged &&
-                             gr_wide_supported() &&
+                             gr_wide_supported() && !gpu_ws_displayed_flat() &&
                              (ws_native_wide_active() || corrected_present));
         if (wide_present && ws_native_wide_active())
             present_w = w + (uint32_t)ws_nw_extra();

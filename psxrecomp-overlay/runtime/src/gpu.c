@@ -364,6 +364,10 @@ static int ws_native_43(int displayed) {
 int gpu_ws_present_native_43(void) { return ws_native_43(0); }
 int gpu_ws_displayed_native_43(void) { return ws_native_43(1); }
 void gpu_ws_tell_frame_kind(int flat) { psx_ws_frame_kinds_tell(&ws_frame_kinds, flat); }
+/* The frame on display is a full-2D one of a GTE-detected game: uploads and copies make it, and they do not reach the corrected mirror. */
+int gpu_ws_displayed_flat(void) {
+    return ws_gte_game_mode_cfg && psx_ws_frame_kinds_displayed(&ws_frame_kinds, display_area_x, display_area_y) == 1;
+}
 
 /* Squash applies only when configured AND the frame is being stretched. */
 static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43(); }
@@ -2103,6 +2107,12 @@ static int32_t ws_disp_h(void) {
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
     return di.height ? (int32_t)di.height : 240;
+}
+
+/* An upload or a copy into a frame buffer has no drawing area to announce it. */
+static void ws_frame_pictured(int x, int y, int w, int h) {
+    psx_ws_frame_kinds_pictured(&ws_frame_kinds, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h,
+                                (uint32_t)ws_disp_w(), (uint32_t)ws_disp_h());
 }
 
 /* Full-screen fades and environmental filters are authored as 320x240 TILEs.
@@ -4795,6 +4805,7 @@ static void gp0_exec_cpu_to_vram(void) {
     vram_write_w = (w == 0) ? 0x400 : (uint16_t)w;
     vram_write_h = (h == 0) ? 0x200 : (uint16_t)h;
 
+    ws_frame_pictured(vram_write_x, vram_write_y, vram_write_w, vram_write_h);
     /* Record for debug */
     if (a0_history_count < A0_HISTORY_CAP) {
         int slot = a0_history_count++;
@@ -5546,6 +5557,7 @@ static void gp0_execute_command(void) {
             if (w == 0) w = 0x400;
             if (h == 0) h = 0x200;
             gr_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
+            ws_frame_pictured(dst_x, dst_y, w, h);
             break;
         }
 
