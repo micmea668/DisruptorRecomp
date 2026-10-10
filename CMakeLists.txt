@@ -268,6 +268,14 @@ if(BUILD_TESTING)
     add_test(NAME disruptor_framework_overlay_new_file
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_framework_overlay_new_file.py")
+
+    # These need the retail image or the translated code. A machine without
+    # the game leaves them out with `ctest -LE retail`.
+    set_tests_properties(
+        disruptor_backdrop_tiles_contract disruptor_grown_quad_contract
+        disruptor_intro_skip_contract disruptor_language_contract
+        disruptor_language_disc_contract disruptor_frame_rate_contract
+        PROPERTIES LABELS retail)
 endif()
 
 if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)

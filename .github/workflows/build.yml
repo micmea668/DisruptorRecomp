@@ -1,0 +1,61 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # No runner has the game: every source is compiled, the runtime is not
+  # linked, and the tests that read no retail data run. See build.sh.
+  DISRUPTOR_WITHOUT_GAME: "1"
+
+jobs:
+  linux:
+    name: Linux, GCC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the toolchain and what SDL builds against
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake ninja-build pkg-config python3 \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxtst-dev libxinerama-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev libdrm-dev \
+            libgbm-dev libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libudev-dev libdbus-1-dev libibus-1.0-dev liburing-dev
+      - name: Build and test without the game
+        run: ./build.sh
+
+  mingw:
+    name: Windows, MinGW-w64
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-python
+      - name: Build and test without the game
+        run: ./build.sh

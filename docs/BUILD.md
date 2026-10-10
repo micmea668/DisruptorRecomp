@@ -76,6 +76,19 @@ chmod +x build.sh run.sh tools/regen.sh
 
 `--mouse-aim` and `--vertical-look` are also available.
 
+## Without the game
+
+A machine without the game can still check a change:
+
+```sh
+DISRUPTOR_WITHOUT_GAME=1 ./build.sh
+```
+
+This compiles every source except the translated game code, leaves the runtime
+unlinked, and runs the tests that read no retail data. It needs Ninja. The
+`build` workflow runs it on Linux and under MSYS2 MinGW-w64 for every pull
+request.
+
 ## In-between frames
 
 The presentation-only frame interpolator is built by default, but starts off
