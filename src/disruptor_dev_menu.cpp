@@ -11,6 +11,7 @@
 #include "disruptor_billboard_aspect.h"
 #include "disruptor_far_rendering.h"
 #include "disruptor_frame_rate.h"
+#include "disruptor_capsule.h"
 #include "disruptor_intro_skip.h"
 #include "disruptor_mouse_aim.h"
 #include "disruptor_present_rate.h"
@@ -1273,20 +1274,47 @@ int on_sdl_event(void *, const SDL_Event *event) {
     }
     if (!g_menu.open && scancode_event(event, SDL_SCANCODE_ESCAPE))
         disruptor_intro_skip_request();
+    if (!g_menu.open && scancode_event(event, SDL_SCANCODE_F12) && (SDL_GetModState() & KMOD_CTRL) != 0) {
+        disruptor_capsule_toggle();
+        return 1;
+    }
     if (!g_menu.open || !g_menu.imgui_ready) return 0;
     imgui_sdl_process_event(event);
     return 1;
 }
 
 uint32_t current_flags(void *) {
-    if (!g_menu.open || !g_menu.imgui_ready) return 0;
+    if (!g_menu.open || !g_menu.imgui_ready) return disruptor_capsule_notice() ? PSX_HOST_UI_VISIBLE : 0u;
     return PSX_HOST_UI_CAPTURE_KEYBOARD |
            PSX_HOST_UI_CAPTURE_MOUSE |
            PSX_HOST_UI_CAPTURE_GAMEPAD |
            PSX_HOST_UI_VISIBLE;
 }
 
-void render_gl(void *, int, int) {
+/* Drawn without the SDL backend's frame: that one reads and captures the mouse, which is the game's while the menu is closed. */
+void render_notice(const char *word, int width, int height) {
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGuiIO &io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(static_cast<float>(width), static_cast<float>(height));
+    io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f));
+    ImGui::Begin("##capsule", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::SetWindowFontScale(std::max(1.0f, static_cast<float>(height) / 360.0f));
+    ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.2f, 1.0f), "%s", word);
+    ImGui::End();
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+}
+
+void render_gl(void *, int width, int height) {
+    if (const char *word = g_menu.open ? nullptr : disruptor_capsule_notice()) {
+        if (initialize_imgui()) render_notice(word, width, height);
+        return;
+    }
     if (!g_menu.open || !initialize_imgui()) return;
     ImGui_ImplOpenGL3_NewFrame();
     imgui_sdl_new_frame();

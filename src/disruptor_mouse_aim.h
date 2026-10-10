@@ -45,6 +45,8 @@ void disruptor_mouse_set_invert_vertical(int inverted);
 
 /* Current requested pitch in signed 256-units-per-turn units. */
 double disruptor_mouse_vertical_pitch(void);
+/* A replay puts back the pitch a recording had, which no save state holds. */
+void disruptor_mouse_set_vertical_pitch(double pitch);
 void disruptor_mouse_recenter_vertical(void);
 
 int disruptor_mouse_captured(void);

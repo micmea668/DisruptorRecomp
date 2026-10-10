@@ -19,6 +19,9 @@ SDL_Window g_window;
 std::array<std::uint8_t, 2 * 1024 * 1024> g_ram{};
 std::array<Uint8, 512> g_keys{};
 void (*g_registered_hook)(void) = nullptr;
+std::uint32_t g_noted_at = 0;
+std::uint8_t g_noted = 0;
+int g_notes = 0;
 std::uint32_t g_buttons = 0;
 std::uint16_t g_pad_buttons = 0xFFFFu;
 float g_relative_x = 0.0f;
@@ -51,6 +54,12 @@ SDL_Window *sdl_window = &g_window;
 
 void mod_register_frame_hook(void (*hook)(void)) {
     g_registered_hook = hook;
+}
+
+void disruptor_capsule_note_byte(std::uint32_t address, std::uint8_t value) {
+    g_noted_at = address;
+    g_noted = value;
+    ++g_notes;
 }
 
 int psx_host_ui_game_input_captured(void) {
@@ -272,18 +281,23 @@ void test_direction_fraction_and_wrap() {
     g_mouse.horizontal_sensitivity = 0.08;
 
     psx_write_byte(kTestYawAddress, 100);
+    g_notes = 0;
     apply_mouse_x(25.0);
     expect(psx_read_byte(kTestYawAddress) == 98,
            "rightward motion decreases Disruptor yaw");
+    expect(g_notes == 1 && g_noted_at == kTestYawAddress && g_noted == 98,
+           "a recording is told the heading the mouse wrote");
     apply_mouse_x(-25.0);
     expect(psx_read_byte(kTestYawAddress) == 100,
            "leftward motion increases Disruptor yaw");
 
     psx_write_byte(kTestYawAddress, 100);
     g_mouse.fractional_yaw = 0.0;
+    g_notes = 0;
     apply_mouse_x(6.0);
     expect(psx_read_byte(kTestYawAddress) == 100,
            "sub-step motion is retained without premature yaw change");
+    expect(g_notes == 0, "and a recording is told nothing while nothing is written");
     apply_mouse_x(7.0);
     expect(psx_read_byte(kTestYawAddress) == 99,
            "fractional motion accumulates into one yaw step");
@@ -791,6 +805,10 @@ int main(int argc, char **argv) {
     } else {
         expect(g_registered_hook != nullptr,
                "normal launch installs a dormant hook for live settings");
+        g_mouse.vertical_pitch = 4.0;
+        disruptor_mouse_set_vertical_pitch(-12.5);
+        expect(disruptor_mouse_vertical_pitch() == -12.5, "a replay puts the pitch back");
+        g_mouse.vertical_pitch = 0.0;
         test_parsing();
         test_ini_configuration();
         test_direction_fraction_and_wrap();

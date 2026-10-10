@@ -70,6 +70,11 @@ extern "C" void gl_renderer_geometry_interpolation_diag(uint64_t out[6]);
 #include "game_options.h"
 #include "mod_plugins.h"
 #include "mod_runtime.h"
+#ifdef PSX_HAS_DISRUPTOR_CAPSULE
+extern "C" void disruptor_capsule_before_input(void);
+extern "C" void disruptor_capsule_after_input(void);
+extern "C" void disruptor_capsule_state_loaded(void);
+#endif
 #ifdef PSX_HAS_DISRUPTOR_FAR_RENDERING
 extern "C" void disruptor_far_rendering_abandon_metrics(void);
 #ifdef PSX_HAS_DISRUPTOR_LANGUAGE
@@ -700,6 +705,9 @@ static void present_session_reset(void) {
  * longjmp). Clears present latches and forces the next vblank to show the
  * restored VRAM — including a blank if display was disabled in the snapshot. */
 extern "C" void psx_frontend_on_savestate_loaded(void) {
+#ifdef PSX_HAS_DISRUPTOR_CAPSULE
+    disruptor_capsule_state_loaded();
+#endif
 #ifdef PSX_HAS_DISRUPTOR_FAR_RENDERING
     disruptor_far_rendering_abandon_metrics();
 #endif
@@ -4628,6 +4636,9 @@ static void sdl_vblank_present(void) {
         }
     } netplay_tail(override);
 
+#ifdef PSX_HAS_DISRUPTOR_CAPSULE
+    if (!psx_netplay_active()) disruptor_capsule_before_input();
+#endif
     if (psx_netplay_active()) {
         psx_netplay_finish_frame();
     } else if (g_headless) {
@@ -4635,6 +4646,9 @@ static void sdl_vblank_present(void) {
     } else {
         sample_pad_into_sio(override);
     }
+#ifdef PSX_HAS_DISRUPTOR_CAPSULE
+    if (!psx_netplay_active()) disruptor_capsule_after_input();
+#endif
 
     /* Latency ring: open this present cycle's slot, stamping when input was
      * sampled into SIO.  Always-on; queried via the debug server "latency". */

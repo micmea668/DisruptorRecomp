@@ -27,6 +27,7 @@ option(DISRUPTOR_FRAME_INTERPOLATION
 set(DISRUPTOR_EXTRA_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_backdrop_tiles.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_billboard_aspect.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_capsule.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_cheats.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_control_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/disruptor_far_rendering.cpp"
@@ -130,6 +131,7 @@ psxrecomp_add_runtime_target(psx-runtime
 target_compile_definitions(psx-runtime PRIVATE
     PSX_HAS_DISRUPTOR_BACKDROP_TILES=1
     PSX_HAS_DISRUPTOR_BILLBOARD_ASPECT=1
+    PSX_HAS_DISRUPTOR_CAPSULE=1
     PSX_HAS_DISRUPTOR_FAR_RENDERING=1
     PSX_HAS_DISRUPTOR_INTRO_SKIP=1
     PSX_HAS_DISRUPTOR_LANGUAGE=1
@@ -264,6 +266,10 @@ if(BUILD_TESTING)
     add_test(NAME disruptor_launcher_contract
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_launcher_contract.py")
+
+    add_test(NAME disruptor_capsule_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_capsule_contract.py")
 
     add_test(NAME disruptor_framework_overlay_new_file
         COMMAND "${Python3_EXECUTABLE}" -B
@@ -401,6 +407,13 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
         COMMAND disruptor-language-overlay-test)
     add_test(NAME disruptor_language_overlay_tall
         COMMAND disruptor-language-overlay-test tall)
+
+    add_executable(disruptor-capsule-test
+        tests/disruptor_capsule_test.cpp)
+    target_compile_features(disruptor-capsule-test PRIVATE cxx_std_20)
+    target_include_directories(disruptor-capsule-test PRIVATE src)
+    add_test(NAME disruptor_capsule
+        COMMAND disruptor-capsule-test)
 
     add_executable(host-pick-slot-test
         tests/host_pick_slot_test.cpp)

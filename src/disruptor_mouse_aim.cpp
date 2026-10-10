@@ -19,6 +19,7 @@
 
 #include "psx_sdl.h"
 #include "disruptor_mouse_aim.h"
+#include "disruptor_capsule.h"
 #include "disruptor_vertical_camera.h"
 #include "../psxrecomp-overlay/runtime/include/gpu.h"
 
@@ -395,6 +396,7 @@ void apply_mouse_x(double raw_x) {
     const uint8_t new_yaw = static_cast<uint8_t>(
         static_cast<int>(old_yaw) + yaw_steps);
     psx_write_byte(kPlayerYawAddress, new_yaw);
+    disruptor_capsule_note_byte(kPlayerYawAddress, new_yaw);
     ++g_mouse.motion_samples;
     g_mouse.interval_mouse_x += raw_x;
     g_mouse.interval_yaw_steps += yaw_steps;
@@ -846,6 +848,10 @@ extern "C" void disruptor_mouse_set_invert_vertical(int inverted) {
 
 extern "C" double disruptor_mouse_vertical_pitch(void) {
     return g_mouse.vertical_pitch;
+}
+
+extern "C" void disruptor_mouse_set_vertical_pitch(double pitch) {
+    g_mouse.vertical_pitch = pitch;
 }
 
 extern "C" void disruptor_mouse_recenter_vertical(void) {
