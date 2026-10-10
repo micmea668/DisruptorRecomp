@@ -145,9 +145,12 @@ require(
     and "constexpr int kHudLayers = 1;" in module
     and "constexpr int32_t kPanels[2][6] = {{16, 10, 128, 196, 0, 0}, {232, 10, 298, 170, 320, 0}};" in module
     and "    gpu_ws_set_hud_widgets(kTablePointer, kHudLayers, kPanels[0], 2);" in module
-    and module.count("gpu_ws_set_hud_widgets(") == 1,
-    "the game must declare where its table is, its HUD node, the weapon list's box with a pivot in the top left corner "
-    "and the psionics list's with one in the top right",
+    and module.count("gpu_ws_set_hud_widgets(") == 1
+    and "constexpr int kTextStrip = 128;" in module
+    and "    gpu_ws_set_hud_text_strip(kTextStrip);\n" in module
+    and module.count("gpu_ws_set_hud_text_strip(") == 1,
+    "the game must declare where its table is, its HUD node, the weapon list's box with a pivot in the top left corner, "
+    "the psionics list's with one in the top right, and how wide its printer makes a line of text",
 )
 
 print("Disruptor HUD widget source contract: PASS")

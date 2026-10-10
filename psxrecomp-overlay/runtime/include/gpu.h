@@ -286,6 +286,8 @@ int gpu_ws_hud_scale(void);
  * such a layer has shown a widget, later rectangles inside its box belong to it too, until the game sets
  * its next drawing area. The game has to set one every frame. */
 void gpu_ws_set_hud_widgets(uint32_t table_pointer, int layers, const int32_t *boxes, int count);
+/* A game whose text printer draws a line as one picture `wide` across, the words from its left end. */
+void gpu_ws_set_hud_text_strip(int wide);
 /* [widescreen] full_2d: opt a pure-2D sprite game into the widescreen present
  * path (treat every in-game frame as gameplay, since it never tags 3D prims). */
 void gpu_ws_set_full_2d(int on);

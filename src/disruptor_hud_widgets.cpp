@@ -27,9 +27,11 @@ constexpr uint32_t kTablePointer = 0x80071490u;  /* gp + 0x344 */
 constexpr int kHudLayers = 1;
 /* x0, y0, x1, y1, pivot x, pivot y: the weapon list, then the psionics list. Left out: the ammunition box from column 12, the psionic charge from row 170. */
 constexpr int32_t kPanels[2][6] = {{16, 10, 128, 196, 0, 0}, {232, 10, 298, 170, 320, 0}};
+constexpr int kTextStrip = 128;  /* a printed line is one picture this wide: NO of the pause menu begins at column 169 and reaches 296 */
 
 PSX_MOD_CONSTRUCTOR(register_disruptor_hud_widgets) {
     gpu_ws_set_hud_widgets(kTablePointer, kHudLayers, kPanels[0], 2);
+    gpu_ws_set_hud_text_strip(kTextStrip);
 }
 
 }  // namespace

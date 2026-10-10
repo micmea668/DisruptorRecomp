@@ -152,9 +152,66 @@ void test_exact_values() {
            "an edge rounds to nearest on both sides of its pivot");
 }
 
+/* The pause menu's question: YES is a strip of 128 columns from 136, NO one from 169, each with its word at the left. */
+void test_a_line_of_text_is_placed_by_where_its_words_can_be() {
+    constexpr std::int32_t kStrip = 128;
+    expect(psx_ws_hud_thirds_centre(136, 128, kStrip, kWidth) == 400, "a strip whose middle is in the middle third is taken as it is");
+    expect(psx_ws_hud_thirds_centre(169, 128, kStrip, kWidth) == kWidth,
+           "a strip that begins in the middle third is in it, though half its width reaches the right third");
+    expect(psx_ws_hud_thirds_centre(150, 128, kStrip, kWidth) == kWidth && psx_ws_hud_thirds_centre(149, 128, kStrip, kWidth) == 426,
+           "from the first column whose half strip crosses into the right third on");
+    expect(psx_ws_hud_thirds_centre(213, 128, kStrip, kWidth) == kWidth && psx_ws_hud_thirds_centre(214, 128, kStrip, kWidth) == 556,
+           "up to the last column of the middle third: a strip that begins in the right third is in the right third");
+    expect(psx_ws_hud_thirds_centre(20, 128, kStrip, kWidth) == 168 && psx_ws_hud_thirds_centre(100, 128, kStrip, kWidth) == 328,
+           "a strip on the left is taken as it is, in the left third or in the middle");
+    expect(psx_ws_hud_thirds_centre(169, 127, kStrip, kWidth) == 465 && psx_ws_hud_thirds_centre(169, 129, kStrip, kWidth) == 467,
+           "a rectangle of another width is no strip");
+    expect(psx_ws_hud_thirds_centre(169, 128, 0, kWidth) == 466 && psx_ws_hud_thirds_centre(169, 128, -128, kWidth) == 466 &&
+               psx_ws_hud_thirds_centre(169, 0, 0, kWidth) == 338,
+           "a game that has told no strip width has no strips");
+    expect(psx_ws_hud_thirds_centre(300, 128, kStrip, 512) == 512 && psx_ws_hud_thirds_centre(342, 128, kStrip, 512) == 812,
+           "the thirds are those of the screen's own width");
+    expect(psx_ws_hud_thirds_centre(200, 128, kStrip, 300) == 300 && psx_ws_hud_thirds_centre(201, 128, kStrip, 300) == 530,
+           "a strip that begins on the very line between two thirds is of the middle one");
+
+    for (const Aspect &aspect : kAspects)
+        for (int percent : {50, 70, 99}) {
+            Rect taken = {169, 126, 128, 11}, plain = taken;
+            expect(scale(plain, aspect, percent) && plain.x > 169 && plain.w < 128,
+                   "by its own middle the NO strip is a widget of the right edge: moved there and shrunk");
+            expect(!psx_ws_hud_scale_rect_strip(&taken.x, &taken.y, &taken.w, &taken.h, kWidth, kHeight, aspect.numerator,
+                                                aspect.denominator, percent, kStrip) &&
+                       same(taken, Rect{169, 126, 128, 11}),
+                   "by where its word can be it is of the middle column, which is left to the stock squash");
+            Rect top = {169, 20, 128, 11};
+            expect(psx_ws_hud_scale_rect_strip(&top.x, &top.y, &top.w, &top.h, kWidth, kHeight, aspect.numerator, aspect.denominator,
+                                               percent, kStrip) &&
+                       top.x == psx_ws_hud_scale_edge(169, kWidth / 2, static_cast<std::int64_t>(aspect.numerator) * percent,
+                                                      static_cast<std::int64_t>(aspect.denominator) * 100) &&
+                       top.y == psx_ws_hud_scale_edge(20, 0, percent, 100),
+                   "in the top third it shrinks toward the middle of the top edge");
+            for (const Rect &widget : kWidgets) {
+                Rect one = widget, other = widget;
+                const bool first = scale(one, aspect, percent);
+                const bool second = psx_ws_hud_scale_rect_strip(&other.x, &other.y, &other.w, &other.h, kWidth, kHeight, aspect.numerator,
+                                                                aspect.denominator, percent, kStrip) != 0;
+                expect(first == second && same(one, other), "the HUD's own widgets, none of them a strip wide, are scaled as without the rule");
+            }
+        }
+    Rect corner = {169, 126, 128, 11};
+    expect(psx_ws_hud_scale_rect_strip(&corner.x, &corner.y, &corner.w, &corner.h, kWidth, kHeight, 3, 4, 50, 0) && corner.x == 263 &&
+               corner.w == 48 && corner.y == 123 && corner.h == 6,
+           "without a strip width NO at 16:9 and half size is exactly where the player saw it: columns 263 to 310");
+    Rect far = {INT32_MAX, 126, 128, 11};
+    expect(!psx_ws_hud_scale_rect(&far.x, &far.y, &far.w, &far.h, kWidth, kHeight, 3, 4, 100) &&
+               !psx_ws_hud_scale_rect_strip(&far.x, &far.y, &far.w, &far.h, 0, kHeight, 3, 4, 50, kStrip) && far.x == INT32_MAX,
+           "a call that is refused works nothing out of the rectangle first");
+}
+
 }  // namespace
 
 int main() {
+    test_a_line_of_text_is_placed_by_where_its_words_can_be();
     test_authored_size_and_bad_input_change_nothing();
     test_weapon_column_is_left_alone();
     test_widgets_shrink_toward_their_own_edge();

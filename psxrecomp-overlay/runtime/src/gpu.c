@@ -2125,9 +2125,10 @@ static void ws_expand_fullscreen_rect(int32_t *x, int32_t y, int *w, int h) {
  * the middle third to centre. A composite (counter box + digits) sits inside
  * one zone, so its pieces share a pivot and stay aligned. (Full-2D menu
  * screens never reach here — they get zero squash + 4:3 pillarbox instead.) */
+static int32_t ws_hud_strip_wide(void);
 static int32_t ws_hud_pivot(int32_t x, int32_t w) {
     int32_t W = ws_disp_w();
-    int32_t cx = 2 * x + w;            /* 2*centre, avoids losing the half */
+    int32_t cx = psx_ws_hud_thirds_centre(x, w, ws_hud_strip_wide(), W);   /* 2*centre, avoids losing the half */
     if (3 * cx < 2 * W) return 0;
     if (3 * cx > 4 * W) return W;
     return W / 2;
@@ -2240,8 +2241,8 @@ int gpu_ws_hud_scale(void) { return ws_hud_scale_percent; }
 static int ws_hud_user_scale(int32_t *x, int32_t *y, int *w, int *h) {
     int32_t scaled_w = *w, scaled_h = *h;
     if (ws_hud_scale_percent >= PSX_WS_HUD_SCALE_MAX ||
-        !psx_ws_hud_scale_rect(x, y, &scaled_w, &scaled_h, ws_disp_w(), ws_disp_h(),
-                               ws_xnum, ws_xden, ws_hud_scale_percent))
+        !psx_ws_hud_scale_rect_strip(x, y, &scaled_w, &scaled_h, ws_disp_w(), ws_disp_h(),
+                                     ws_xnum, ws_xden, ws_hud_scale_percent, ws_hud_strip_wide()))
         return 0;
     *w = (int)scaled_w;
     *h = (int)scaled_h;
@@ -2250,6 +2251,12 @@ static int ws_hud_user_scale(int32_t *x, int32_t *y, int *w, int *h) {
 
 static PsxWsHudWidgets ws_hud;
 static uint32_t ws_hud_table_pointer;
+static int ws_hud_strip; /* how wide the game's text printer makes a line, 0 when the game has not said */
+
+void gpu_ws_set_hud_text_strip(int wide) { ws_hud_strip = wide > 0 ? wide : 0; }
+
+/* A line of text is printed as a list of its own, outside the HUD layer: only there is a rectangle of that width a line. */
+static int32_t ws_hud_strip_wide(void) { return ws_hud.in_hud_layer ? 0 : ws_hud_strip; }
 
 void gpu_ws_set_hud_widgets(uint32_t table_pointer, int layers, const int32_t *boxes, int count) {
     ws_hud_table_pointer = table_pointer;

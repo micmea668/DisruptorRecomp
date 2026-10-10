@@ -17,6 +17,7 @@ def require(condition: bool, message: str) -> None:
 
 cmake = read("CMakeLists.txt")
 manifest = read("PSXRECOMP_OVERLAY_FILES.txt")
+scale_header = read("psxrecomp-overlay/runtime/include/gpu_ws_hud_scale.h")
 gpu = read("psxrecomp-overlay/runtime/src/gpu.c")
 header = read("psxrecomp-overlay/runtime/include/gpu.h")
 menu = read("src/disruptor_dev_menu.cpp")
@@ -41,10 +42,25 @@ require(
 )
 require(
     "    if (ws_hud_scale_percent >= PSX_WS_HUD_SCALE_MAX ||\n"
-    "        !psx_ws_hud_scale_rect(x, y, &scaled_w, &scaled_h, ws_disp_w(), ws_disp_h(),\n"
-    "                               ws_xnum, ws_xden, ws_hud_scale_percent))\n"
+    "        !psx_ws_hud_scale_rect_strip(x, y, &scaled_w, &scaled_h, ws_disp_w(), ws_disp_h(),\n"
+    "                                     ws_xnum, ws_xden, ws_hud_scale_percent, ws_hud_strip_wide()))\n"
     "        return 0;" in gpu,
     "at the authored size the stock squash must stay in charge",
+)
+require(
+    "static int32_t ws_hud_strip_wide(void) { return ws_hud.in_hud_layer ? 0 : ws_hud_strip; }" in gpu
+    and "    int32_t cx = psx_ws_hud_thirds_centre(x, w, ws_hud_strip_wide(), W);" in gpu
+    and gpu.count("ws_hud_strip_wide(") == 4
+    and gpu.count("psx_ws_hud_thirds_centre(") == 1
+    and scale_header.count("psx_ws_hud_thirds_centre(") == 2
+    and scale_header.count("2 * *x + *w") == 0
+    and "    centre_x = psx_ws_hud_thirds_centre(*x, *w, strip, screen_w);\n    centre_y = 2 * *y + *h;\n" in scale_header
+    and scale_header.index("        return 0;\n    centre_x = ") > scale_header.index("squash_num <= 0 || squash_den <= 0)")
+    and "void gpu_ws_set_hud_text_strip(int wide) { ws_hud_strip = wide > 0 ? wide : 0; }" in gpu
+    and "void gpu_ws_set_hud_text_strip(int wide);" in header
+    and gpu.count("ws_hud_strip") - gpu.count("ws_hud_strip_wide") == 3,
+    "the user's size and the stock squash must take one middle for a rectangle, and a line of text outside the HUD layer "
+    "by where its words can be",
 )
 require(
     "            else if (ws_hud_sprt) {\n"
