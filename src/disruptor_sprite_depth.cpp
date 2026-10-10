@@ -13,7 +13,8 @@
  * size goes along too, before the game cuts it to whole pixels. The third
  * funnel sizes an effect after its projection: the size is worked out
  * ahead and holds only if the game's registers agree at the packet.
- * Guest state is only read.
+ * Guest state is only read, but for the range a funnel sorts and fades by:
+ * under the widescreen squash it is made the squashed world's.
  */
 
 #include "cpu_state.h"
@@ -24,6 +25,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+
+extern "C" void gte_ws_x_squash(int32_t *num, int32_t *den);
 
 namespace {
 
@@ -46,6 +49,8 @@ constexpr uint32_t kEffectPacketSite = 0x8003C848u;
 constexpr uint32_t kWarped = 1u;
 constexpr int32_t kLargest = 0x1FF;  /* the game caps a side here and rescales the other */
 constexpr int64_t kTaken = 3 * kOne / 2;  /* the renderer takes a size this far over its packet's, an effect's two cuts can leave more */
+constexpr int64_t kBodyLead = 0x18;  /* 0x8003CEC8..0x8003CEEC: the fourth funnel sorts this much nearer, down to kNearest */
+constexpr int64_t kNearest = 8;
 
 /* Where a funnel keeps the size it scales by 160 / Z. */
 enum class Size : uint8_t { Words, Bytes, Effect, Body };
@@ -63,13 +68,15 @@ struct Funnel {
     Operand x;
     Operand y;
     Size size;
+    uint8_t range_gpr;
+    bool led;  /* the range has had its lead by the time of the projection */
 };
 
 constexpr auto kFunnels = std::array<Funnel, 4>{{
-    {0x8003B98Cu, 16u, {0x8003BB88u, 0u}, {7u, 0u}, {5u, 0u}, Size::Words},
-    {0x8003BDA0u, 16u, {0x8003BFB0u, 0u}, {7u, 0u}, {6u, 0u}, Size::Bytes},
-    {0x8003C4B0u, 21u, {kEffectPacketSite, 0x8003CAD4u}, {0u, 0x18u}, {0u, 0x20u}, Size::Effect},
-    {kDeferredProjection, 20u, {kShadowPacketSite, 0u}, {8u, 0u}, {5u, 0u}, Size::Body},
+    {0x8003B98Cu, 16u, {0x8003BB88u, 0u}, {7u, 0u}, {5u, 0u}, Size::Words, 18u, false},
+    {0x8003BDA0u, 16u, {0x8003BFB0u, 0u}, {7u, 0u}, {6u, 0u}, Size::Bytes, 19u, false},
+    {0x8003C4B0u, 21u, {kEffectPacketSite, 0x8003CAD4u}, {0u, 0x18u}, {0u, 0x20u}, Size::Effect, 23u, false},
+    {kDeferredProjection, 20u, {kShadowPacketSite, 0u}, {8u, 0u}, {5u, 0u}, Size::Body, 23u, true},
 }};
 
 /* 16.16: the unrounded column of the projection, and how far it stands from the row the game stored. */
@@ -249,6 +256,24 @@ struct Effect {
     return sprite;
 }
 
+/* A funnel's range, as at 0x8003B8C4..0x8003B8D4: the depth and three eighths of the step aside. */
+[[nodiscard]] constexpr int64_t range_of(const Funnel& funnel, int32_t depth, int64_t aside) {
+    const int64_t range = depth + (3 * aside >> 3);
+    return funnel.led ? std::max(range - kBodyLead, kNearest) : range;
+}
+
+/* The world renderer ranges a vertex by its squashed column (0x80046360): a sprite's step aside has to count for as little, or the floor under it sorts in front. */
+void squash_range(CPUState& cpu, const Funnel& funnel) {
+    int32_t num = 1, den = 1;
+    gte_ws_x_squash(&num, &den);
+    const std::optional<int32_t> x = operand(cpu, funnel.x);
+    const auto depth = static_cast<int32_t>(cpu.gpr[funnel.depth_gpr]);
+    if (num <= 0 || den <= 0 || !x || depth <= 0) return;
+    const int64_t aside = *x < 0 ? -static_cast<int64_t>(*x) : *x;
+    if (static_cast<int32_t>(cpu.gpr[funnel.range_gpr]) != range_of(funnel, depth, aside)) return;
+    cpu.gpr[funnel.range_gpr] = static_cast<uint32_t>(range_of(funnel, depth, aside * num / den));
+}
+
 [[nodiscard]] Sprite take_pending(uint32_t projection) {
     const Sprite sprite = g_pending_projection == projection ? g_pending : Sprite{};
     g_pending_projection = 0;
@@ -277,6 +302,7 @@ extern "C" void disruptor_sprite_depth_instruction_hook(
         if (funnel.projection != address) continue;
         g_pending_projection = address;
         g_pending = projected(*cpu, funnel);
+        squash_range(*cpu, funnel);
         return;
     }
 }

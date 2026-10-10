@@ -237,6 +237,13 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_grown_quad_contract.py"
             --require-artifacts)
 
+    add_test(NAME disruptor_sprite_range_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sprite_range_contract.py"
+            --require-artifacts)
+    set_tests_properties(disruptor_sprite_range_contract
+        PROPERTIES LABELS retail)
+
     add_test(NAME disruptor_intro_skip_contract
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_intro_skip_contract.py"

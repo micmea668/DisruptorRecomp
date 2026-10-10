@@ -186,6 +186,13 @@ static void depth_cue_from_ir(GTEState* gte, uint32_t instr) {
 // ---------------------------------------------------------------------------
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
 extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
+static bool ws_x_squashed() { return s_ws_xnum != s_ws_xden && !gpu_ws_present_native_43(); }
+/* The ratio RTPS scales a projected X by on this frame, 1/1 when it leaves X alone. */
+extern "C" void gte_ws_x_squash(int32_t* num, int32_t* den) {
+    const bool squashed = ws_x_squashed();
+    *num = squashed ? s_ws_xnum : 1;
+    *den = squashed ? s_ws_xden : 1;
+}
 extern "C" void psx_ws_note_gte_project(int nverts);  /* gpu.c — gte_game_mode stamp */
 static int s_gte_replay_sandbox = 0;
 
@@ -1545,7 +1552,7 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     // this frame is being stretched — never on a 4:3-presented frame (FMV /
     // full-2D screen), so content and present stay locked.
     int64_t xterm = (int64_t)gte->IR1 * h_div_sz;
-    bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
+    bool do_squash = ws_x_squashed();
     const bool dome_call = ws_dome_call_matches();
     // Curved backdrops are authored to cover the original 4:3 projection.
     // In classic widescreen, leave that projection intact and let the normal

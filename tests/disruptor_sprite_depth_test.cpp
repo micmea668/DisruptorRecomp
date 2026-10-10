@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -115,6 +116,12 @@ extern "C" int psx_ws_project_x(int x) {
 extern "C" std::int32_t psx_ws_project_x16(int x, std::int32_t fraction16) {
     if (!g_squash) return x * 65536 + fraction16;
     return 160 * 65536 + static_cast<std::int32_t>((static_cast<std::int64_t>(x - 160) * 65536 + fraction16) * 3 / 4);
+}
+
+std::int32_t g_range_num = 1, g_range_den = 1;
+extern "C" void gte_ws_x_squash(std::int32_t *num, std::int32_t *den) {
+    *num = g_range_num;
+    *den = g_range_den;
 }
 
 #include "../src/disruptor_sprite_depth.cpp"
@@ -589,9 +596,92 @@ void test_deferred_actor_waits_under_its_record() {
     expect(g_notes.empty(), "a misaligned or out-of-range record and a changed word store nothing");
 }
 
+/* Where each funnel holds its range at the projection, and whether the fourth's lead is in it by then. */
+struct TestRange {
+    int gpr;
+    bool led;
+};
+constexpr std::array<TestRange, 4> kTestRanges{{{18, false}, {19, false}, {23, false}, {23, true}}};
+
+/* The game's steps: the depth and three eighths of the step aside, then the fourth funnel's lead of 0x18 down to 8. */
+std::int32_t game_range(bool led, std::int32_t depth, std::int32_t aside) {
+    const std::int32_t range = depth + (3 * aside >> 3);
+    return led ? std::max(range - 0x18, 8) : range;
+}
+
+/* The registers as a funnel has them at its projection, and its range after the seam. */
+std::int32_t ranged(std::size_t which, std::int32_t depth, std::int32_t x, std::int32_t off_by = 0,
+                    std::uint32_t word = kStoreWord, int phase = 1, bool stack = true) {
+    const TestFunnel &funnel = kTestFunnels[which];
+    CPUState cpu{};
+    cpu.read_word = stack ? read_stack : nullptr;
+    cpu.gpr[29] = kStack;
+    for (int gpr = 1; gpr < 32; ++gpr)
+        if (gpr != 29) cpu.gpr[gpr] = 0x40000000u + static_cast<std::uint32_t>(gpr);
+    if (funnel.x_gpr != 0) cpu.gpr[funnel.x_gpr] = static_cast<std::uint32_t>(x);
+    g_stack_x = static_cast<std::uint32_t>(x);
+    g_stack_y = 0u;
+    cpu.gpr[funnel.depth_gpr] = static_cast<std::uint32_t>(depth);
+    cpu.gpr[kTestRanges[which].gpr] = static_cast<std::uint32_t>(game_range(kTestRanges[which].led, depth, std::abs(x)) + off_by);
+    const CPUState before = cpu;
+    disruptor_sprite_depth_instruction_hook(&cpu, funnel.projection, word, phase);
+    for (int gpr = 0; gpr < 32; ++gpr)
+        expect(gpr == kTestRanges[which].gpr || cpu.gpr[gpr] == before.gpr[gpr], "the seam may change the range register and no other");
+    return static_cast<std::int32_t>(cpu.gpr[kTestRanges[which].gpr]);
+}
+
+void test_a_range_comes_under_the_squash() {
+    for (std::size_t which = 0; which < kTestFunnels.size(); ++which) {
+        const bool led = kTestRanges[which].led;
+        g_range_num = g_range_den = 1;
+        expect(ranged(which, 1000, 400) == game_range(led, 1000, 400), "at 4:3 the game's range stands");
+        g_range_num = g_range_den = 3;
+        expect(ranged(which, 1000, 400) == game_range(led, 1000, 400), "a ratio of one in other numbers is no squash");
+
+        g_range_num = 3;
+        g_range_den = 4;
+        expect(ranged(which, 1000, 400) == game_range(led, 1000, 300) && ranged(which, 1000, -400) == game_range(led, 1000, 300),
+               "at 16:9 a step aside counts for three quarters of itself, to either side");
+        expect(game_range(led, 1000, 400) - game_range(led, 1000, 300) == 38, "which is 38 nearer here: over four sort slots");
+        expect(ranged(which, 1000, 7) == game_range(led, 1000, 5), "the squashed step is cut to a whole unit before the eighths");
+        expect(ranged(which, 1000, 0) == game_range(led, 1000, 0), "a sprite straight ahead keeps its range");
+        expect(ranged(which, 1000, 400, 1) == game_range(led, 1000, 400) + 1 && ranged(which, 1000, 400, -1) == game_range(led, 1000, 400) - 1,
+               "a register that does not hold the game's range of this depth and step is left alone");
+        expect(ranged(which, 1000, 400, 0, kStoreWord ^ 1u) == game_range(led, 1000, 400) &&
+                   ranged(which, 1000, 400, 0, kStoreWord, 0) == game_range(led, 1000, 400),
+               "a changed word and the phase before the store change nothing");
+
+        g_range_num = 4;
+        g_range_den = 7;
+        expect(ranged(which, 1000, 400) == game_range(led, 1000, 228), "at 21:9 it counts for four sevenths");
+        g_range_num = 16;
+        g_range_den = 15;
+        expect(ranged(which, 1000, 400) == game_range(led, 1000, 426), "a screen narrower than 4:3 stretches it");
+        for (const auto &[num, den] : {std::pair{0, 4}, std::pair{3, 0}, std::pair{-3, -4}}) {
+            g_range_num = num;
+            g_range_den = den;
+            expect(ranged(which, 1000, 400) == game_range(led, 1000, 400), "a ratio that is not two positive numbers changes nothing");
+        }
+    }
+
+    g_range_num = 3;
+    g_range_den = 4;
+    expect(ranged(3, 20, 40) == 8 && game_range(true, 20, 40) == 11 && game_range(true, 20, 30) == 8,
+           "the fourth funnel's range keeps its lead and its floor");
+    expect(ranged(3, 10, 8) == 8, "a range already on its floor stays there");
+    for (std::size_t which = 0; which < kTestFunnels.size(); ++which)
+        for (const std::int32_t depth : {0, -1000})
+            expect(ranged(which, depth, 400) == game_range(kTestRanges[which].led, depth, 400), "a depth the game does not draw is not a sprite's: the range stands");
+    expect(ranged(0, 20, 40) == game_range(false, 20, 30) && game_range(false, 20, 30) == 31, "the other funnels have no lead at the projection");
+    expect(ranged(2, 1000, 400, 0, kStoreWord, 1, false) == game_range(false, 1000, 400),
+           "the third funnel's step is on the stack: unreadable, the range stands");
+    g_range_num = g_range_den = 1;
+}
+
 }  // namespace
 
 int main() {
+    test_a_range_comes_under_the_squash();
     test_every_funnel_hands_its_depth_over();
     test_a_depth_stays_in_its_funnel();
     test_only_the_reviewed_instructions_count();
