@@ -696,6 +696,11 @@ static void present_session_reset(void) {
     smooth_60_reset();
 }
 
+extern "C" int dirty_ram_text_image_registered(void);
+extern "C" int psx_game_text_native_ok(uint32_t addr);
+extern "C" void memory_keep_low_boot_scratch(void);
+static void take_loaded_state_for_started(void);
+
 /* Called from savestate_poll after a successful restore (before scheduler
  * longjmp). Clears present latches and forces the next vblank to show the
  * restored VRAM — including a blank if display was disabled in the snapshot. */
@@ -716,6 +721,7 @@ extern "C" void psx_frontend_on_savestate_loaded(void) {
      * tiles + force several swaps so the window actually updates. Safe no-op
      * when the GL pipeline was never brought up. */
     gl_renderer_invalidate_present();
+    take_loaded_state_for_started();
 }
 
 #ifndef PSX_DISABLE_FRAME_INTERPOLATION
@@ -2456,7 +2462,7 @@ static const int sdl_audio_fade_samples = 44100 * 40 / 1000;  /* 40 ms */
 static int       sdl_audio_fadein_left  = 0;
 
 static void sdl_audio_pump(bool discard_output = false) {
-    if (!sdl_audio_device) return;
+    if (!sdl_audio_device) discard_output = true;  /* a game reads the SPU back: it runs on with nothing to play it */
 
     const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
     const bool legacy = audio_legacy_mode();
@@ -2990,7 +2996,6 @@ static void runtime_perf_diag_tick() {
 }
 
 static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
-    if (!sdl_audio_device) return;
     {   /* Tag audio events with the vblank frame counter. */
         extern uint64_t s_frame_count;
         audio_trace_note_frame((uint32_t)s_frame_count);
@@ -3013,14 +3018,14 @@ static void sdl_audio_update(int hard_mute_active, int turbo_sink_active) {
             spu_render(sdl_audio_buf, tail);
             sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
             audio_trace_event(AUDIO_EV_MUTE, (uint32_t)tail, 0);
-            if (audio_legacy_mode()) {
+            if (sdl_audio_device && audio_legacy_mode()) {
                 sdl_audio_apply_master_gain(
                     sdl_audio_buf, tail,
                     &g_audio_legacy_applied_master_gain);
                 audio_trace_pcm(AUDIO_TAP_HOST, sdl_audio_buf, tail);
                 psx_sdl_audio_queue(sdl_audio_device, sdl_audio_buf,
                                     (uint32_t)tail * sizeof(int16_t) * 2u);
-            } else if (s_drc_ready) {
+            } else if (sdl_audio_device && s_drc_ready) {
                 psx_sdl_audio_lock(sdl_audio_device);
                 rab_push(&s_drc, sdl_audio_buf, tail);
                 psx_sdl_audio_unlock(sdl_audio_device);
@@ -4384,6 +4389,33 @@ static void depth24_fix_trailing_margin(uint32_t *buf, uint32_t w, uint32_t h,
     }
 }
 
+static void engage_widescreen(void) {
+    g_ws_engaged = true;
+    const bool wide = g_video_aspect_num * 3 != g_video_aspect_den * 4;
+    int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
+    /* Native-wide: GTE drawn un-squashed — feed it the 4:3 ratio
+     * (identity squash). Squash mode: feed the real wide aspect. */
+    gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
+                           mode == 1 ? g_video_aspect_den : 3);
+    gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
+                     g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0, mode);
+}
+
+/* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
+static void engage_widescreen_at_game_entry(void) {
+    extern int fntrace_is_game_started(void);
+    if (!g_ws_engaged && fntrace_is_game_started()) engage_widescreen();
+}
+
+/* A state of a started game is no game entry. Told by the game's code in memory, as the entry latch tells it. */
+static void take_loaded_state_for_started(void) {
+    uint32_t bios = 0, entry = 0;
+    savestate_get_integrity(&bios, &entry);
+    if (!dirty_ram_text_image_registered() || !psx_game_text_native_ok(entry)) return;
+    memory_keep_low_boot_scratch();  /* the latch of a fresh process would clear what the game has written there since */
+    if (!g_ws_engaged) engage_widescreen();  /* at the next VBlank the frame the state draws first would be a 4:3 one */
+}
+
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
     /* A host UI normally submits its request from the GL render callback near
@@ -4733,6 +4765,7 @@ static void sdl_vblank_present(void) {
                      (turbo_loads_active && g_turbo_audio_sink_enabled));
 #endif
 
+    if (g_headless) engage_widescreen_at_game_entry();  /* a run without a window is the same game */
     if (g_headless || module_fast_forward) {
         netplay_tail.skip_pace();
         return;
@@ -4857,21 +4890,7 @@ static void sdl_vblank_present(void) {
     if (gpu_depth24_present_hold_tick())
         return;
 
-    /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
-    if (!g_ws_engaged) {
-        extern int fntrace_is_game_started(void);
-        if (fntrace_is_game_started()) {
-            g_ws_engaged = true;
-            const bool wide = g_video_aspect_num * 3 != g_video_aspect_den * 4;
-            int mode = wide ? (g_ws_native_wide ? 2 : 1) : 0;
-            /* Native-wide: GTE drawn un-squashed — feed it the 4:3 ratio
-             * (identity squash). Squash mode: feed the real wide aspect. */
-            gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
-                                   mode == 1 ? g_video_aspect_den : 3);
-            gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
-                             g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0, mode);
-        }
-    }
+    engage_widescreen_at_game_entry();
 
     /* ---- Display from our VRAM ---- */
     uint32_t w = 0, h = 0;
@@ -7775,6 +7794,7 @@ session_reboot:
 
   if (g_headless) {
     std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
+    host_ui_runtime_ready(nullptr, PSX_HOST_UI_BACKEND_NONE);  /* a game module sets its session up there, saved settings included */
   } else {
     /* ---- SDL init ---- */
     /* Scale quality governs SDL's logical-size -> window scaling. Linear when

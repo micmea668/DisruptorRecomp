@@ -204,6 +204,10 @@ if(BUILD_TESTING)
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dev_menu_contract.py")
 
+    add_test(NAME disruptor_loaded_state_contract
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_loaded_state_contract.py")
+
     add_test(NAME disruptor_cheats_contract
         COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cheats_contract.py")

@@ -3,6 +3,8 @@
 
 /* Optional v3 section; old snapshots predate enhancement packet allocations. */
 #define BS_SEC_GPU_DMA_MEMORY 0x0Fu
+/* Optional: the instruction cost divider of an enhancement and its carry. An old snapshot resumes at the session's. */
+#define BS_SEC_CPU_COST 0x10u
 #include "overlay_api.h"   /* PSX_OVERLAY_CODEGEN_HASH / _ABI_TAG / _CODEGEN_VER */
 #include "gpu_render.h"    /* gr_vram_transfer_in / gr_vram_transfer_out          */
 #include "psx_cycles.h"
@@ -26,6 +28,8 @@ extern void      dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t coun
 extern uint32_t  i_stat;
 extern uint32_t  i_mask;
 extern uint64_t  psx_cycle_count;
+extern uint32_t  g_psx_cyc_overclock_shift;
+extern uint32_t  g_psx_cyc_overclock_carry;
 extern void timers_get_snapshot(uint16_t counter[3], uint32_t mode[3],
                                 uint16_t target[3], int32_t irq_line[3],
                                 uint32_t frac[3]);
@@ -182,7 +186,7 @@ int boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
     h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
     h.codegen_ver   = (uint32_t)PSX_OVERLAY_CODEGEN_VER;
-    h.section_count = 15;
+    h.section_count = 16;
 
     int ok = write_header_le(f, &h);
 
@@ -249,6 +253,14 @@ int boot_state_save(const CPUState* cpu, uint32_t bios_checksum,
     if (ok) ok = write_section(f, BS_SEC_GPU_DMA_MEMORY,
                               psx_mod_gpu_dma_memory_data(),
                               psx_mod_gpu_dma_memory_bytes());
+    if (ok) {
+        uint8_t cost[8];
+        PstW w;
+        pst_w_init(&w, cost, sizeof cost);
+        ok = pst_w_u32(&w, g_psx_cyc_overclock_shift) &&
+             pst_w_u32(&w, g_psx_cyc_overclock_carry) &&
+             write_section(f, BS_SEC_CPU_COST, cost, sizeof cost);
+    }
 
     fclose(f);
     if (!ok)
@@ -281,6 +293,17 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
     }
     case BS_SEC_GPU_DMA_MEMORY:
         return psx_mod_gpu_dma_memory_restore(p, len);
+    case BS_SEC_CPU_COST: {
+        PstR r;
+        uint32_t shift, carry;
+        if (len != 8) return 0;
+        pst_r_init(&r, p, len);
+        /* A wait drops the divider and leaves the carry for the next frame, so the carry is not held to the divider. */
+        if (!pst_r_u32(&r, &shift) || !pst_r_u32(&r, &carry) || shift > 31u || (carry >> 31) != 0u) return 0;
+        g_psx_cyc_overclock_shift = shift;
+        g_psx_cyc_overclock_carry = carry;
+        return 1;
+    }
     case BS_SEC_RAM:
         if (len != RAM_SIZE) return 0;
         memcpy(memory_get_ram_ptr(), p, RAM_SIZE);

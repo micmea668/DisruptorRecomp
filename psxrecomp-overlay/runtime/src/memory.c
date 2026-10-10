@@ -126,7 +126,11 @@ static inline uint32_t psx_phys_addr(uint32_t addr) {
 uint8_t *memory_get_ram_ptr(void) { return ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
 
+static int s_low_scratch_is_the_games;  /* a loaded state of a started game: what is there is no longer the boot's */
+void memory_keep_low_boot_scratch(void) { s_low_scratch_is_the_games = 1; }
+
 void memory_clear_low_boot_scratch(void) {
+    if (s_low_scratch_is_the_games) return;
     memset(ram, 0, 0x10u);
 }
 
@@ -913,6 +917,7 @@ uint32_t memory_get_bios_checksum(void) { return s_bios_checksum; }
 
 void memory_init(const char* bios_path) {
     gte_precision_word_write_begin();
+    s_low_scratch_is_the_games = 0;
     memset(ram, 0, sizeof(ram));
     memset(scratchpad, 0, sizeof(scratchpad));
     /* Rematch re-enters without process exit — wipe sticky I/O regs that
